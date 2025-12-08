@@ -496,182 +496,7 @@ def tab_type_cleaning():
 
 
 # ============================================================================
-# Tab 4: Question Collection
-# ============================================================================
-
-def tab_question_collection():
-    """Question collection tab - Define expected usage"""
-    st.header("❓ Question Collection")
-
-    if not st.session_state.session:
-        st.warning("⚠️ No active session")
-        return
-
-    session = st.session_state.session
-
-    st.markdown("""
-    **Define how you will use this data:**
-
-    This step helps the system understand your needs and generate a better schema.
-    Provide:
-    1. **Sample questions** you will frequently ask
-    2. **Expected output format** - fields you need in responses
-    3. Any additional context
-    """)
-
-    # Initialize question_set if not exists
-    if not session.question_set:
-        session.question_set = QuestionSet()
-
-    question_set = session.question_set
-
-    # ============================================================================
-    # Section 1: User Questions
-    # ============================================================================
-    st.subheader("📝 Sample Questions")
-    st.write("What questions will you frequently ask about this data?")
-
-    # Display existing questions
-    if question_set.user_questions:
-        st.write("**Current Questions:**")
-        for i, uq in enumerate(question_set.user_questions):
-            with st.expander(f"Question {i+1}: {uq.question[:50]}...", expanded=False):
-                col1, col2 = st.columns([4, 1])
-                with col1:
-                    st.write(f"**Question:** {uq.question}")
-                    if uq.description:
-                        st.write(f"**Description:** {uq.description}")
-                    st.write(f"**Priority:** {uq.priority}")
-                with col2:
-                    if st.button("🗑️ Delete", key=f"del_q_{uq.id}"):
-                        question_set.user_questions = [q for q in question_set.user_questions if q.id != uq.id]
-                        st.success("Deleted!")
-                        st.rerun()
-
-    # Add new question
-    with st.form("add_question_form"):
-        st.write("**Add New Question:**")
-        new_question = st.text_area("Question", placeholder="E.g., What is the total revenue by product category?")
-        new_description = st.text_input("Description (optional)", placeholder="Brief explanation")
-        new_priority = st.selectbox("Priority", ["low", "medium", "high"], index=1)
-
-        if st.form_submit_button("➕ Add Question"):
-            if new_question:
-                question_set.user_questions.append(UserQuestion(
-                    id=f"uq_{len(question_set.user_questions)+1}_{datetime.now().timestamp()}",
-                    question=new_question,
-                    description=new_description,
-                    priority=new_priority
-                ))
-                st.success("✓ Question added!")
-                st.rerun()
-            else:
-                st.error("Please enter a question")
-
-    st.divider()
-
-    # ============================================================================
-    # Section 2: Output Fields
-    # ============================================================================
-    st.subheader("📊 Expected Output Fields")
-    st.write("Define the fields you need in the query responses")
-
-    # Display existing output fields
-    if question_set.output_fields:
-        st.write("**Current Output Fields:**")
-        for i, field in enumerate(question_set.output_fields):
-            with st.expander(f"Field: {field.field_name}", expanded=False):
-                col1, col2 = st.columns([4, 1])
-                with col1:
-                    st.write(f"**Field Name:** {field.field_name}")
-                    st.write(f"**Description:** {field.description}")
-                    st.write(f"**Data Type:** {field.data_type}")
-                    st.write(f"**Required:** {'Yes' if field.required else 'No'}")
-                    if field.example_value:
-                        st.write(f"**Example:** {field.example_value}")
-                with col2:
-                    if st.button("🗑️ Delete", key=f"del_f_{field.field_name}_{i}"):
-                        question_set.output_fields = [f for j, f in enumerate(question_set.output_fields) if j != i]
-                        st.success("Deleted!")
-                        st.rerun()
-
-    # Add new output field
-    with st.form("add_field_form"):
-        st.write("**Add New Output Field:**")
-        col1, col2 = st.columns(2)
-        with col1:
-            field_name = st.text_input("Field Name", placeholder="E.g., total_revenue")
-            data_type = st.selectbox("Data Type", ["string", "number", "integer", "float", "date", "boolean", "array", "object"])
-        with col2:
-            field_desc = st.text_input("Description", placeholder="What does this field represent?")
-            is_required = st.checkbox("Required", value=True)
-
-        example_value = st.text_input("Example Value (optional)", placeholder="E.g., 1500000")
-
-        if st.form_submit_button("➕ Add Field"):
-            if field_name and field_desc:
-                question_set.output_fields.append(OutputField(
-                    field_name=field_name,
-                    description=field_desc,
-                    data_type=data_type,
-                    required=is_required,
-                    example_value=example_value if example_value else None
-                ))
-                st.success("✓ Field added!")
-                st.rerun()
-            else:
-                st.error("Please enter field name and description")
-
-    st.divider()
-
-    # ============================================================================
-    # Section 3: Additional Notes
-    # ============================================================================
-    st.subheader("📝 Additional Context")
-    additional_notes = st.text_area(
-        "Any additional information about how you'll use this data?",
-        value=question_set.additional_notes,
-        placeholder="E.g., This data will be used for monthly financial reports..."
-    )
-
-    if st.button("💾 Save Additional Notes"):
-        question_set.additional_notes = additional_notes
-        st.success("✓ Notes saved!")
-
-    st.divider()
-
-    # ============================================================================
-    # Summary and Actions
-    # ============================================================================
-    st.subheader("📊 Summary")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Questions Defined", len(question_set.user_questions))
-    with col2:
-        st.metric("Output Fields", len(question_set.output_fields))
-    with col3:
-        has_notes = "Yes" if question_set.additional_notes else "No"
-        st.metric("Additional Notes", has_notes)
-
-    # Show warning if nothing defined
-    if not question_set.user_questions and not question_set.output_fields:
-        st.info("💡 **Tip:** Defining questions and output fields helps generate a more relevant schema. You can skip this step if you prefer.")
-
-    # Clear all button
-    if question_set.user_questions or question_set.output_fields:
-        if st.button("🗑️ Clear All"):
-            if st.session_state.get('confirm_clear'):
-                session.question_set = QuestionSet()
-                st.session_state.confirm_clear = False
-                st.success("✓ All cleared!")
-                st.rerun()
-            else:
-                st.session_state.confirm_clear = True
-                st.warning("Click again to confirm")
-
-
-# ============================================================================
-# Tab 5: Schema Generation
+# Tab 4: Schema Generation
 # ============================================================================
 
 def tab_schema_generation():
@@ -702,7 +527,95 @@ def tab_schema_generation():
     if df is None:
         st.error("No data available")
         return
-    
+
+    # ============================================================================
+    # Question & Output Format Definition (Optional)
+    # ============================================================================
+    with st.expander("❓ Define Expected Questions & Output Format (Optional)", expanded=False):
+        st.markdown("""
+        **Help the system understand how you'll use this data:**
+
+        Define questions you'll frequently ask and the output format you need.
+        This helps generate a more relevant schema.
+        """)
+
+        # Initialize question_set if not exists
+        if not session.question_set:
+            session.question_set = QuestionSet()
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("📝 Sample Questions")
+            questions_text = st.text_area(
+                "Enter questions (one per line)",
+                value="\n".join([q.question for q in session.question_set.user_questions]) if session.question_set.user_questions else "",
+                placeholder="What is the total revenue by category?\nShow top 10 products by price\nHow many items per region?",
+                height=150,
+                key="questions_input"
+            )
+
+        with col2:
+            st.subheader("📊 Expected Output Fields")
+            fields_text = st.text_area(
+                "Enter field names (one per line or comma-separated)",
+                value=", ".join([f.field_name for f in session.question_set.output_fields]) if session.question_set.output_fields else "",
+                placeholder="total_revenue, category_name, product_count, average_price",
+                height=150,
+                key="fields_input"
+            )
+
+        additional_notes = st.text_area(
+            "Additional context (optional)",
+            value=session.question_set.additional_notes if session.question_set else "",
+            placeholder="E.g., This data will be used for monthly financial reports...",
+            height=80,
+            key="notes_input"
+        )
+
+        if st.button("💾 Save Question Context"):
+            # Parse questions
+            questions_list = [q.strip() for q in questions_text.split('\n') if q.strip()]
+            session.question_set.user_questions = [
+                UserQuestion(
+                    id=f"uq_{i}_{datetime.now().timestamp()}",
+                    question=q,
+                    description="",
+                    priority="medium"
+                ) for i, q in enumerate(questions_list)
+            ]
+
+            # Parse fields
+            if ',' in fields_text:
+                fields_list = [f.strip() for f in fields_text.split(',') if f.strip()]
+            else:
+                fields_list = [f.strip() for f in fields_text.split('\n') if f.strip()]
+
+            session.question_set.output_fields = [
+                OutputField(
+                    field_name=f,
+                    description=f"Field: {f}",
+                    data_type="string",
+                    required=True
+                ) for f in fields_list
+            ]
+
+            session.question_set.additional_notes = additional_notes
+
+            st.success(f"✓ Saved {len(session.question_set.user_questions)} questions and {len(session.question_set.output_fields)} fields")
+            st.rerun()
+
+        # Show summary
+        if session.question_set and (session.question_set.user_questions or session.question_set.output_fields):
+            st.divider()
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Questions", len(session.question_set.user_questions))
+            with col2:
+                st.metric("Output Fields", len(session.question_set.output_fields))
+
+    st.divider()
+
     if st.button("🧠 Generate Schema", type="primary"):
         with st.spinner("Generating semantic schema..."):
             # Generate profiles
@@ -943,17 +856,20 @@ def tab_agent_qa():
     # Info banner
     if sql_tool:
         schema_info = sql_tool.get_schema_info()
-        st.info(f"""
-        💡 **SQL Capability Enabled!** 
-        - Table: `{schema_info['table_name']}` 
-        - Rows: {schema_info['row_count']} 
-        - Columns: {len(schema_info['columns'])}
-        
-        You can ask questions like:
-        - "What is the average price?"
-        - "Show me the top 5 most expensive properties"
-        - "How many properties per district?"
-        """)
+        if schema_info and 'table_name' in schema_info:
+            st.info(f"""
+            💡 **SQL Capability Enabled!**
+            - Table: `{schema_info['table_name']}`
+            - Rows: {schema_info['row_count']}
+            - Columns: {len(schema_info['columns'])}
+
+            You can ask questions like:
+            - "What is the average price?"
+            - "Show me the top 5 most expensive properties"
+            - "How many properties per district?"
+            """)
+        else:
+            st.warning("⚠️ SQL tool initialized but schema info not available")
     else:
         st.info("💬 Ask questions about your schema (SQL queries not yet available)")
     
@@ -1290,11 +1206,10 @@ def main():
             1. **Ingestion**: Upload files
             2. **Structure**: Fix structure issues
             3. **Type Cleaning**: Convert formatted numbers
-            4. **Question Collection**: Define expected usage (optional but recommended)
-            5. **Schema**: Generate semantic schema
-            6. **Agent Q&A**: Chat about your data
-            7. **Checkpoints**: Review transformations
-            8. **Export**: Download results
+            4. **Schema**: Generate schema (define questions/fields if needed)
+            5. **Agent Q&A**: Chat & query your data with SQL
+            6. **Checkpoints**: Review transformations
+            7. **Export**: Download results
             """)
     
     # Main content - tabs
@@ -1302,7 +1217,6 @@ def main():
         "📁 Ingestion",
         "🔍 Structure Analysis",
         "🧹 Type Cleaning",
-        "❓ Question Collection",
         "📋 Schema Generation",
         "🤖 Agent Q&A",
         "💾 Checkpoints",
@@ -1319,18 +1233,15 @@ def main():
         tab_type_cleaning()
 
     with tabs[3]:
-        tab_question_collection()
-
-    with tabs[4]:
         tab_schema_generation()
 
-    with tabs[5]:
+    with tabs[4]:
         tab_agent_qa()
 
-    with tabs[6]:
+    with tabs[5]:
         tab_checkpoints()
 
-    with tabs[7]:
+    with tabs[6]:
         tab_export()
 
 
