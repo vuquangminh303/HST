@@ -1,0 +1,1753 @@
+"""
+Enhanced Data Schema Analysis Pipeline V4
+- Smart type inference (handles 500.000 → int, not str)
+- Data cleaning and type conversion
+- Interactive Q&A agent after schema refinement
+- Full Streamlit integration
+"""
+
+import json
+import os
+import re
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple, Union
+from enum import Enum
+import argparse
+from pydantic import BaseModel, Field
+import pandas as pd
+import numpy as np
+from openai import OpenAI
+import logging
+import sys
+import sqlite3
+
+
+logging.basicConfig(level=os.getenv('LOGLEVEL','INFO').upper())
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Domain Models
+# ============================================================================
+
+class TransformationType(str, Enum):
+    """Types of structural transformations"""
+    SKIP_ROWS = "skip_rows"
+    USE_ROW_AS_HEADER = "use_row_as_header"
+    DROP_COLUMNS = "drop_columns"
+    DROP_ROWS = "drop_rows"
+    RENAME_COLUMNS = "rename_columns"
+    SPLIT_COLUMN = "split_column"
+    MERGE_COLUMNS = "merge_columns"
+    CUSTOM = "custom"
+
+
+class DataCleaningAction(str, Enum):
+    """Types of data cleaning actions"""
+    REMOVE_THOUSAND_SEPARATOR = "remove_thousand_separator"
+    CONVERT_TO_INT = "convert_to_int"
+    CONVERT_TO_FLOAT = "convert_to_float"
+    CONVERT_TO_DATETIME = "convert_to_datetime"
+    STRIP_WHITESPACE = "strip_whitespace"
+    NORMALIZE_CASE = "normalize_case"
+    REPLACE_VALUES = "replace_values"
+
+
+class CleaningRule(BaseModel):
+    """A data cleaning rule"""
+    id: str
+    column: str
+    action: DataCleaningAction
+    description: str
+    params: Dict[str, Any] = Field(default_factory=dict)
+    applied: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class Transformation(BaseModel):
+    """A structural transformation to apply to the DataFrame"""
+    id: str
+    type: TransformationType
+    description: str
+    params: Dict[str, Any]
+    confidence: float
+    applied: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class ColumnProfile(BaseModel):
+    """Statistical profile of a single column"""
+    name: str
+    pandas_dtype: str
+    inferred_type: str  # After smart inference
+    non_null_count: int
+    null_count: int
+    null_ratio: float
+    n_unique: int
+    sample_values: List[Any]
+    sample_raw_values: List[str]  # Original string values
+    has_thousand_separator: bool = False
+    decimal_separator: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class ColumnSchema(BaseModel):
+    """Schema definition for a single column"""
+    name: str
+    description: str
+    semantic_type: str
+    physical_type: str
+    original_type: str  # Before cleaning
+    unit: Optional[str]
+    is_required: bool
+    constraints: Optional[Dict[str, Any]] = None
+    cleaning_applied: List[str] = Field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class Question(BaseModel):
+    """A question requiring human clarification"""
+    id: str
+    question: str
+    suggested_answer: Optional[str]
+    target: str
+    question_type: str = "semantic"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class Answer(BaseModel):
+    """Human answer to a question"""
+    question_id: str
+    answer: str
+    timestamp: str
+    applied: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class AgentMessage(BaseModel):
+    """Message in agent conversation"""
+    role: str  # "user" or "assistant"
+    content: str
+    timestamp: str
+    context: Optional[Dict[str, Any]] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class DataFrameCheckpoint(BaseModel):
+    """Checkpoint of DataFrame state"""
+    checkpoint_id: str
+    stage: str
+    timestamp: str
+    shape: Tuple[int, int]
+    description: str
+    file_path: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class HistoryEntry(BaseModel):
+    """Single entry in refinement history"""
+    timestamp: str
+    action: str
+    details: Dict[str, Any]
+    schema_version: int
+    checkpoint_id: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class DataSource(BaseModel):
+    """Information about a data source"""
+    source_id: str
+    file_path: str
+    sheet_name: Optional[str] = None
+    source_type: str
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class Session(BaseModel):
+    """Complete session state"""
+    session_id: str
+    created_at: str
+    
+    sources: List[DataSource]
+    current_source_id: str
+    
+    raw_structure_info: Dict[str, Any]
+    transformations: List[Transformation]
+    applied_transformations: List[str]
+    
+    # Data cleaning
+    cleaning_rules: List[CleaningRule] = Field(default_factory=list)
+    applied_cleaning_rules: List[str] = Field(default_factory=list)
+    
+    schema: Dict[str, ColumnSchema]
+    profiles: Dict[str, ColumnProfile]
+    
+    questions: List[Question]
+    answers: List[Answer]
+    
+    # Agent Q&A
+    agent_conversations: List[AgentMessage] = Field(default_factory=list)
+    agent_enabled: bool = True
+    
+    history: List[HistoryEntry]
+    checkpoints: List[DataFrameCheckpoint]
+    schema_version: int = 1
+    
+    is_clean_structure: bool = False
+    structure_issues: List[str] = Field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "created_at": self.created_at,
+            "sources": [s.to_dict() for s in self.sources],
+            "current_source_id": self.current_source_id,
+            "raw_structure_info": self.raw_structure_info,
+            "transformations": [t.to_dict() for t in self.transformations],
+            "applied_transformations": self.applied_transformations,
+            "cleaning_rules": [r.to_dict() for r in self.cleaning_rules],
+            "applied_cleaning_rules": self.applied_cleaning_rules,
+            "schema": {k: v.to_dict() for k, v in self.schema.items()},
+            "profiles": {k: v.to_dict() for k, v in self.profiles.items()},
+            "questions": [q.to_dict() for q in self.questions],
+            "answers": [a.to_dict() for a in self.answers],
+            "agent_conversations": [m.to_dict() for m in self.agent_conversations],
+            "agent_enabled": self.agent_enabled,
+            "history": [h.to_dict() for h in self.history],
+            "checkpoints": [c.to_dict() for c in self.checkpoints],
+            "schema_version": self.schema_version,
+            "is_clean_structure": self.is_clean_structure,
+            "structure_issues": self.structure_issues
+        }
+
+
+
+
+class SQLQueryTool:
+    """Tool to execute SQL queries on the cleaned data"""
+    
+    def __init__(self, db_path: str, df: pd.DataFrame, table_name: str = "data"):
+        self.db_path = db_path
+        self.table_name = table_name
+        self.conn = None
+        self._create_database(df)
+    
+    def _create_database(self, df: pd.DataFrame):
+        """Create SQLite database from DataFrame"""
+        try:
+            self.conn = sqlite3.connect(self.db_path)
+            df.to_sql(self.table_name, self.conn, if_exists='replace', index=False)
+            
+            cursor = self.conn.cursor()
+            cursor.execute(f"PRAGMA table_info({self.table_name})")
+            columns = cursor.fetchall()
+            
+            logger.info(f"✓ Created SQL database: {self.db_path}")
+            logger.info(f"  Table: {self.table_name}, Columns: {len(columns)}, Rows: {len(df)}")
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to create database: {str(e)}")
+    
+    def execute_query(self, query: str) -> Tuple[pd.DataFrame, Optional[str]]:
+        """Execute SQL query and return results"""
+        try:
+            query_upper = query.upper().strip()
+            if not query_upper.startswith('SELECT'):
+                return pd.DataFrame(), "Error: Only SELECT queries allowed"
+            
+            dangerous = ['DROP', 'DELETE', 'INSERT', 'UPDATE', 'ALTER', 'CREATE']
+            for keyword in dangerous:
+                if keyword in query_upper:
+                    return pd.DataFrame(), f"Error: {keyword} not allowed"
+            
+            result_df = pd.read_sql_query(query, self.conn)
+            return result_df, None
+            
+        except Exception as e:
+            return pd.DataFrame(), f"SQL Error: {str(e)}"
+    
+    def get_schema_info(self) -> Dict[str, Any]:
+        """Get table schema information"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(f"PRAGMA table_info({self.table_name})")
+            columns = cursor.fetchall()
+            
+            cursor.execute(f"SELECT COUNT(*) FROM {self.table_name}")
+            row_count = cursor.fetchone()[0]
+            
+            return {
+                "table_name": self.table_name,
+                "columns": [{"name": col[1], "type": col[2]} for col in columns],
+                "row_count": row_count
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+# ============================================================================
+# Type Inference & Data Cleaning
+# ============================================================================
+
+class TypeInferenceEngine:
+    """Smart type inference that handles formatted numbers"""
+    
+    @staticmethod
+    def detect_thousand_separator(series: pd.Series) -> Optional[str]:
+        """Detect thousand separator (. or ,)"""
+        sample = series.dropna().astype(str).head(100)
+        
+        # Check for patterns like 1.000, 500.000.000
+        dot_pattern = r'^\d{1,3}(\.\d{3})+$'
+        comma_pattern = r'^\d{1,3}(,\d{3})+$'
+        
+        dot_matches = sum(1 for val in sample if re.match(dot_pattern, val.strip()))
+        comma_matches = sum(1 for val in sample if re.match(comma_pattern, val.strip()))
+        
+        if dot_matches > len(sample) * 0.5:
+            return '.'
+        if comma_matches > len(sample) * 0.5:
+            return ','
+        
+        return None
+    
+    @staticmethod
+    def detect_decimal_separator(series: pd.Series, thousand_sep: Optional[str]) -> Optional[str]:
+        """Detect decimal separator"""
+        sample = series.dropna().astype(str).head(100)
+        
+        # If thousand sep is '.', decimal is ','
+        if thousand_sep == '.':
+            # Check for pattern like 1.000,50
+            pattern = r'\d+\.\d{3},\d{1,2}$'
+            if sum(1 for val in sample if re.match(pattern, val.strip())) > 0:
+                return ','
+        
+        # If thousand sep is ',', decimal is '.'
+        elif thousand_sep == ',':
+            # Check for pattern like 1,000.50
+            pattern = r'\d+,\d{3}\.\d{1,2}$'
+            if sum(1 for val in sample if re.match(pattern, val.strip())) > 0:
+                return '.'
+        
+        # Default: check for single decimal point
+        if any('.' in str(val) and str(val).count('.') == 1 for val in sample):
+            return '.'
+        
+        return None
+    
+    @staticmethod
+    def infer_type(series: pd.Series) -> Tuple[str, Dict[str, Any]]:
+        """
+        Infer actual data type from series.
+        Returns: (inferred_type, metadata)
+        """
+        if pd.api.types.is_numeric_dtype(series):
+            if pd.api.types.is_integer_dtype(series):
+                return 'int', {}
+            else:
+                return 'float', {}
+        
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return 'datetime', {}
+        
+        if series.dtype == 'object':
+            sample = series.dropna()
+            if len(sample) == 0:
+                return 'string', {}
+            
+            thousand_sep = TypeInferenceEngine.detect_thousand_separator(sample)
+            decimal_sep = TypeInferenceEngine.detect_decimal_separator(sample, thousand_sep)
+            
+            metadata = {
+                'thousand_separator': thousand_sep,
+                'decimal_separator': decimal_sep
+            }
+            
+            try:
+                if thousand_sep:
+                    cleaned = sample.astype(str).str.replace(thousand_sep, '', regex=False)
+                    
+                    if decimal_sep and decimal_sep != '.':
+                        cleaned = cleaned.str.replace(decimal_sep, '.', regex=False)
+                    
+                    numeric = pd.to_numeric(cleaned, errors='coerce')
+                    
+                    if numeric.notna().sum() / len(numeric) > 0.8:
+                        if (numeric.dropna() % 1 == 0).all():
+                            return 'int', metadata
+                        else:
+                            return 'float', metadata
+                
+                # Try direct numeric conversion
+                numeric = pd.to_numeric(sample, errors='coerce')
+                if numeric.notna().sum() / len(numeric) > 0.8:
+                    if (numeric.dropna() % 1 == 0).all():
+                        return 'int', {}
+                    else:
+                        return 'float', {}
+                
+                # Try datetime
+                dt = pd.to_datetime(sample, errors='coerce')
+                if dt.notna().sum() / len(dt) > 0.8:
+                    return 'datetime', {}
+                
+            except:
+                pass
+        
+        return 'string', {}
+    
+    @staticmethod
+    def generate_cleaning_rules(df: pd.DataFrame, profiles: Dict[str, ColumnProfile]) -> List[CleaningRule]:
+        """Generate cleaning rules based on inferred types"""
+        rules = []
+        
+        for col_name, profile in profiles.items():
+            # Skip if inferred type matches pandas type
+            if profile.inferred_type == 'int' and df[col_name].dtype in ['int64', 'int32']:
+                continue
+            if profile.inferred_type == 'float' and df[col_name].dtype in ['float64', 'float32']:
+                continue
+            
+            # Generate cleaning rule for number with thousand separator
+            if profile.has_thousand_separator:
+                if profile.decimal_separator:
+                    # Has both thousand and decimal
+                    rules.append(CleaningRule(
+                        id=f"clean_{col_name}_numeric",
+                        column=col_name,
+                        action=DataCleaningAction.CONVERT_TO_FLOAT,
+                        description=f"Convert '{col_name}' from formatted number to float (remove {profile.sample_raw_values[0]!r} → float)",
+                        params={
+                            'thousand_separator': '.',
+                            'decimal_separator': profile.decimal_separator
+                        }
+                    ))
+                else:
+                    # Only thousand separator (integer)
+                    rules.append(CleaningRule(
+                        id=f"clean_{col_name}_int",
+                        column=col_name,
+                        action=DataCleaningAction.CONVERT_TO_INT,
+                        description=f"Convert '{col_name}' from formatted number to integer (remove dots: {profile.sample_raw_values[0]!r} → int)",
+                        params={
+                            'thousand_separator': '.'
+                        }
+                    ))
+            
+            # Generate rule for plain numeric conversion
+            elif profile.inferred_type == 'int' and df[col_name].dtype == 'object':
+                rules.append(CleaningRule(
+                    id=f"clean_{col_name}_to_int",
+                    column=col_name,
+                    action=DataCleaningAction.CONVERT_TO_INT,
+                    description=f"Convert '{col_name}' to integer",
+                    params={}
+                ))
+            
+            elif profile.inferred_type == 'float' and df[col_name].dtype == 'object':
+                rules.append(CleaningRule(
+                    id=f"clean_{col_name}_to_float",
+                    column=col_name,
+                    action=DataCleaningAction.CONVERT_TO_FLOAT,
+                    description=f"Convert '{col_name}' to float",
+                    params={}
+                ))
+            
+            elif profile.inferred_type == 'datetime' and df[col_name].dtype == 'object':
+                rules.append(CleaningRule(
+                    id=f"clean_{col_name}_to_datetime",
+                    column=col_name,
+                    action=DataCleaningAction.CONVERT_TO_DATETIME,
+                    description=f"Convert '{col_name}' to datetime",
+                    params={}
+                ))
+        
+        return rules
+    
+    @staticmethod
+    def apply_cleaning_rule(df: pd.DataFrame, rule: CleaningRule) -> pd.DataFrame:
+        """Apply a single cleaning rule"""
+        df_result = df.copy()
+        col = rule.column
+        
+        try:
+            if rule.action == DataCleaningAction.CONVERT_TO_INT:
+                # Remove thousand separator if specified
+                if 'thousand_separator' in rule.params:
+                    df_result[col] = df_result[col].astype(str).str.replace(
+                        rule.params['thousand_separator'], '', regex=False
+                    )
+                
+                # Convert to int
+                df_result[col] = pd.to_numeric(df_result[col], errors='coerce').astype('Int64')
+                logger.info(f"✓ Converted '{col}' to integer")
+            
+            elif rule.action == DataCleaningAction.CONVERT_TO_FLOAT:
+                series = df_result[col].astype(str)
+                
+                # Remove thousand separator
+                if 'thousand_separator' in rule.params:
+                    series = series.str.replace(rule.params['thousand_separator'], '', regex=False)
+                
+                # Replace decimal separator
+                if 'decimal_separator' in rule.params and rule.params['decimal_separator'] != '.':
+                    series = series.str.replace(rule.params['decimal_separator'], '.', regex=False)
+                
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Converted '{col}' to float")
+            
+            elif rule.action == DataCleaningAction.CONVERT_TO_DATETIME:
+                df_result[col] = pd.to_datetime(df_result[col], errors='coerce')
+                logger.info(f"✓ Converted '{col}' to datetime")
+            
+            elif rule.action == DataCleaningAction.STRIP_WHITESPACE:
+                df_result[col] = df_result[col].astype(str).str.strip()
+                logger.info(f"✓ Stripped whitespace from '{col}'")
+            
+            elif rule.action == DataCleaningAction.NORMALIZE_CASE:
+                case_type = rule.params.get('case', 'lower')
+                if case_type == 'lower':
+                    df_result[col] = df_result[col].astype(str).str.lower()
+                elif case_type == 'upper':
+                    df_result[col] = df_result[col].astype(str).str.upper()
+                logger.info(f"✓ Normalized case for '{col}'")
+            
+        except Exception as e:
+            logger.error(f"✗ Failed to apply cleaning rule {rule.id}: {str(e)}")
+            raise
+        
+        return df_result
+
+
+# ============================================================================
+# Data Ingestion (same as V3)
+# ============================================================================
+
+class DataIngestor:
+    """Handles file loading and validation with multi-file/multi-sheet support"""
+    
+    SUPPORTED_EXTENSIONS = {'.csv', '.xlsx', '.xls'}
+    
+    @classmethod
+    def discover_sources(cls, file_paths: List[str]) -> List[DataSource]:
+        """Discover all data sources from file paths"""
+        sources = []
+        
+        for file_path in file_paths:
+            path = Path(file_path)
+            
+            if not path.exists():
+                logger.warning(f"File not found: {file_path}")
+                continue
+            
+            if path.suffix.lower() not in cls.SUPPORTED_EXTENSIONS:
+                logger.warning(f"Unsupported file: {file_path}")
+                continue
+            
+            if path.suffix.lower() == '.csv':
+                source = DataSource(
+                    source_id=f"{path.stem}_csv",
+                    file_path=file_path,
+                    source_type="csv"
+                )
+                sources.append(source)
+            else:
+                try:
+                    xls = pd.ExcelFile(file_path)
+                    for sheet_name in xls.sheet_names:
+                        source = DataSource(
+                            source_id=f"{path.stem}_{sheet_name}",
+                            file_path=file_path,
+                            sheet_name=sheet_name,
+                            source_type="xlsx_sheet"
+                        )
+                        sources.append(source)
+                except Exception as e:
+                    logger.warning(f"Failed to read Excel sheets from {file_path}: {e}")
+        
+        logger.info(f"✓ Discovered {len(sources)} data source(s)")
+        return sources
+    
+    @classmethod
+    def load_source(cls, source: DataSource, header: Optional[int] = None) -> pd.DataFrame:
+        """Load a specific data source"""
+        try:
+            if source.source_type == "csv":
+                df = pd.read_csv(source.file_path, header=header)
+            else:
+                df = pd.read_excel(
+                    source.file_path, 
+                    sheet_name=source.sheet_name,
+                    header=header
+                )
+            
+            if df.empty:
+                raise ValueError("DataFrame is empty")
+            
+            logger.info(f"✓ Loaded {source.source_id}: {len(df)} rows × {len(df.columns)} columns")
+            return df
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load {source.source_id}: {str(e)}")
+    
+    @classmethod
+    def load_raw(cls, source: DataSource) -> pd.DataFrame:
+        """Load raw data without headers"""
+        return cls.load_source(source, header=None)
+
+
+# ============================================================================
+# Structure Analysis (from V3)
+# ============================================================================
+
+class StructureAnalyzer:
+    """Analyzes raw DataFrame structure with improved clean data detection"""
+    
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+    
+    def analyze_structure(
+        self, 
+        df: pd.DataFrame, 
+        max_preview_rows: int = 10
+    ) -> Tuple[Dict[str, Any], List[Transformation], List[Question], bool]:
+        """
+        Analyze raw structure and propose transformations.
+        Returns: (structure_info, transformations, questions, is_clean)
+        """
+        
+        # First, perform heuristic check
+        is_clean, issues = self._heuristic_structure_check(df)
+        
+        if is_clean:
+            logger.info("✓ Data structure appears clean - no transformations needed")
+            structure_info = self._extract_structure_info(df, max_preview_rows)
+            return structure_info, [], [], True
+        
+        logger.info(f"⚠ Detected structure issues: {', '.join(issues)}")
+        
+        # Perform LLM analysis
+        structure_info = self._extract_structure_info(df, max_preview_rows)
+        prompt = self._build_structure_prompt(structure_info, issues)
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_structure_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            
+            transformations = [Transformation(**t) for t in result.get("transformations", [])]
+            questions = [Question(**q) for q in result.get("questions", [])]
+            
+            logger.info(f"✓ Analyzed structure: {len(transformations)} transformations proposed, {len(questions)} questions")
+            return structure_info, transformations, questions, False
+            
+        except Exception as e:
+            raise RuntimeError(f"Structure analysis failed: {str(e)}")
+    
+    def _heuristic_structure_check(self, df: pd.DataFrame) -> Tuple[bool, List[str]]:
+        """
+        Fast heuristic check for common structure issues.
+        Returns: (is_clean, list_of_issues)
+        """
+        issues = []
+        
+        first_row = df.iloc[0]
+        potential_headers = first_row.astype(str).tolist()
+        
+        numeric_headers = sum(1 for val in potential_headers if str(val).replace('.', '').replace('-', '').isdigit())
+        if numeric_headers > len(potential_headers) * 0.5:
+            issues.append("First row contains mostly numeric values (should be headers)")
+        
+        if all(str(col).isdigit() for col in df.columns):
+            issues.append("Column names are numeric indices (no header row detected)")
+        
+        empty_cols = sum(1 for col in df.columns if pd.isna(col) or str(col).strip() == '')
+        if empty_cols > 0:
+            issues.append(f"{empty_cols} empty column name(s)")
+        
+        # Check 4: Duplicate column names
+        if len(df.columns) != len(set(df.columns)):
+            issues.append("Duplicate column names detected")
+        
+        # Check 5: Excessive nulls in first few rows (might need to skip)
+        if len(df) > 3:
+            first_rows_null_ratio = df.head(3).isna().sum().sum() / (3 * len(df.columns))
+            if first_rows_null_ratio > 0.7:
+                issues.append("First 3 rows are mostly empty (might need to skip)")
+        
+        # Check 6: Are column names actually descriptive?
+        if not all(str(col).isdigit() for col in df.columns):
+            # We have string column names - check if they're descriptive
+            avg_length = sum(len(str(col)) for col in df.columns) / len(df.columns)
+            if avg_length < 3:
+                issues.append("Column names are too short (less than 3 characters on average)")
+        
+        is_clean = len(issues) == 0
+        
+        return is_clean, issues
+    
+    def _extract_structure_info(self, df: pd.DataFrame, max_rows: int = 10) -> Dict[str, Any]:
+        """Extract structure information for LLM analysis"""
+        preview_rows = min(max_rows, len(df))
+        
+        return {
+            "shape": {"rows": len(df), "columns": len(df.columns)},
+            "column_names": df.columns.tolist(),
+            "dtypes": df.dtypes.astype(str).to_dict(),
+            "preview_data": df.head(preview_rows).to_dict(orient='records'),
+            "null_counts": df.isna().sum().to_dict(),
+            "first_row_values": df.iloc[0].tolist() if len(df) > 0 else []
+        }
+    
+    def _build_structure_prompt(self, info: Dict[str, Any], detected_issues: List[str]) -> str:
+        """Build prompt for structure analysis"""
+        return f"""Analyze this raw DataFrame structure and propose transformations.
+
+**Detected Issues (from heuristics):**
+{chr(10).join('- ' + issue for issue in detected_issues)}
+
+**DataFrame Info:**
+- Shape: {info['shape']['rows']} rows × {info['shape']['columns']} columns
+- Current column names: {info['column_names']}
+- First row values: {info['first_row_values'][:10]}
+
+**Preview (first few rows):**
+```json
+{json.dumps(info['preview_data'][:5], indent=2, default=str)}
+```
+
+**Instructions:**
+1. Determine if this data needs structural transformation
+2. Common issues to look for:
+   - First row should be used as header
+   - Empty rows at the top that should be skipped
+   - Unnamed or poorly named columns
+   - Empty columns that should be dropped
+   - Merged header rows that need special handling
+
+3. For each transformation, propose:
+   - A unique ID (e.g., "use_row_0_as_header")
+   - Type of transformation
+   - Description
+   - Parameters
+   - Confidence score (0.0-1.0)
+
+4. If you're uncertain about any transformation, create a question for the user
+
+**Response Format:**
+{{
+  "transformations": [
+    {{
+      "id": "unique_id",
+      "type": "use_row_as_header" | "skip_rows" | "drop_columns" | "rename_columns" | ...,
+      "description": "Human-readable description",
+      "params": {{"row_index": 0}} or {{"rows_to_skip": 2}} etc,
+      "confidence": 0.95
+    }}
+  ],
+  "questions": [
+    {{
+      "id": "question_id",
+      "question": "Should we...?",
+      "suggested_answer": "yes" or null,
+      "target": "transform.unique_id",
+      "question_type": "structural"
+    }}
+  ]
+}}
+
+**IMPORTANT:** If the data already has proper headers and clean structure, return empty transformations list!
+"""
+    
+    def _get_structure_system_prompt(self) -> str:
+        """System prompt for structure analysis"""
+        return """You are an expert data analyst specializing in detecting and fixing structural issues in raw tabular data.
+
+Your job is to:
+1. Identify structural problems (wrong headers, empty rows, malformed columns)
+2. Propose specific transformations to fix them
+3. Ask clarifying questions when uncertain
+
+Be conservative: if the data looks clean, don't propose unnecessary transformations.
+
+Always respond in valid JSON format with "transformations" and "questions" arrays."""
+    
+    @staticmethod
+    def apply_transformation(df: pd.DataFrame, trans: Transformation) -> pd.DataFrame:
+        """Apply a single transformation to DataFrame"""
+        df_result = df.copy()
+        
+        try:
+            if trans.type == TransformationType.USE_ROW_AS_HEADER:
+                row_idx = trans.params["row_index"]
+                df_result.columns = df_result.iloc[row_idx].astype(str).tolist()
+                df_result = df_result.iloc[row_idx + 1:].reset_index(drop=True)
+                
+            elif trans.type == TransformationType.SKIP_ROWS:
+                rows_to_skip = trans.params["rows_to_skip"]
+                df_result = df_result.iloc[rows_to_skip:].reset_index(drop=True)
+                
+            elif trans.type == TransformationType.DROP_COLUMNS:
+                cols = trans.params["columns"]
+                df_result = df_result.drop(columns=cols, errors='ignore')
+                
+            elif trans.type == TransformationType.DROP_ROWS:
+                indices = trans.params["indices"]
+                df_result = df_result.drop(index=indices, errors='ignore').reset_index(drop=True)
+                
+            elif trans.type == TransformationType.RENAME_COLUMNS:
+                mapping = trans.params["mapping"]
+                df_result = df_result.rename(columns=mapping)
+            
+            logger.info(f"✓ Applied: {trans.description}")
+            
+        except Exception as e:
+            logger.error(f"✗ Failed to apply {trans.id}: {str(e)}")
+            raise
+        
+        return df_result
+
+
+# ============================================================================
+# Profile Generation (Enhanced with Type Inference)
+# ============================================================================
+
+class ProfileGenerator:
+    """Generate statistical profiles with smart type inference"""
+    
+    @staticmethod
+    def generate_profiles(
+        df: pd.DataFrame, 
+        max_samples: int = 10
+    ) -> Dict[str, ColumnProfile]:
+        """Generate profile for each column with type inference"""
+        profiles = {}
+        
+        for col in df.columns:
+            series = df[col]
+            non_null = series.notna().sum()
+            null = series.isna().sum()
+            total = len(series)
+            
+            # Sample values
+            samples = series.dropna().head(max_samples).tolist()
+            raw_samples = series.dropna().astype(str).head(max_samples).tolist()
+            
+            # Type inference
+            inferred_type, metadata = TypeInferenceEngine.infer_type(series)
+            
+            profile = ColumnProfile(
+                name=str(col),
+                pandas_dtype=str(series.dtype),
+                inferred_type=inferred_type,
+                non_null_count=int(non_null),
+                null_count=int(null),
+                null_ratio=float(null / total) if total > 0 else 0.0,
+                n_unique=int(series.nunique()),
+                sample_values=samples,
+                sample_raw_values=raw_samples,
+                has_thousand_separator=metadata.get('thousand_separator') is not None,
+                decimal_separator=metadata.get('decimal_separator')
+            )
+            profiles[str(col)] = profile
+        
+        return profiles
+    
+    @staticmethod
+    def get_sample_rows(df: pd.DataFrame, n: int = 5) -> List[Dict[str, Any]]:
+        """Get sample rows"""
+        return df.head(n).to_dict(orient='records')
+
+
+class SchemaGenerator:
+    """Generate semantic schema using LLM with type awareness"""
+    
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+    
+    def generate_schema(
+        self, 
+        profiles: Dict[str, ColumnProfile],
+        sample_rows: List[Dict[str, Any]]
+    ) -> Tuple[Dict[str, ColumnSchema], List[Question]]:
+        """Generate schema with semantic types"""
+        
+        prompt = self._build_schema_prompt(profiles, sample_rows)
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_schema_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            
+            schema = {}
+            for col, spec in result["schema"].items():
+                # Add original_type from profile
+                original_type = profiles[col].pandas_dtype
+                spec['original_type'] = original_type
+                schema[col] = ColumnSchema(**spec)
+            
+            questions = [Question(**q) for q in result.get("questions", [])]
+            
+            logger.info(f"✓ Generated schema for {len(schema)} columns")
+            return schema, questions
+            
+        except Exception as e:
+            raise RuntimeError(f"Schema generation failed: {str(e)}")
+    
+    def _build_schema_prompt(
+        self, 
+        profiles: Dict[str, ColumnProfile],
+        sample_rows: List[Dict[str, Any]]
+    ) -> str:
+        """Build prompt with type inference info"""
+        
+        profiles_json = {}
+        for col, prof in profiles.items():
+            prof_dict = prof.to_dict()
+            # Add inference hints
+            if prof.has_thousand_separator:
+                prof_dict['note'] = f"Has thousand separator (e.g., {prof.sample_raw_values[0]!r}), should be {prof.inferred_type}"
+            profiles_json[col] = prof_dict
+        
+        return f"""Analyze column profiles and generate semantic schema.
+
+**Column Profiles (with type inference):**
+```json
+{json.dumps(profiles_json, indent=2, default=str)}
+```
+
+**Sample Rows:**
+```json
+{json.dumps(sample_rows, indent=2, default=str)}
+```
+
+Generate schema for each column:
+
+**Response Format:**
+{{
+  "schema": {{
+    "column_name": {{
+      "name": "column_name",
+      "description": "Brief description",
+      "semantic_type": "categorical" | "numeric" | "boolean" | "datetime" | "text" | "identifier",
+      "physical_type": "int64" | "float64" | "string" | "datetime64[ns]",
+      "unit": "m" | "m2" | "VND" | "USD" | null,
+      "is_required": true | false,
+      "constraints": {{"min": 0}} or null
+    }}
+  }},
+  "questions": [
+    {{
+      "id": "price_unit",
+      "question": "What is the unit of the 'price' column?",
+      "suggested_answer": "VND",
+      "target": "price.unit",
+      "question_type": "semantic"
+    }}
+  ]
+}}
+
+IMPORTANT: Use the inferred_type to set physical_type correctly (not pandas_dtype if it's object but should be int/float).
+"""
+    
+    def _get_schema_system_prompt(self) -> str:
+        """System prompt"""
+        return """You are an expert data analyst specializing in semantic schema inference.
+
+Analyze profiles and determine:
+1. Semantic type (what it represents)
+2. Physical type (actual data type - use inferred_type from profile)
+3. Units if applicable
+4. Required status (based on null_ratio)
+5. Constraints
+
+Pay attention to type inference hints - if a column has "inferred_type": "int" but "pandas_dtype": "object",
+it means the data has formatting (like 500.000) and should be treated as int after cleaning.
+
+Always respond in valid JSON."""
+
+
+# ============================================================================
+# Agent Q&A System
+# ============================================================================
+
+class DataSchemaAgent:
+    """Enhanced Agent with SQL query capability"""
+    
+    def __init__(
+        self, 
+        session: 'Session',
+        api_key: str, 
+        model: str = "gpt-4o-mini",
+        df_cleaned: Optional[pd.DataFrame] = None
+    ):
+        self.session = session
+        self.df_cleaned = df_cleaned
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+        self.sql_tool = None
+        
+        # Create SQL database if cleaned data provided
+        if df_cleaned is not None:
+            db_dir = Path("./agent_databases")
+            db_dir.mkdir(exist_ok=True)
+            
+            self.db_path = db_dir / f"data_{session.session_id}.db"
+            self.sql_tool = SQLQueryTool(str(self.db_path), df_cleaned)
+            logger.info("✓ Agent initialized with SQL capability")
+    
+    def enable_sql(self, df_cleaned: pd.DataFrame):
+        """Enable SQL capability with cleaned DataFrame"""
+        if self.sql_tool is None:
+            db_dir = Path("./agent_databases")
+            db_dir.mkdir(exist_ok=True)
+            
+            self.db_path = db_dir / f"data_{self.session.session_id}.db"
+            self.sql_tool = SQLQueryTool(str(self.db_path), df_cleaned)
+            self.df_cleaned = df_cleaned
+            logger.info("✓ SQL capability enabled for agent")
+    
+    def chat(self, user_message: str) -> str:
+        """Chat with agent - can execute SQL if enabled"""
+        
+        context = self._build_context()
+        
+        self.session.agent_conversations.append(AgentMessage(
+            role="user",
+            content=user_message,
+            timestamp=datetime.now().isoformat()
+        ))
+        
+        messages = [
+            {"role": "system", "content": self._get_system_prompt()},
+            {"role": "user", "content": f"**Context:**\n{context}\n\n**Question:**\n{user_message}"}
+        ]
+        
+        # Add history
+        for msg in self.session.agent_conversations[-11:-1]:
+            messages.append({"role": msg.role, "content": msg.content})
+        
+        try:
+            # Call with tools if SQL enabled
+            if self.sql_tool:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=self._get_tools(),
+                    tool_choice="auto",
+                    temperature=0.7,
+                    max_tokens=1000
+                )
+                
+                assistant_msg = response.choices[0].message
+                
+                if assistant_msg.tool_calls:
+                    assistant_response = self._handle_tool_calls(assistant_msg, user_message)
+                else:
+                    assistant_response = assistant_msg.content
+            else:
+                # No SQL - text only
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=500
+                )
+                assistant_response = response.choices[0].message.content
+            
+            self.session.agent_conversations.append(AgentMessage(
+                role="assistant",
+                content=assistant_response,
+                timestamp=datetime.now().isoformat(),
+                context={"used_sql": bool(self.sql_tool and assistant_msg.tool_calls if self.sql_tool else False)}
+            ))
+            
+            return assistant_response
+            
+        except Exception as e:
+            error_msg = f"Sorry, error: {str(e)}"
+            self.session.agent_conversations.append(AgentMessage(
+                role="assistant",
+                content=error_msg,
+                timestamp=datetime.now().isoformat()
+            ))
+            return error_msg
+    
+    def _handle_tool_calls(self, assistant_message, original_question: str) -> str:
+        """Handle SQL query execution"""
+        responses = []
+        
+        for tool_call in assistant_message.tool_calls:
+            if tool_call.function.name == "execute_sql_query":
+                arguments = json.loads(tool_call.function.arguments)
+                query = arguments.get("query", "")
+                
+                logger.info(f"🔍 Executing SQL: {query}")
+                
+                result_df, error = self.sql_tool.execute_query(query)
+                
+                if error:
+                    responses.append(f"❌ {error}")
+                else:
+                    if len(result_df) == 0:
+                        responses.append("✅ Query OK but no results")
+                    else:
+                        display_df = result_df.head(10)
+                        result_text = f"✅ Results ({len(result_df)} rows):\n\n{display_df.to_string(index=False)}"
+                        if len(result_df) > 10:
+                            result_text += f"\n\n(Showing 10/{len(result_df)} rows)"
+                        responses.append(result_text)
+        
+        if responses:
+            result_summary = "\n\n".join(responses)
+            
+            # Get interpretation
+            try:
+                interp_response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "Interpret SQL results for the user."},
+                        {"role": "user", "content": f"Question: {original_question}\n\nResults:\n{result_summary}\n\nInterpret:"}
+                    ],
+                    temperature=0.7,
+                    max_tokens=500
+                )
+                interpretation = interp_response.choices[0].message.content
+                return f"{result_summary}\n\n**Analysis:**\n{interpretation}"
+            except:
+                return result_summary
+        
+        return "Query issue occurred."
+    
+    def _get_tools(self) -> List[Dict[str, Any]]:
+        """Define SQL query tool"""
+        if not self.sql_tool:
+            return []
+        
+        schema_info = self.sql_tool.get_schema_info()
+        cols_desc = ", ".join([f"{c['name']} ({c['type']})" for c in schema_info['columns']])
+        
+        return [{
+            "type": "function",
+            "function": {
+                "name": "execute_sql_query",
+                "description": f"Execute SQL SELECT on table '{schema_info['table_name']}'. Columns: {cols_desc}. Rows: {schema_info['row_count']}. Use for analysis, aggregation, filtering.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "SQL SELECT query. Examples: 'SELECT * FROM data LIMIT 5', 'SELECT AVG(price) FROM data', 'SELECT category, COUNT(*) FROM data GROUP BY category'"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }]
+    
+    def _build_context(self) -> str:
+        """Build context"""
+        parts = []
+        
+        if self.session.sources:
+            parts.append(f"**Dataset:** {self.session.sources[0].source_id}")
+        
+        if self.df_cleaned is not None:
+            parts.append(f"**Shape:** {self.df_cleaned.shape[0]} rows × {self.df_cleaned.shape[1]} cols")
+        
+        if self.session.schema:
+            schema_lines = [
+                f"- **{col}**: {s.semantic_type} ({s.physical_type})" + 
+                (f", {s.unit}" if s.unit else "")
+                for col, s in list(self.session.schema.items())[:10]
+            ]
+            parts.append("**Schema:**\n" + "\n".join(schema_lines))
+        
+        if self.sql_tool:
+            info = self.sql_tool.get_schema_info()
+            parts.append(f"**SQL DB:** Table '{info['table_name']}' ({info['row_count']} rows)")
+        
+        return "\n\n".join(parts)
+    
+    def _get_system_prompt(self) -> str:
+        """System prompt"""
+        if self.sql_tool:
+            return """You are a data analyst with SQL access.
+
+You can:
+- Answer questions about the schema
+- Execute SQL queries to analyze data
+- Provide insights and recommendations
+
+SQL Guidelines:
+- Only SELECT queries
+- Table name: 'data'
+- Use LIMIT for previews
+- Use aggregations: COUNT, SUM, AVG, etc.
+- Use GROUP BY for categories
+- Use WHERE for filtering
+
+Examples:
+- "SELECT * FROM data LIMIT 5"
+- "SELECT AVG(price) FROM data WHERE category='A'"
+- "SELECT district, COUNT(*) as count FROM data GROUP BY district ORDER BY count DESC"
+
+Always explain findings clearly."""
+        else:
+            return """You are a data schema assistant.
+
+Help users understand their data schema:
+- Explain column meanings
+- Suggest analyses
+- Recommend improvements
+
+Be concise and helpful."""
+    
+    def close(self):
+        """Close database"""
+        if self.sql_tool:
+            self.sql_tool.close()
+
+
+# ============================================================================
+# Refinement Engine (Enhanced)
+# ============================================================================
+
+class RefinementEngine:
+    """Handle schema refinement based on user answers"""
+    
+    def __init__(self, session: 'Session'):
+        self.session = session
+    
+    def apply_answer(self, answer: Answer) -> bool:
+        """Apply user answer to schema"""
+        try:
+            question = next(q for q in self.session.questions if q.id == answer.question_id)
+            
+            parts = question.target.split(".")
+            if len(parts) != 2:
+                logger.warning(f"Invalid target: {question.target}")
+                return False
+            
+            col_name, field = parts
+            
+            if col_name not in self.session.schema:
+                logger.warning(f"Column not found: {col_name}")
+                return False
+            
+            schema_col = self.session.schema[col_name]
+            
+            if field == "unit":
+                schema_col.unit = answer.answer
+            elif field == "description":
+                schema_col.description = answer.answer
+            elif field == "semantic_type":
+                schema_col.semantic_type = answer.answer
+            elif field == "physical_type":
+                schema_col.physical_type = answer.answer
+            elif field == "is_required":
+                schema_col.is_required = answer.answer.lower() in ('true', 'yes', '1')
+            else:
+                logger.warning(f"Unknown field: {field}")
+                return False
+            
+            answer.applied = True
+            
+            self.session.history.append(HistoryEntry(
+                timestamp=datetime.now().isoformat(),
+                action="question_answered",
+                details={
+                    "question_id": answer.question_id,
+                    "question": question.question,
+                    "answer": answer.answer,
+                    "target": question.target
+                },
+                schema_version=self.session.schema_version
+            ))
+            
+            self.session.schema_version += 1
+            
+            logger.info(f"✓ Applied answer to {question.target}: {answer.answer}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to apply answer: {str(e)}")
+            return False
+
+
+# ============================================================================
+# Session Management (Enhanced with Cleaning)
+# ============================================================================
+
+class SessionManager:
+    """Manage session state and checkpoints"""
+    
+    def __init__(self, output_dir: str):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.checkpoints_dir = self.output_dir / "checkpoints"
+        self.checkpoints_dir.mkdir(exist_ok=True)
+    
+    def create_session(
+        self,
+        sources: List[DataSource],
+        current_source_id: str
+    ) -> Session:
+        """Create new session"""
+        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        session = Session(
+            session_id=session_id,
+            created_at=datetime.now().isoformat(),
+            sources=sources,
+            current_source_id=current_source_id,
+            raw_structure_info={},
+            transformations=[],
+            applied_transformations=[],
+            cleaning_rules=[],
+            applied_cleaning_rules=[],
+            schema={},
+            profiles={},
+            questions=[],
+            answers=[],
+            agent_conversations=[],
+            history=[],
+            checkpoints=[]
+        )
+        
+        logger.info(f"✓ Created session: {session_id}")
+        return session
+    
+    def save_checkpoint(
+        self,
+        session: Session,
+        df: pd.DataFrame,
+        stage: str,
+        description: str
+    ) -> DataFrameCheckpoint:
+        """Save DataFrame checkpoint"""
+        checkpoint_id = f"{session.session_id}_{stage}_{len(session.checkpoints)}"
+        timestamp = datetime.now().isoformat()
+        
+        checkpoint_file = self.checkpoints_dir / f"{checkpoint_id}.parquet"
+        df.to_parquet(checkpoint_file, index=False)
+        
+        checkpoint = DataFrameCheckpoint(
+            checkpoint_id=checkpoint_id,
+            stage=stage,
+            timestamp=timestamp,
+            shape=(len(df), len(df.columns)),
+            description=description,
+            file_path=str(checkpoint_file)
+        )
+        
+        session.checkpoints.append(checkpoint)
+        
+        logger.info(f"✓ Checkpoint: {stage} ({checkpoint.shape[0]}×{checkpoint.shape[1]})")
+        return checkpoint
+    
+    def load_checkpoint(self, checkpoint: DataFrameCheckpoint) -> pd.DataFrame:
+        """Load DataFrame from checkpoint"""
+        if not checkpoint.file_path:
+            raise ValueError("No file path")
+        
+        df = pd.read_parquet(checkpoint.file_path)
+        logger.info(f"✓ Loaded: {checkpoint.stage}")
+        return df
+    
+    def save_session(self, session: Session):
+        """Save session to JSON"""
+        session_file = self.output_dir / f"session_{session.session_id}.json"
+        
+        with open(session_file, 'w', encoding='utf-8') as f:
+            json.dump(session.to_dict(), f, indent=2, ensure_ascii=False, default=str)
+        
+        logger.info(f"✓ Session saved: {session_file}")
+
+
+# ============================================================================
+# CLI Interface (Enhanced)
+# ============================================================================
+
+class CLI:
+    """Command-line interface"""
+    
+    def __init__(self, args):
+        self.args = args
+        self.session_manager = SessionManager(args.output_dir)
+    
+    def run(self):
+        """Execute pipeline"""
+        
+        logger.info("="*70)
+        logger.info("Enhanced Data Schema Analysis Pipeline V4")
+        logger.info("="*70)
+        
+        # Discover sources
+        logger.info("\nStep 1: Discovering data sources...")
+        file_paths = self.args.file_paths if isinstance(self.args.file_paths, list) else [self.args.file_paths]
+        sources = DataIngestor.discover_sources(file_paths)
+        
+        if not sources:
+            raise ValueError("No valid sources found")
+        
+        # Create session
+        session = self.session_manager.create_session(
+            sources=sources,
+            current_source_id=sources[0].source_id
+        )
+        
+        # Process each source
+        for source in sources:
+            logger.info(f"\n{'='*70}")
+            logger.info(f"Processing: {source.source_id}")
+            logger.info(f"{'='*70}")
+            
+            self._process_source(session, source)
+        
+        # Agent Q&A
+        if not self.args.skip_agent and session.schema:
+            logger.info("\n" + "="*70)
+            logger.info("Agent Q&A: Ask questions about your data schema")
+            logger.info("="*70)
+            self._agent_chat(session)
+        
+        # Save
+        self.session_manager.save_session(session)
+        
+        logger.info("\n" + "="*70)
+        logger.info(f"✓ Complete! Session: {session.session_id}")
+        logger.info(f"✓ Output: {self.args.output_dir}")
+        logger.info("="*70 + "\n")
+    
+    def _process_source(self, session: Session, source: DataSource):
+        """Process single source"""
+        
+        # Load raw
+        logger.info(f"\nLoading raw data...")
+        df_raw = DataIngestor.load_raw(source)
+        
+        checkpoint_raw = self.session_manager.save_checkpoint(
+            session, df_raw, "raw", f"Raw: {source.source_id}"
+        )
+        
+        # Structure analysis
+        logger.info("\nAnalyzing structure...")
+        analyzer = StructureAnalyzer(api_key=self.args.api_key, model=self.args.model)
+        
+        structure_info, transformations, structural_qs, is_clean = analyzer.analyze_structure(df_raw)
+        
+        session.raw_structure_info[source.source_id] = structure_info
+        session.is_clean_structure = is_clean
+        
+        df_clean = df_raw.copy()
+        applied_trans = []
+        
+        # Handle transformations
+        if transformations and not self.args.skip_interactive:
+            df_clean, applied_trans = self._handle_transformations(df_clean, transformations, session)
+        elif transformations and self.args.auto_transform:
+            for t in transformations:
+                if t.confidence >= 0.9:
+                    logger.info(f"Auto-applying: {t.description}")
+                    df_clean = StructureAnalyzer.apply_transformation(df_clean, t)
+                    applied_trans.append(t.id)
+        
+        session.transformations.extend(transformations)
+        session.applied_transformations.extend(applied_trans)
+        
+        checkpoint_clean = self.session_manager.save_checkpoint(
+            session, df_clean, "after_structure", "After structure transforms"
+        )
+        
+        # Generate profiles with type inference
+        logger.info("\nGenerating profiles with type inference...")
+        profiles = ProfileGenerator.generate_profiles(df_clean)
+        
+        # Show type inference results
+        for col_name, profile in profiles.items():
+            if profile.inferred_type != 'string' and df_clean[col_name].dtype == 'object':
+                logger.info(f"  Column '{col_name}': {profile.pandas_dtype} → {profile.inferred_type}")
+                if profile.has_thousand_separator:
+                    logger.info(f"    Example: {profile.sample_raw_values[0]!r}")
+        
+        # Generate cleaning rules
+        logger.info("\nGenerating data cleaning rules...")
+        cleaning_rules = TypeInferenceEngine.generate_cleaning_rules(df_clean, profiles)
+        session.cleaning_rules.extend(cleaning_rules)
+        
+        if cleaning_rules:
+            logger.info(f"Found {len(cleaning_rules)} cleaning rule(s)")
+            
+            # Apply cleaning
+            df_cleaned = df_clean.copy()
+            applied_cleaning = []
+            
+            if not self.args.skip_interactive:
+                df_cleaned, applied_cleaning = self._handle_cleaning(df_cleaned, cleaning_rules, session)
+            elif self.args.auto_clean:
+                for rule in cleaning_rules:
+                    df_cleaned = TypeInferenceEngine.apply_cleaning_rule(df_cleaned, rule)
+                    applied_cleaning.append(rule.id)
+            
+            session.applied_cleaning_rules.extend(applied_cleaning)
+            
+            # Save checkpoint after cleaning
+            checkpoint_cleaned = self.session_manager.save_checkpoint(
+                session, df_cleaned, "cleaned", "After data cleaning"
+            )
+            
+            # Regenerate profiles after cleaning
+            profiles = ProfileGenerator.generate_profiles(df_cleaned)
+            
+            df_final = df_cleaned
+            
+        else:
+            logger.info("No cleaning needed")
+            df_final = df_clean
+        self._final_df = df_final  # Save for agent
+        sample_rows = ProfileGenerator.get_sample_rows(df_final)
+        
+        # Generate schema
+        logger.info("\nGenerating semantic schema...")
+        schema_gen = SchemaGenerator(api_key=self.args.api_key, model=self.args.model)
+        schema, semantic_qs = schema_gen.generate_schema(profiles, sample_rows)
+        
+        session.profiles.update(profiles)
+        session.schema.update(schema)
+        session.questions.extend(structural_qs + semantic_qs)
+        
+        # Interactive refinement
+        if semantic_qs and not self.args.skip_interactive:
+            logger.info("\nInteractive refinement...")
+            self._interactive_refinement(session, semantic_qs)
+    
+    def _handle_transformations(
+        self,
+        df: pd.DataFrame,
+        transformations: List[Transformation],
+        session: Session
+    ) -> Tuple[pd.DataFrame, List[str]]:
+        """Handle transformations interactively"""
+        df_result = df.copy()
+        applied = []
+        
+        logger.info(f"\nFound {len(transformations)} transformation(s):\n")
+        
+        for i, trans in enumerate(transformations, 1):
+            logger.info(f"[{i}/{len(transformations)}] {trans.description}")
+            logger.info(f"    Confidence: {trans.confidence:.2%}")
+            
+            user_input = input(f"    Apply? [y/N]: ").strip().lower()
+            
+            if user_input in ('y', 'yes'):
+                df_result = StructureAnalyzer.apply_transformation(df_result, trans)
+                applied.append(trans.id)
+                
+                self.session_manager.save_checkpoint(
+                    session, df_result, f"trans_{trans.id}", trans.description
+                )
+            
+            print()
+        
+        return df_result, applied
+    
+    def _handle_cleaning(
+        self,
+        df: pd.DataFrame,
+        rules: List[CleaningRule],
+        session: Session
+    ) -> Tuple[pd.DataFrame, List[str]]:
+        """Handle cleaning rules interactively"""
+        df_result = df.copy()
+        applied = []
+        
+        logger.info(f"\nFound {len(rules)} cleaning rule(s):\n")
+        
+        for i, rule in enumerate(rules, 1):
+            logger.info(f"[{i}/{len(rules)}] {rule.description}")
+            logger.info(f"    Column: {rule.column}")
+            logger.info(f"    Action: {rule.action}")
+            
+            user_input = input(f"    Apply? [y/N]: ").strip().lower()
+            
+            if user_input in ('y', 'yes'):
+                df_result = TypeInferenceEngine.apply_cleaning_rule(df_result, rule)
+                applied.append(rule.id)
+                
+                self.session_manager.save_checkpoint(
+                    session, df_result, f"clean_{rule.id}", rule.description
+                )
+            
+            print()
+        
+        return df_result, applied
+    
+    def _interactive_refinement(self, session: Session, questions: List[Question]):
+        """Handle Q&A"""
+        engine = RefinementEngine(session)
+        
+        semantic_qs = [q for q in questions if q.question_type == "semantic"]
+        
+        if not semantic_qs:
+            return
+        
+        logger.info(f"\nFound {len(semantic_qs)} question(s):\n")
+        
+        for i, question in enumerate(semantic_qs, 1):
+            logger.info(f"[{i}/{len(semantic_qs)}] {question.question}")
+            if question.suggested_answer:
+                logger.info(f"    Suggested: {question.suggested_answer}")
+            
+            user_input = input(f"    Answer (or Enter for suggestion): ").strip()
+            
+            if not user_input and question.suggested_answer:
+                user_input = question.suggested_answer
+            
+            if user_input:
+                answer = Answer(
+                    question_id=question.id,
+                    answer=user_input,
+                    timestamp=datetime.now().isoformat()
+                )
+                session.answers.append(answer)
+                engine.apply_answer(answer)
+            
+            print()
+    
+    def _agent_chat(self, session: Session):
+        """Interactive agent Q&A with SQL capability"""
+        
+        # Get the final cleaned DataFrame
+        df_final = None
+        if hasattr(self, '_final_df'):
+            df_final = self._final_df
+        else:
+            # Try to load from latest checkpoint
+            if session.checkpoints:
+                latest_cp = session.checkpoints[-1]
+                try:
+                    df_final = self.session_manager.load_checkpoint(latest_cp)
+                except:
+                    pass
+        
+        # Initialize or enable SQL for agent
+        agent = DataSchemaAgent(session, api_key=self.args.api_key, model=self.args.model)
+        
+        if df_final is not None:
+            agent.enable_sql(df_final)
+            logger.info("\n✓ Agent ready with SQL query capability!")
+            logger.info("  You can ask questions that require data analysis")
+            logger.info("  Examples:")
+            logger.info("    - 'What is the average price?'")
+            logger.info("    - 'How many items per category?'")
+            logger.info("    - 'Show me the top 5 most expensive items'")
+        else:
+            logger.info("\n✓ Agent ready (schema questions only)")
+        
+        logger.info("\nAsk me anything! (Type 'exit' to quit)\n")
+        
+        while True:
+            try:
+                user_input = input("You: ").strip()
+                
+                if not user_input:
+                    continue
+                
+                if user_input.lower() in ('exit', 'quit', 'q'):
+                    logger.info("\nAgent session ended.\n")
+                    break
+                
+                response = agent.chat(user_input)
+                print(f"\nAgent: {response}\n")
+                
+            except KeyboardInterrupt:
+                logger.info("\n\nAgent session ended.\n")
+                break
+            except Exception as e:
+                logger.error(f"\nError: {str(e)}\n")
+        
+        agent.close()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Enhanced Data Schema Analysis Pipeline V4"
+    )
+    parser.add_argument(
+        "file_paths",
+        nargs='+',
+        type=str,
+        help="CSV or XLSX file(s)"
+    )
+    parser.add_argument("--model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--output-dir", type=str, default="./output")
+    parser.add_argument("--api-key", type=str, default=None)
+    parser.add_argument("--skip-interactive", action="store_true")
+    parser.add_argument("--auto-transform", action="store_true")
+    parser.add_argument("--auto-clean", action="store_true", help="Auto-apply cleaning rules")
+    parser.add_argument("--skip-agent", action="store_true", help="Skip agent Q&A")
+    
+    args = parser.parse_args()
+    
+    if not args.api_key:
+        args.api_key = os.getenv("OPENAI_API_KEY")
+    
+    if not args.api_key:
+        logger.error("Error: OpenAI API key required")
+        sys.exit(1)
+    
+    try:
+        cli = CLI(args)
+        cli.run()
+    except Exception as e:
+        logger.error(f"\n✗ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
