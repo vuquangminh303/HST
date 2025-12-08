@@ -1,7 +1,9 @@
 """
-Enhanced Data Schema Analysis Pipeline V4
+Enhanced Data Schema Analysis Pipeline V5
 - Smart type inference (handles 500.000 → int, not str)
 - Data cleaning and type conversion
+- Question-driven schema generation
+- Schema validation against user questions
 - Interactive Q&A agent after schema refinement
 - Full Streamlit integration
 """
@@ -183,21 +185,61 @@ class DataSource(BaseModel):
         return self.model_dump()
 
 
+class UserQuestion(BaseModel):
+    """User-defined question that will be frequently asked"""
+    id: str
+    question: str
+    description: str = ""  # Optional description of what the question is about
+    priority: str = "medium"  # low, medium, high
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class OutputField(BaseModel):
+    """Expected output field definition"""
+    field_name: str
+    description: str
+    data_type: str  # Expected data type (string, number, date, etc.)
+    required: bool = True
+    example_value: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class QuestionSet(BaseModel):
+    """Collection of user questions and expected output format"""
+    user_questions: List[UserQuestion] = Field(default_factory=list)
+    output_fields: List[OutputField] = Field(default_factory=list)
+    additional_notes: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "user_questions": [q.to_dict() for q in self.user_questions],
+            "output_fields": [f.to_dict() for f in self.output_fields],
+            "additional_notes": self.additional_notes
+        }
+
+
 class Session(BaseModel):
     """Complete session state"""
     session_id: str
     created_at: str
-    
+
     sources: List[DataSource]
     current_source_id: str
-    
+
     raw_structure_info: Dict[str, Any]
     transformations: List[Transformation]
     applied_transformations: List[str]
-    
+
     # Data cleaning
     cleaning_rules: List[CleaningRule] = Field(default_factory=list)
     applied_cleaning_rules: List[str] = Field(default_factory=list)
+
+    # User questions and output format
+    question_set: Optional[QuestionSet] = None
     
     schema: Dict[str, ColumnSchema]
     profiles: Dict[str, ColumnProfile]
@@ -227,6 +269,7 @@ class Session(BaseModel):
             "applied_transformations": self.applied_transformations,
             "cleaning_rules": [r.to_dict() for r in self.cleaning_rules],
             "applied_cleaning_rules": self.applied_cleaning_rules,
+            "question_set": self.question_set.to_dict() if self.question_set else None,
             "schema": {k: v.to_dict() for k, v in self.schema.items()},
             "profiles": {k: v.to_dict() for k, v in self.profiles.items()},
             "questions": [q.to_dict() for q in self.questions],
@@ -900,13 +943,14 @@ class SchemaGenerator:
         self.model = model
     
     def generate_schema(
-        self, 
+        self,
         profiles: Dict[str, ColumnProfile],
-        sample_rows: List[Dict[str, Any]]
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None
     ) -> Tuple[Dict[str, ColumnSchema], List[Question]]:
-        """Generate schema with semantic types"""
-        
-        prompt = self._build_schema_prompt(profiles, sample_rows)
+        """Generate schema with semantic types, guided by user questions if provided"""
+
+        prompt = self._build_schema_prompt(profiles, sample_rows, question_set)
         
         try:
             response = self.client.chat.completions.create(
@@ -937,12 +981,13 @@ class SchemaGenerator:
             raise RuntimeError(f"Schema generation failed: {str(e)}")
     
     def _build_schema_prompt(
-        self, 
+        self,
         profiles: Dict[str, ColumnProfile],
-        sample_rows: List[Dict[str, Any]]
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None
     ) -> str:
-        """Build prompt with type inference info"""
-        
+        """Build prompt with type inference info and user questions"""
+
         profiles_json = {}
         for col, prof in profiles.items():
             prof_dict = prof.to_dict()
@@ -950,8 +995,32 @@ class SchemaGenerator:
             if prof.has_thousand_separator:
                 prof_dict['note'] = f"Has thousand separator (e.g., {prof.sample_raw_values[0]!r}), should be {prof.inferred_type}"
             profiles_json[col] = prof_dict
-        
-        return f"""Analyze column profiles and generate semantic schema.
+
+        # Build user questions context if provided
+        user_context = ""
+        if question_set and (question_set.user_questions or question_set.output_fields):
+            user_context = f"""
+
+**IMPORTANT: User's Expected Usage**
+
+The user has specified how they intend to use this data:
+
+**Questions the user will ask:**
+{json.dumps([q.to_dict() for q in question_set.user_questions], indent=2)}
+
+**Expected output fields needed:**
+{json.dumps([f.to_dict() for f in question_set.output_fields], indent=2)}
+
+**Additional notes:**
+{question_set.additional_notes}
+
+Please ensure the schema you generate has enough semantic information to:
+1. Answer the user's questions accurately
+2. Map to the expected output fields
+3. Provide clear descriptions that help answer these questions
+"""
+
+        return f"""Analyze column profiles and generate semantic schema.{user_context}
 
 **Column Profiles (with type inference):**
 ```json
@@ -1007,6 +1076,136 @@ Pay attention to type inference hints - if a column has "inferred_type": "int" b
 it means the data has formatting (like 500.000) and should be treated as int after cleaning.
 
 Always respond in valid JSON."""
+
+
+class SchemaValidator:
+    """Validate if schema can answer user questions and suggest refinements"""
+
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+
+    def validate_schema_for_questions(
+        self,
+        schema: Dict[str, ColumnSchema],
+        profiles: Dict[str, ColumnProfile],
+        question_set: QuestionSet,
+        sample_rows: List[Dict[str, Any]]
+    ) -> Tuple[bool, List[Question], str]:
+        """
+        Validate if current schema can answer user questions.
+
+        Returns:
+            - is_sufficient: Whether schema is sufficient
+            - additional_questions: Questions to ask if schema is insufficient
+            - validation_report: Detailed report of the validation
+        """
+        prompt = self._build_validation_prompt(schema, profiles, question_set, sample_rows)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_validation_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+
+            is_sufficient = result.get("is_sufficient", False)
+            additional_questions = [Question(**q) for q in result.get("additional_questions", [])]
+            validation_report = result.get("validation_report", "")
+
+            logger.info(f"✓ Schema validation: {'Sufficient' if is_sufficient else 'Needs refinement'}")
+            if not is_sufficient:
+                logger.info(f"  Additional questions needed: {len(additional_questions)}")
+
+            return is_sufficient, additional_questions, validation_report
+
+        except Exception as e:
+            raise RuntimeError(f"Schema validation failed: {str(e)}")
+
+    def _build_validation_prompt(
+        self,
+        schema: Dict[str, ColumnSchema],
+        profiles: Dict[str, ColumnProfile],
+        question_set: QuestionSet,
+        sample_rows: List[Dict[str, Any]]
+    ) -> str:
+        """Build validation prompt"""
+
+        schema_json = {k: v.to_dict() for k, v in schema.items()}
+        profiles_json = {k: v.to_dict() for k, v in profiles.items()}
+
+        return f"""Validate if the current schema can adequately answer the user's questions.
+
+**User Questions to Answer:**
+{json.dumps([q.to_dict() for q in question_set.user_questions], indent=2)}
+
+**Expected Output Fields:**
+{json.dumps([f.to_dict() for f in question_set.output_fields], indent=2)}
+
+**Additional Notes:**
+{question_set.additional_notes}
+
+**Current Schema:**
+```json
+{json.dumps(schema_json, indent=2, default=str)}
+```
+
+**Column Profiles:**
+```json
+{json.dumps(profiles_json, indent=2, default=str)}
+```
+
+**Sample Data Rows:**
+```json
+{json.dumps(sample_rows[:5], indent=2, default=str)}
+```
+
+Analyze whether the current schema provides enough information to:
+1. Answer each user question accurately
+2. Generate the expected output fields
+3. Handle the data transformations required
+
+**Response Format:**
+{{
+  "is_sufficient": true | false,
+  "validation_report": "Detailed explanation of what can/cannot be answered",
+  "additional_questions": [
+    {{
+      "id": "unique_id",
+      "question": "What specific information is needed?",
+      "suggested_answer": "Possible answer",
+      "target": "schema_field_path",
+      "question_type": "semantic"
+    }}
+  ],
+  "missing_fields": ["field1", "field2"],
+  "unclear_mappings": {{
+    "user_question_id": "explanation of why it's unclear"
+  }}
+}}
+"""
+
+    def _get_validation_system_prompt(self) -> str:
+        """System prompt for validation"""
+        return """You are an expert data schema validator.
+
+Your task is to determine if a data schema is sufficient to answer specific user questions.
+
+Analyze:
+1. Can each user question be answered with the current schema?
+2. Are the expected output fields mappable to schema columns?
+3. Are there ambiguities or missing information?
+4. What additional clarifications are needed?
+
+Be thorough but practical. Only request clarifications that are truly necessary.
+
+Always respond in valid JSON format."""
 
 
 # ============================================================================

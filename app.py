@@ -1,6 +1,7 @@
 """
-Streamlit UI V4 - Complete Pipeline
-Full workflow from V3 + Type Cleaning + Agent Q&A
+Streamlit UI V5 - Question-Driven Schema Generation
+Full workflow from V4 + User Question Collection + Schema Validation
+Allows users to define expected questions and output format before schema generation
 """
 
 import streamlit as st
@@ -18,7 +19,8 @@ from schema_pipeline import (
     DataIngestor, StructureAnalyzer, ProfileGenerator, SchemaGenerator,
     SessionManager, RefinementEngine, DataSource, Session, Transformation,
     Question, Answer, ColumnProfile, ColumnSchema, DataFrameCheckpoint,
-    TypeInferenceEngine, CleaningRule, DataSchemaAgent, AgentMessage
+    TypeInferenceEngine, CleaningRule, DataSchemaAgent, AgentMessage,
+    UserQuestion, OutputField, QuestionSet, SchemaValidator
 )
 
 # Page config
@@ -494,7 +496,182 @@ def tab_type_cleaning():
 
 
 # ============================================================================
-# Tab 4: Schema Generation
+# Tab 4: Question Collection
+# ============================================================================
+
+def tab_question_collection():
+    """Question collection tab - Define expected usage"""
+    st.header("❓ Question Collection")
+
+    if not st.session_state.session:
+        st.warning("⚠️ No active session")
+        return
+
+    session = st.session_state.session
+
+    st.markdown("""
+    **Define how you will use this data:**
+
+    This step helps the system understand your needs and generate a better schema.
+    Provide:
+    1. **Sample questions** you will frequently ask
+    2. **Expected output format** - fields you need in responses
+    3. Any additional context
+    """)
+
+    # Initialize question_set if not exists
+    if not session.question_set:
+        session.question_set = QuestionSet()
+
+    question_set = session.question_set
+
+    # ============================================================================
+    # Section 1: User Questions
+    # ============================================================================
+    st.subheader("📝 Sample Questions")
+    st.write("What questions will you frequently ask about this data?")
+
+    # Display existing questions
+    if question_set.user_questions:
+        st.write("**Current Questions:**")
+        for i, uq in enumerate(question_set.user_questions):
+            with st.expander(f"Question {i+1}: {uq.question[:50]}...", expanded=False):
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    st.write(f"**Question:** {uq.question}")
+                    if uq.description:
+                        st.write(f"**Description:** {uq.description}")
+                    st.write(f"**Priority:** {uq.priority}")
+                with col2:
+                    if st.button("🗑️ Delete", key=f"del_q_{uq.id}"):
+                        question_set.user_questions = [q for q in question_set.user_questions if q.id != uq.id]
+                        st.success("Deleted!")
+                        st.rerun()
+
+    # Add new question
+    with st.form("add_question_form"):
+        st.write("**Add New Question:**")
+        new_question = st.text_area("Question", placeholder="E.g., What is the total revenue by product category?")
+        new_description = st.text_input("Description (optional)", placeholder="Brief explanation")
+        new_priority = st.selectbox("Priority", ["low", "medium", "high"], index=1)
+
+        if st.form_submit_button("➕ Add Question"):
+            if new_question:
+                question_set.user_questions.append(UserQuestion(
+                    id=f"uq_{len(question_set.user_questions)+1}_{datetime.now().timestamp()}",
+                    question=new_question,
+                    description=new_description,
+                    priority=new_priority
+                ))
+                st.success("✓ Question added!")
+                st.rerun()
+            else:
+                st.error("Please enter a question")
+
+    st.divider()
+
+    # ============================================================================
+    # Section 2: Output Fields
+    # ============================================================================
+    st.subheader("📊 Expected Output Fields")
+    st.write("Define the fields you need in the query responses")
+
+    # Display existing output fields
+    if question_set.output_fields:
+        st.write("**Current Output Fields:**")
+        for i, field in enumerate(question_set.output_fields):
+            with st.expander(f"Field: {field.field_name}", expanded=False):
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    st.write(f"**Field Name:** {field.field_name}")
+                    st.write(f"**Description:** {field.description}")
+                    st.write(f"**Data Type:** {field.data_type}")
+                    st.write(f"**Required:** {'Yes' if field.required else 'No'}")
+                    if field.example_value:
+                        st.write(f"**Example:** {field.example_value}")
+                with col2:
+                    if st.button("🗑️ Delete", key=f"del_f_{field.field_name}_{i}"):
+                        question_set.output_fields = [f for j, f in enumerate(question_set.output_fields) if j != i]
+                        st.success("Deleted!")
+                        st.rerun()
+
+    # Add new output field
+    with st.form("add_field_form"):
+        st.write("**Add New Output Field:**")
+        col1, col2 = st.columns(2)
+        with col1:
+            field_name = st.text_input("Field Name", placeholder="E.g., total_revenue")
+            data_type = st.selectbox("Data Type", ["string", "number", "integer", "float", "date", "boolean", "array", "object"])
+        with col2:
+            field_desc = st.text_input("Description", placeholder="What does this field represent?")
+            is_required = st.checkbox("Required", value=True)
+
+        example_value = st.text_input("Example Value (optional)", placeholder="E.g., 1500000")
+
+        if st.form_submit_button("➕ Add Field"):
+            if field_name and field_desc:
+                question_set.output_fields.append(OutputField(
+                    field_name=field_name,
+                    description=field_desc,
+                    data_type=data_type,
+                    required=is_required,
+                    example_value=example_value if example_value else None
+                ))
+                st.success("✓ Field added!")
+                st.rerun()
+            else:
+                st.error("Please enter field name and description")
+
+    st.divider()
+
+    # ============================================================================
+    # Section 3: Additional Notes
+    # ============================================================================
+    st.subheader("📝 Additional Context")
+    additional_notes = st.text_area(
+        "Any additional information about how you'll use this data?",
+        value=question_set.additional_notes,
+        placeholder="E.g., This data will be used for monthly financial reports..."
+    )
+
+    if st.button("💾 Save Additional Notes"):
+        question_set.additional_notes = additional_notes
+        st.success("✓ Notes saved!")
+
+    st.divider()
+
+    # ============================================================================
+    # Summary and Actions
+    # ============================================================================
+    st.subheader("📊 Summary")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Questions Defined", len(question_set.user_questions))
+    with col2:
+        st.metric("Output Fields", len(question_set.output_fields))
+    with col3:
+        has_notes = "Yes" if question_set.additional_notes else "No"
+        st.metric("Additional Notes", has_notes)
+
+    # Show warning if nothing defined
+    if not question_set.user_questions and not question_set.output_fields:
+        st.info("💡 **Tip:** Defining questions and output fields helps generate a more relevant schema. You can skip this step if you prefer.")
+
+    # Clear all button
+    if question_set.user_questions or question_set.output_fields:
+        if st.button("🗑️ Clear All"):
+            if st.session_state.get('confirm_clear'):
+                session.question_set = QuestionSet()
+                st.session_state.confirm_clear = False
+                st.success("✓ All cleared!")
+                st.rerun()
+            else:
+                st.session_state.confirm_clear = True
+                st.warning("Click again to confirm")
+
+
+# ============================================================================
+# Tab 5: Schema Generation
 # ============================================================================
 
 def tab_schema_generation():
@@ -531,30 +708,55 @@ def tab_schema_generation():
             # Generate profiles
             profiles = ProfileGenerator.generate_profiles(df)
             sample_rows = ProfileGenerator.get_sample_rows(df)
-            
-            # Generate schema
+
+            # Generate schema (with question_set if available)
             schema_gen = SchemaGenerator(
                 api_key=st.session_state.api_key,
                 model=st.session_state.model
             )
-            schema, questions = schema_gen.generate_schema(profiles, sample_rows)
-            
+            schema, questions = schema_gen.generate_schema(
+                profiles,
+                sample_rows,
+                question_set=session.question_set
+            )
+
+            # Validate schema against user questions (if provided)
+            validation_report = None
+            is_sufficient = True
+            if session.question_set and (session.question_set.user_questions or session.question_set.output_fields):
+                with st.spinner("Validating schema against your questions..."):
+                    validator = SchemaValidator(
+                        api_key=st.session_state.api_key,
+                        model=st.session_state.model
+                    )
+                    is_sufficient, additional_questions, validation_report = validator.validate_schema_for_questions(
+                        schema, profiles, session.question_set, sample_rows
+                    )
+
+                    # Add additional questions to refinement questions
+                    if not is_sufficient and additional_questions:
+                        questions.extend(additional_questions)
+
             # Store results
             if 'schema_results' not in st.session_state:
                 st.session_state.schema_results = {}
-            
+
             st.session_state.schema_results[selected_source_id] = {
                 'profiles': profiles,
                 'schema': schema,
-                'questions': questions
+                'questions': questions,
+                'validation_report': validation_report,
+                'is_sufficient': is_sufficient
             }
-            
+
             # Update session
             session.profiles.update(profiles)
             session.schema.update(schema)
             session.questions.extend(questions)
-            
+
             st.success(f"✅ Generated schema for {len(schema)} columns")
+            if not is_sufficient:
+                st.warning("⚠️ Schema may not be sufficient to answer all your questions. Please review validation report and answer refinement questions below.")
             st.rerun()
     
     # Display schema
@@ -606,7 +808,20 @@ def tab_schema_generation():
                     # Sample values
                     st.subheader("Sample Values")
                     st.write(profile.sample_values[:10])
-        
+
+        # Validation Report
+        if results.get('validation_report'):
+            st.divider()
+            st.subheader("🔍 Schema Validation Report")
+
+            if results.get('is_sufficient'):
+                st.success("✅ Schema is sufficient to answer your questions!")
+            else:
+                st.warning("⚠️ Schema needs refinement")
+
+            with st.expander("📄 View Detailed Report", expanded=not results.get('is_sufficient')):
+                st.markdown(results['validation_report'])
+
         # Questions
         if results['questions']:
             st.divider()
@@ -1043,9 +1258,9 @@ def main():
     
     # Sidebar
     with st.sidebar:
-        st.title("📊 Data Schema Pipeline V4")
-        st.write("Complete workflow + Type Cleaning + Agent Q&A")
-        
+        st.title("📊 Data Schema Pipeline V5")
+        st.write("Complete workflow + Question-Driven Schema Generation")
+
         st.divider()
         
         # Session info
@@ -1075,10 +1290,11 @@ def main():
             1. **Ingestion**: Upload files
             2. **Structure**: Fix structure issues
             3. **Type Cleaning**: Convert formatted numbers
-            4. **Schema**: Generate semantic schema
-            5. **Agent Q&A**: Chat about your data
-            6. **Checkpoints**: Review transformations
-            7. **Export**: Download results
+            4. **Question Collection**: Define expected usage (optional but recommended)
+            5. **Schema**: Generate semantic schema
+            6. **Agent Q&A**: Chat about your data
+            7. **Checkpoints**: Review transformations
+            8. **Export**: Download results
             """)
     
     # Main content - tabs
@@ -1086,31 +1302,35 @@ def main():
         "📁 Ingestion",
         "🔍 Structure Analysis",
         "🧹 Type Cleaning",
+        "❓ Question Collection",
         "📋 Schema Generation",
         "🤖 Agent Q&A",
         "💾 Checkpoints",
         "📤 Export"
     ])
-    
+
     with tabs[0]:
         tab_ingestion()
-    
+
     with tabs[1]:
         tab_structure_analysis()
-    
+
     with tabs[2]:
         tab_type_cleaning()
-    
+
     with tabs[3]:
-        tab_schema_generation()
-    
+        tab_question_collection()
+
     with tabs[4]:
-        tab_agent_qa()
-    
+        tab_schema_generation()
+
     with tabs[5]:
-        tab_checkpoints()
-    
+        tab_agent_qa()
+
     with tabs[6]:
+        tab_checkpoints()
+
+    with tabs[7]:
         tab_export()
 
 
