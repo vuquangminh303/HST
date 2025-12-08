@@ -772,32 +772,52 @@ def tab_schema_generation():
 # Tab 5: Agent Q&A
 # ============================================================================
 class SQLQueryTool:
-    """Tool to execute SQL queries"""
-    
+    """Tool to execute SQL queries - thread-safe for Streamlit"""
+
     def __init__(self, db_path: str, df: pd.DataFrame, table_name: str = "data"):
         self.db_path = db_path
         self.table_name = table_name
-        self.conn = None
+        self.df_hash = hash(str(df.values.tobytes()))  # Track df changes
         self._create_database(df)
-    
+
     def _create_database(self, df: pd.DataFrame):
+        """Create/recreate database with data"""
         try:
-            self.conn = sqlite3.connect(self.db_path)
+            # Close any existing connection first
+            if hasattr(self, 'conn') and self.conn:
+                self.conn.close()
+
+            # Create new connection with check_same_thread=False for Streamlit
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
             df.to_sql(self.table_name, self.conn, if_exists='replace', index=False)
         except Exception as e:
             raise RuntimeError(f"Failed to create database: {str(e)}")
-    
+
+    def _ensure_connection(self):
+        """Ensure connection is valid, recreate if needed"""
+        try:
+            if not self.conn:
+                self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            # Test connection
+            self.conn.execute("SELECT 1")
+        except:
+            # Recreate connection if failed
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+
     def execute_query(self, query: str):
         try:
             if not query.upper().strip().startswith('SELECT'):
                 return pd.DataFrame(), "Only SELECT allowed"
+
+            self._ensure_connection()
             result_df = pd.read_sql_query(query, self.conn)
             return result_df, None
         except Exception as e:
             return pd.DataFrame(), f"Error: {str(e)}"
-    
+
     def get_schema_info(self):
         try:
+            self._ensure_connection()
             cursor = self.conn.cursor()
             cursor.execute(f"PRAGMA table_info({self.table_name})")
             columns = cursor.fetchall()
@@ -808,11 +828,11 @@ class SQLQueryTool:
                 "columns": [{"name": col[1], "type": col[2]} for col in columns],
                 "row_count": row_count
             }
-        except:
-            return {}
-    
+        except Exception as e:
+            return {"error": str(e)}
+
     def close(self):
-        if self.conn:
+        if hasattr(self, 'conn') and self.conn:
             self.conn.close()
 def tab_agent_qa():
     """Enhanced Agent Q&A with SQL capability"""
@@ -837,26 +857,49 @@ def tab_agent_qa():
             st.session_state.raw_dfs.get(selected_source_id)
         )
     )
-    
-    # Initialize SQL capability
+
+    if df_cleaned is None:
+        st.warning("⚠️ No data available. Please complete data ingestion and cleaning first.")
+        return
+
+    # Calculate current df hash to detect changes
+    current_df_hash = hash(str(df_cleaned.values.tobytes()))
+
+    # Initialize or recreate SQL capability if df changed
+    need_recreate = False
     if 'sql_tool' not in st.session_state or st.session_state.sql_tool is None:
-        if df_cleaned is not None:
-            with st.spinner("Setting up SQL database..."):
-                db_dir = Path("./agent_databases")
-                db_dir.mkdir(exist_ok=True)
-                db_path = db_dir / f"data_{session.session_id}.db"
-                
-                sql_tool = SQLQueryTool(str(db_path), df_cleaned)
-                st.session_state.sql_tool = sql_tool
-                
-                st.success("✅ SQL database created! Agent can now query your data.")
-    
+        need_recreate = True
+    elif 'sql_tool_df_hash' not in st.session_state:
+        need_recreate = True
+    elif st.session_state.sql_tool_df_hash != current_df_hash:
+        need_recreate = True
+        st.info("🔄 Data has changed, recreating SQL database...")
+
+    if need_recreate:
+        with st.spinner("Setting up SQL database..."):
+            db_dir = Path("./agent_databases")
+            db_dir.mkdir(exist_ok=True)
+            db_path = db_dir / f"data_{session.session_id}.db"
+
+            # Close old connection if exists
+            if 'sql_tool' in st.session_state and st.session_state.sql_tool:
+                try:
+                    st.session_state.sql_tool.close()
+                except:
+                    pass
+
+            sql_tool = SQLQueryTool(str(db_path), df_cleaned)
+            st.session_state.sql_tool = sql_tool
+            st.session_state.sql_tool_df_hash = current_df_hash
+
+            st.success("✅ SQL database created! Agent can now query your data.")
+
     sql_tool = st.session_state.get('sql_tool')
     
     # Info banner
     if sql_tool:
         schema_info = sql_tool.get_schema_info()
-        if schema_info and 'table_name' in schema_info:
+        if schema_info and 'table_name' in schema_info and 'error' not in schema_info:
             st.info(f"""
             💡 **SQL Capability Enabled!**
             - Table: `{schema_info['table_name']}`
@@ -868,6 +911,8 @@ def tab_agent_qa():
             - "Show me the top 5 most expensive properties"
             - "How many properties per district?"
             """)
+        elif 'error' in schema_info:
+            st.error(f"⚠️ SQL database error: {schema_info['error']}")
         else:
             st.warning("⚠️ SQL tool initialized but schema info not available")
     else:
