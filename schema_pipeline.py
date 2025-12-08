@@ -937,20 +937,133 @@ class ProfileGenerator:
 
 class SchemaGenerator:
     """Generate semantic schema using LLM with type awareness"""
-    
+
     def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
         self.client = OpenAI(api_key=api_key)
         self.model = model
-    
-    def generate_schema(
+
+    def generate_clarification_questions(
         self,
         profiles: Dict[str, ColumnProfile],
         sample_rows: List[Dict[str, Any]],
         question_set: Optional[QuestionSet] = None
-    ) -> Tuple[Dict[str, ColumnSchema], List[Question]]:
-        """Generate schema with semantic types, guided by user questions if provided"""
+    ) -> List[Question]:
+        """
+        Analyze data and generate clarification questions before schema generation.
 
-        prompt = self._build_schema_prompt(profiles, sample_rows, question_set)
+        Examples: unit of measurement, data format, constraints, relationships, etc.
+        """
+        prompt = self._build_clarification_prompt(profiles, sample_rows, question_set)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_clarification_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+            questions = [Question(**q) for q in result.get("questions", [])]
+
+            logger.info(f"✓ Generated {len(questions)} clarification questions")
+            return questions
+
+        except Exception as e:
+            raise RuntimeError(f"Clarification question generation failed: {str(e)}")
+
+    def _build_clarification_prompt(
+        self,
+        profiles: Dict[str, ColumnProfile],
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None
+    ) -> str:
+        """Build prompt for clarification questions"""
+
+        profiles_json = {col: prof.to_dict() for col, prof in profiles.items()}
+
+        user_context = ""
+        if question_set and (question_set.user_questions or question_set.output_fields):
+            user_context = f"""
+
+**User's Expected Usage:**
+- Questions: {json.dumps([q.question for q in question_set.user_questions], indent=2)}
+- Output Fields: {json.dumps([f.field_name for f in question_set.output_fields], indent=2)}
+- Notes: {question_set.additional_notes}
+"""
+
+        return f"""Analyze this data and generate clarification questions to better understand the schema.{user_context}
+
+**Column Profiles:**
+```json
+{json.dumps(profiles_json, indent=2, default=str)}
+```
+
+**Sample Rows:**
+```json
+{json.dumps(sample_rows[:5], indent=2, default=str)}
+```
+
+Generate clarification questions about:
+1. **Units**: For numeric columns (price, area, salary, etc.) - what is the unit? (VND, USD, m², etc.)
+2. **Format**: For date/text columns - what format is expected?
+3. **Constraints**: Any min/max values, allowed ranges?
+4. **Relationships**: Foreign keys, categorical hierarchies?
+5. **Business Context**: What does this column represent in business terms?
+
+Focus on questions that will help generate an accurate, useful schema.
+
+**Response Format:**
+{{
+  "questions": [
+    {{
+      "id": "salary_unit",
+      "question": "What is the currency unit for the 'Salary' column?",
+      "suggested_answer": "VND",
+      "target": "Salary.unit",
+      "question_type": "semantic"
+    }},
+    {{
+      "id": "area_unit",
+      "question": "What is the unit of measurement for 'Area'?",
+      "suggested_answer": "m2",
+      "target": "Area.unit",
+      "question_type": "semantic"
+    }}
+  ]
+}}
+
+Generate 3-10 most important clarification questions.
+"""
+
+    def _get_clarification_system_prompt(self) -> str:
+        """System prompt for clarification questions"""
+        return """You are a data analyst expert who asks clarifying questions about data schemas.
+
+Your job is to analyze column profiles and sample data, then ask questions that will help:
+1. Understand units of measurement for numeric columns
+2. Clarify date/time formats
+3. Identify constraints and validation rules
+4. Understand business context and relationships
+
+Ask specific, actionable questions. Each question should help define a specific schema attribute.
+Be concise but thorough. Prioritize questions that impact data interpretation.
+
+Always respond in valid JSON format."""
+
+    def generate_schema(
+        self,
+        profiles: Dict[str, ColumnProfile],
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None,
+        clarification_answers: Optional[List[Answer]] = None
+    ) -> Tuple[Dict[str, ColumnSchema], List[Question]]:
+        """Generate schema with semantic types, guided by user questions and clarification answers"""
+
+        prompt = self._build_schema_prompt(profiles, sample_rows, question_set, clarification_answers)
         
         try:
             response = self.client.chat.completions.create(
@@ -984,9 +1097,10 @@ class SchemaGenerator:
         self,
         profiles: Dict[str, ColumnProfile],
         sample_rows: List[Dict[str, Any]],
-        question_set: Optional[QuestionSet] = None
+        question_set: Optional[QuestionSet] = None,
+        clarification_answers: Optional[List[Answer]] = None
     ) -> str:
-        """Build prompt with type inference info and user questions"""
+        """Build prompt with type inference info, user questions, and clarification answers"""
 
         profiles_json = {}
         for col, prof in profiles.items():
@@ -995,6 +1109,13 @@ class SchemaGenerator:
             if prof.has_thousand_separator:
                 prof_dict['note'] = f"Has thousand separator (e.g., {prof.sample_raw_values[0]!r}), should be {prof.inferred_type}"
             profiles_json[col] = prof_dict
+
+        # Build clarification answers context
+        clarification_context = ""
+        if clarification_answers:
+            clarification_context = "\n\n**Clarification Answers:**\n"
+            for answer in clarification_answers:
+                clarification_context += f"- {answer.question_id}: {answer.answer}\n"
 
         # Build user questions context if provided
         user_context = ""
@@ -1020,7 +1141,7 @@ Please ensure the schema you generate has enough semantic information to:
 3. Provide clear descriptions that help answer these questions
 """
 
-        return f"""Analyze column profiles and generate semantic schema.{user_context}
+        return f"""Analyze column profiles and generate semantic schema.{user_context}{clarification_context}
 
 **Column Profiles (with type inference):**
 ```json
