@@ -1337,11 +1337,20 @@ Always respond in valid JSON format."""
 # Data Schema Agent - Flexible OpenAI Agent
 # ============================================================================
 
+# ============================================================================
+# Data Schema Agent - OpenAI Agent Standard
+# ============================================================================
+
 class DataSchemaAgent:
     """
-    Flexible Data Schema Agent with SQL query capability
+    Data Schema Agent following OpenAI Agent standard
 
-    Dynamically adapts to any schema from session without hardcoding
+    Features:
+    - Streaming query interface (Generator pattern)
+    - SQL query execution with dynamic schema
+    - Helper methods: get_sample_rows, get_distinct_values, execute_query
+    - Can be instantiated and used from any code
+    - Fully flexible - adapts to any schema
     """
 
     DEFAULT_MODEL = "gpt-4o-mini"
@@ -1352,7 +1361,8 @@ class DataSchemaAgent:
         api_key: str,
         model: str = None,
         df_cleaned: Optional[pd.DataFrame] = None,
-        sql_tool: Optional['SQLQueryTool'] = None
+        sql_tool: Optional['SQLQueryTool'] = None,
+        system_prompt: str = None
     ):
         """
         Initialize Data Schema Agent
@@ -1363,6 +1373,7 @@ class DataSchemaAgent:
             model: Model to use (default: gpt-4o-mini)
             df_cleaned: Cleaned DataFrame (optional)
             sql_tool: SQL query tool (optional, will create if df_cleaned provided)
+            system_prompt: Custom system prompt (optional)
         """
         self.session = session
         self.df_cleaned = df_cleaned
@@ -1370,64 +1381,104 @@ class DataSchemaAgent:
         self.model = model or self.DEFAULT_MODEL
         self.sql_tool = sql_tool
 
+        # System prompt
+        self.system_prompt = system_prompt or self._default_system_prompt()
+
         # Create SQL database if cleaned data provided and no sql_tool
         if df_cleaned is not None and sql_tool is None:
             db_dir = Path("./agent_databases")
             db_dir.mkdir(exist_ok=True)
 
             self.db_path = db_dir / f"data_{session.session_id}.db"
-            # SQLQueryTool is defined in this same file
             self.sql_tool = SQLQueryTool(str(self.db_path), df_cleaned)
             logger.info("✓ Agent initialized with SQL capability")
 
         logger.info(f"DataSchemaAgent initialized with model: {self.model}")
 
-    def enable_sql(self, df_cleaned: pd.DataFrame, sql_tool: Optional['SQLQueryTool'] = None):
-        """Enable SQL capability with cleaned DataFrame"""
-        if sql_tool:
-            self.sql_tool = sql_tool
-            self.df_cleaned = df_cleaned
-            logger.info("✓ SQL capability enabled with provided tool")
-        elif self.sql_tool is None:
-            db_dir = Path("./agent_databases")
-            db_dir.mkdir(exist_ok=True)
+    def _default_system_prompt(self) -> str:
+        """Default system prompt for data schema agent"""
+        return """You are an intelligent data analyst assistant with SQL query capabilities.
 
-            self.db_path = db_dir / f"data_{self.session.session_id}.db"
-            # SQLQueryTool is defined in this same file
-            self.sql_tool = SQLQueryTool(str(self.db_path), df_cleaned)
-            self.df_cleaned = df_cleaned
-            logger.info("✓ SQL capability enabled for agent")
+**Your Capabilities:**
+- Understand and explain data schemas
+- Execute SQL queries to analyze data
+- Provide insights and recommendations
+- Answer questions about data with evidence
 
-    def chat(self, user_message: str) -> str:
-        """Chat with agent - can execute SQL if enabled"""
+**SQL Guidelines:**
+- You can only execute SELECT queries (no INSERT, UPDATE, DELETE)
+- Table name: 'data'
+- Use column names exactly as shown in the schema
+- Use LIMIT for previews (e.g., LIMIT 10)
+- Use aggregations: COUNT(), SUM(), AVG(), MIN(), MAX()
+- Use GROUP BY for category analysis
+- Use WHERE for filtering
+- Use ORDER BY for sorting
 
-        # Build context from session
-        context = self._build_context()
+**Query Examples:**
+- Preview data: `SELECT * FROM data LIMIT 5`
+- Calculate average: `SELECT AVG(price) FROM data WHERE category='A'`
+- Count by category: `SELECT category, COUNT(*) as count FROM data GROUP BY category ORDER BY count DESC`
+- Find top records: `SELECT * FROM data ORDER BY price DESC LIMIT 10`
 
-        # Add user message to conversation
-        self.session.agent_conversations.append(AgentMessage(
-            role="user",
-            content=user_message,
-            timestamp=datetime.now().isoformat()
-        ))
+**Response Guidelines:**
+- Always explain your reasoning
+- Use specific numbers and facts from query results
+- Provide actionable insights
+- Be concise and helpful
 
-        # Build messages for API call
-        messages = [
-            {"role": "system", "content": self._get_system_prompt()},
-            {"role": "user", "content": f"**Context:**\n{context}\n\n**Question:**\n{user_message}"}
-        ]
+When you need to query data, use the execute_sql_query tool."""
 
-        # Add conversation history (last 10 messages)
-        for msg in self.session.agent_conversations[-11:-1]:
-            messages.append({"role": msg.role, "content": msg.content})
+    def query(
+        self,
+        question: str,
+        conversation_history: List[Dict[str, Any]] = None,
+        model: str = None
+    ) -> Generator[str, None, Dict[str, Any]]:
+        """
+        Query with streaming response
+
+        Args:
+            question: User question
+            conversation_history: Previous conversation (optional)
+            model: Model to override default (optional)
+
+        Yields:
+            Response text chunks
+
+        Returns:
+            Metadata dict with usage info
+        """
+        import time
+        start_time = time.time()
 
         try:
-            # Call with tools if SQL enabled
-            if self.sql_tool:
+            # Build context
+            context = self._build_context()
+
+            # Build messages
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": f"**Context:**\n{context}\n\n**Question:**\n{question}"}
+            ]
+
+            # Add conversation history if provided
+            if conversation_history:
+                for msg in conversation_history[-10:]:  # Last 10 messages
+                    messages.append(msg)
+
+            # Determine if SQL tools should be available
+            tools = self._get_tools() if self.sql_tool else None
+
+            # Call OpenAI
+            use_model = model or self.model
+
+            if tools:
+                # With SQL capability - use tools
                 response = self.client.chat.completions.create(
-                    model=self.model,
+                    model=use_model,
                     messages=messages,
-                    tools=self._get_tools(),
+                    tools=tools,
                     tool_choice="auto",
                     temperature=0.7,
                     max_tokens=1000
@@ -1437,41 +1488,110 @@ class DataSchemaAgent:
 
                 # Handle tool calls
                 if assistant_msg.tool_calls:
-                    assistant_response = self._handle_tool_calls(assistant_msg, user_message)
+                    # Execute tools and get results
+                    tool_results = self._handle_tool_calls(assistant_msg, question)
+
+                    # Stream tool results
+                    for char in tool_results:
+                        yield char
+
+                    final_text = tool_results
                 else:
-                    assistant_response = assistant_msg.content
+                    # No tools called, stream response
+                    final_text = assistant_msg.content or ""
+                    for char in final_text:
+                        yield char
+
+                # Calculate usage
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                }
             else:
-                # No SQL - text only
+                # Without SQL - simple streaming response
                 response = self.client.chat.completions.create(
-                    model=self.model,
+                    model=use_model,
                     messages=messages,
                     temperature=0.7,
-                    max_tokens=500
+                    max_tokens=500,
+                    stream=True
                 )
-                assistant_response = response.choices[0].message.content
 
-            # Add assistant response to conversation
-            self.session.agent_conversations.append(AgentMessage(
-                role="assistant",
-                content=assistant_response,
-                timestamp=datetime.now().isoformat(),
-                context={"used_sql": bool(self.sql_tool and hasattr(assistant_msg, 'tool_calls') and assistant_msg.tool_calls)}
-            ))
+                final_text = ""
+                for chunk in response:
+                    if chunk.choices[0].delta.content:
+                        text = chunk.choices[0].delta.content
+                        final_text += text
+                        yield text
 
-            return assistant_response
+                usage = {"estimated_tokens": len(final_text) // 4}  # Rough estimate
+
+            # Record in conversation
+            if hasattr(self, 'session'):
+                self.session.agent_conversations.append(AgentMessage(
+                    role="user",
+                    content=question,
+                    timestamp=datetime.now().isoformat()
+                ))
+                self.session.agent_conversations.append(AgentMessage(
+                    role="assistant",
+                    content=final_text,
+                    timestamp=datetime.now().isoformat(),
+                    context={"used_sql": bool(tools)}
+                ))
+
+            # Return metadata
+            return {
+                "usage": usage,
+                "duration": time.time() - start_time,
+                "model": use_model,
+                "used_sql": bool(tools)
+            }
 
         except Exception as e:
-            logger.error(f"Agent error: {str(e)}")
-            error_msg = f"Sorry, I encountered an error: {str(e)}"
-            self.session.agent_conversations.append(AgentMessage(
-                role="assistant",
-                content=error_msg,
-                timestamp=datetime.now().isoformat()
-            ))
-            return error_msg
+            logger.error(f"Query failed: {str(e)}")
+            error_msg = f"\n\n⚠️ Error: {str(e)}"
+            yield error_msg
+
+            return {
+                "error": str(e),
+                "duration": time.time() - start_time,
+                "model": model or self.model
+            }
+
+    def chat(self, user_message: str) -> str:
+        """
+        Simple chat interface (non-streaming)
+
+        Args:
+            user_message: User message
+
+        Returns:
+            Assistant response text
+        """
+        result = []
+        metadata = None
+
+        for chunk in self.query(user_message):
+            if isinstance(chunk, dict):
+                metadata = chunk
+            else:
+                result.append(chunk)
+
+        return "".join(result)
 
     def _handle_tool_calls(self, assistant_message, original_question: str) -> str:
-        """Handle SQL query execution from tool calls"""
+        """
+        Handle SQL query execution from tool calls
+
+        Args:
+            assistant_message: OpenAI assistant message with tool calls
+            original_question: Original user question
+
+        Returns:
+            Response text with query results and analysis
+        """
         responses = []
 
         for tool_call in assistant_message.tool_calls:
@@ -1482,10 +1602,12 @@ class DataSchemaAgent:
 
                     logger.info(f"🔍 Executing SQL: {query}")
 
-                    result_df, error = self.sql_tool.execute_query(query)
+                    # Execute query
+                    result_df, error = self._execute_sql(query)
 
                     if error:
                         responses.append(f"❌ SQL Error: {error}")
+                        logger.warning(f"SQL execution failed: {error}")
                     else:
                         if len(result_df) == 0:
                             responses.append("✅ Query executed successfully but returned no results")
@@ -1496,6 +1618,7 @@ class DataSchemaAgent:
                             if len(result_df) > 10:
                                 result_text += f"\n\n(Showing first 10 of {len(result_df)} rows)"
                             responses.append(result_text)
+                            logger.info(f"SQL execution successful: {len(result_df)} rows")
 
                 except Exception as e:
                     logger.error(f"Tool execution error: {str(e)}")
@@ -1524,38 +1647,125 @@ class DataSchemaAgent:
 
         return "No results from query execution."
 
+    def _execute_sql(self, query: str) -> Tuple[pd.DataFrame, Optional[str]]:
+        """
+        Execute SQL query
+
+        Args:
+            query: SQL query string
+
+        Returns:
+            Tuple of (result DataFrame, error message)
+        """
+        if not self.sql_tool:
+            return pd.DataFrame(), "SQL capability not enabled"
+
+        try:
+            result_df, error = self.sql_tool.execute_query(query)
+            return result_df, error
+        except Exception as e:
+            logger.error(f"SQL execution failed: {str(e)}")
+            return pd.DataFrame(), str(e)
+
+    def _get_sample_rows(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Get sample rows from data
+
+        Args:
+            limit: Number of rows to return
+
+        Returns:
+            List of row dicts
+        """
+        if self.df_cleaned is None:
+            return []
+
+        try:
+            sample_df = self.df_cleaned.head(limit)
+            return sample_df.to_dict(orient='records')
+        except Exception as e:
+            logger.error(f"Failed to get sample rows: {str(e)}")
+            return []
+
+    def _get_distinct_values(self, column_name: str, limit: int = 50) -> List[Any]:
+        """
+        Get distinct values for a column
+
+        Args:
+            column_name: Column name
+            limit: Maximum number of values to return
+
+        Returns:
+            List of distinct values
+        """
+        if self.df_cleaned is None:
+            return []
+
+        try:
+            if column_name not in self.df_cleaned.columns:
+                logger.warning(f"Column '{column_name}' not found in data")
+                return []
+
+            distinct_values = self.df_cleaned[column_name].dropna().unique()[:limit]
+            return distinct_values.tolist()
+        except Exception as e:
+            logger.error(f"Failed to get distinct values: {str(e)}")
+            return []
+
+    def get_schema_info(self) -> Dict[str, Any]:
+        """
+        Get schema information
+
+        Returns:
+            Dict with schema information
+        """
+        schema_info = {
+            "table_name": "data",
+            "columns": [],
+            "row_count": 0
+        }
+
+        if self.session.schema:
+            for col_name, col_schema in self.session.schema.items():
+                schema_info["columns"].append({
+                    "name": col_name,
+                    "semantic_type": col_schema.semantic_type,
+                    "physical_type": col_schema.physical_type,
+                    "unit": col_schema.unit,
+                    "description": col_schema.description,
+                    "required": col_schema.is_required
+                })
+
+        if self.df_cleaned is not None:
+            schema_info["row_count"] = len(self.df_cleaned)
+
+        return schema_info
+
     def _get_tools(self) -> List[Dict[str, Any]]:
         """
         Define SQL query tool dynamically based on actual schema
 
-        Returns list of tool definitions for OpenAI function calling
+        Returns:
+            List of tool definitions for OpenAI function calling
         """
         if not self.sql_tool:
             return []
 
-        # Get schema info from SQL tool
-        schema_info = self.sql_tool.get_schema_info()
+        # Get schema info
+        schema_info = self.get_schema_info()
 
-        if 'error' in schema_info:
-            logger.error(f"Cannot get schema info: {schema_info['error']}")
-            return []
-
-        # Build column descriptions from session schema if available
+        # Build column descriptions from session schema
         column_descriptions = []
         if self.session.schema:
-            for col_name, col_schema in self.session.schema.items():
+            for col_name, col_schema in list(self.session.schema.items())[:20]:
                 desc = f"{col_name} ({col_schema.semantic_type}, {col_schema.physical_type})"
                 if col_schema.unit:
                     desc += f" - Unit: {col_schema.unit}"
                 if col_schema.description:
                     desc += f" - {col_schema.description}"
                 column_descriptions.append(desc)
-        else:
-            # Fallback to basic schema from SQL tool
-            for col in schema_info.get('columns', []):
-                column_descriptions.append(f"{col['name']} ({col['type']})")
 
-        columns_desc = "\n".join(column_descriptions[:20])  # Limit to first 20 columns
+        columns_desc = "\n".join(column_descriptions) if column_descriptions else "Use PRAGMA table_info(data) to see columns"
 
         return [{
             "type": "function",
@@ -1563,8 +1773,8 @@ class DataSchemaAgent:
                 "name": "execute_sql_query",
                 "description": f"""Execute SQL SELECT query on the data table.
 
-**Table:** {schema_info.get('table_name', 'data')}
-**Rows:** {schema_info.get('row_count', 'unknown')}
+**Table:** {schema_info['table_name']}
+**Rows:** {schema_info['row_count']}
 
 **Available Columns:**
 {columns_desc}
@@ -1612,8 +1822,6 @@ Only SELECT queries are allowed.""",
                 line = f"- **{col}**: {col_schema.semantic_type} ({col_schema.physical_type})"
                 if col_schema.unit:
                     line += f", Unit: {col_schema.unit}"
-                if col_schema.description:
-                    line += f" - {col_schema.description}"
                 schema_lines.append(line)
 
             if len(self.session.schema) > 10:
@@ -1623,73 +1831,30 @@ Only SELECT queries are allowed.""",
 
         # SQL capability status
         if self.sql_tool:
-            info = self.sql_tool.get_schema_info()
-            if 'error' not in info:
-                parts.append(f"**SQL Database:** Table '{info.get('table_name', 'data')}' ready for queries ({info.get('row_count', 0)} rows)")
-
-        # Data quality info
-        if self.session.cleaning_rules:
-            applied_count = len(self.session.applied_cleaning_rules)
-            total_count = len(self.session.cleaning_rules)
-            parts.append(f"**Data Cleaning:** {applied_count}/{total_count} rules applied")
+            parts.append(f"**SQL Database:** Ready for queries")
 
         return "\n\n".join(parts)
 
-    def _get_system_prompt(self) -> str:
-        """Get system prompt based on SQL capability"""
+    def enable_sql(self, df_cleaned: pd.DataFrame, sql_tool: Optional['SQLQueryTool'] = None):
+        """
+        Enable SQL capability
 
-        if self.sql_tool:
-            # SQL-enabled prompt
-            return """You are an intelligent data analyst assistant with SQL query capabilities.
+        Args:
+            df_cleaned: Cleaned DataFrame
+            sql_tool: Optional SQL tool to use (will create if not provided)
+        """
+        if sql_tool:
+            self.sql_tool = sql_tool
+            self.df_cleaned = df_cleaned
+            logger.info("✓ SQL capability enabled with provided tool")
+        elif self.sql_tool is None:
+            db_dir = Path("./agent_databases")
+            db_dir.mkdir(exist_ok=True)
 
-**Your Capabilities:**
-- Understand and explain data schemas
-- Execute SQL queries to analyze data
-- Provide insights and recommendations
-- Answer questions about data with evidence
-
-**SQL Guidelines:**
-- You can only execute SELECT queries (no INSERT, UPDATE, DELETE)
-- Table name is provided in the context
-- Use column names exactly as shown in the schema
-- Use LIMIT for previews (e.g., LIMIT 10)
-- Use aggregations: COUNT(), SUM(), AVG(), MIN(), MAX()
-- Use GROUP BY for category analysis
-- Use WHERE for filtering
-- Use ORDER BY for sorting
-
-**Query Examples:**
-- Preview data: `SELECT * FROM data LIMIT 5`
-- Calculate average: `SELECT AVG(price) FROM data WHERE category='A'`
-- Count by category: `SELECT category, COUNT(*) as count FROM data GROUP BY category ORDER BY count DESC`
-- Find top records: `SELECT * FROM data ORDER BY price DESC LIMIT 10`
-
-**Response Guidelines:**
-- Always explain your reasoning
-- Use specific numbers and facts from query results
-- Provide actionable insights
-- Suggest follow-up analyses when appropriate
-
-Be helpful, accurate, and data-driven in your responses."""
-
-        else:
-            # Schema-only prompt
-            return """You are a data schema assistant helping users understand their data.
-
-**Your Capabilities:**
-- Explain column meanings and data types
-- Describe data structure and relationships
-- Suggest useful analyses
-- Recommend data quality improvements
-- Help users understand their schema
-
-**Guidelines:**
-- Be concise and clear
-- Provide practical examples
-- Suggest SQL queries users could run (even though you can't execute them yet)
-- Focus on data understanding and quality
-
-Be helpful and educational in your responses."""
+            self.db_path = db_dir / f"data_{self.session.session_id}.db"
+            self.sql_tool = SQLQueryTool(str(self.db_path), df_cleaned)
+            self.df_cleaned = df_cleaned
+            logger.info("✓ SQL capability enabled for agent")
 
     def close(self):
         """Close database connection"""
@@ -1699,6 +1864,8 @@ Be helpful and educational in your responses."""
                 logger.info("SQL tool closed")
             except Exception as e:
                 logger.error(f"Error closing SQL tool: {str(e)}")
+
+
 class RefinementEngine:
     """Handle schema refinement based on user answers"""
     
