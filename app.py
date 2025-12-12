@@ -1,6 +1,7 @@
 """
-Streamlit UI V4 - Complete Pipeline
-Full workflow from V3 + Type Cleaning + Agent Q&A
+Streamlit UI V5 - Question-Driven Schema Generation
+Full workflow from V4 + User Question Collection + Schema Validation
+Allows users to define expected questions and output format before schema generation
 """
 
 import streamlit as st
@@ -18,7 +19,8 @@ from schema_pipeline import (
     DataIngestor, StructureAnalyzer, ProfileGenerator, SchemaGenerator,
     SessionManager, RefinementEngine, DataSource, Session, Transformation,
     Question, Answer, ColumnProfile, ColumnSchema, DataFrameCheckpoint,
-    TypeInferenceEngine, CleaningRule, DataSchemaAgent, AgentMessage
+    TypeInferenceEngine, CleaningRule, DataSchemaAgent, AgentMessage,
+    UserQuestion, OutputField, QuestionSet, SchemaValidator
 )
 
 # Page config
@@ -494,25 +496,126 @@ def tab_type_cleaning():
 
 
 # ============================================================================
-# Tab 4: Schema Generation
+# Tab 4: Question Collection
 # ============================================================================
 
-def tab_schema_generation():
-    """Schema generation tab"""
-    st.header("📋 Semantic Schema Generation")
-    
+def tab_question_collection():
+    """Define expected questions and output format"""
+    st.header("❓ Question Collection")
+
     if not st.session_state.session:
         st.warning("⚠️ No active session")
         return
-    
+
     session = st.session_state.session
-    
+
+    st.markdown("""
+    **Define how you will use this data:**
+
+    Help the system understand your needs by defining:
+    1. **Sample questions** you will frequently ask
+    2. **Expected output fields** you need in responses
+    """)
+
+    # Initialize question_set if not exists
+    if not session.question_set:
+        session.question_set = QuestionSet()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("📝 Sample Questions")
+        questions_text = st.text_area(
+            "Enter questions (one per line)",
+            value="\n".join([q.question for q in session.question_set.user_questions]) if session.question_set.user_questions else "",
+            placeholder="What is the total revenue by category?\nShow top 10 products by price\nHow many items per region?",
+            height=200,
+            key="questions_input"
+        )
+
+    with col2:
+        st.subheader("📊 Expected Output Fields")
+        fields_text = st.text_area(
+            "Enter field names (comma-separated or one per line)",
+            value=", ".join([f.field_name for f in session.question_set.output_fields]) if session.question_set.output_fields else "",
+            placeholder="total_revenue, category_name, product_count, average_price",
+            height=200,
+            key="fields_input"
+        )
+
+    additional_notes = st.text_area(
+        "Additional context (optional)",
+        value=session.question_set.additional_notes if session.question_set else "",
+        placeholder="E.g., This data will be used for monthly financial reports...",
+        height=100,
+        key="notes_input"
+    )
+
+    if st.button("💾 Save Question Context", type="primary"):
+        # Parse questions
+        questions_list = [q.strip() for q in questions_text.split('\n') if q.strip()]
+        session.question_set.user_questions = [
+            UserQuestion(
+                id=f"uq_{i}_{datetime.now().timestamp()}",
+                question=q,
+                description="",
+                priority="medium"
+            ) for i, q in enumerate(questions_list)
+        ]
+
+        # Parse fields
+        if ',' in fields_text:
+            fields_list = [f.strip() for f in fields_text.split(',') if f.strip()]
+        else:
+            fields_list = [f.strip() for f in fields_text.split('\n') if f.strip()]
+
+        session.question_set.output_fields = [
+            OutputField(
+                field_name=f,
+                description=f"Field: {f}",
+                data_type="string",
+                required=True
+            ) for f in fields_list
+        ]
+
+        session.question_set.additional_notes = additional_notes
+
+        st.success(f"✓ Saved {len(session.question_set.user_questions)} questions and {len(session.question_set.output_fields)} fields")
+        st.rerun()
+
+    # Show summary
+    if session.question_set and (session.question_set.user_questions or session.question_set.output_fields):
+        st.divider()
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Questions", len(session.question_set.user_questions))
+        with col2:
+            st.metric("Output Fields", len(session.question_set.output_fields))
+        with col3:
+            has_notes = "Yes" if session.question_set.additional_notes else "No"
+            st.metric("Additional Notes", has_notes)
+
+
+# ============================================================================
+# Tab 5: Schema Generation
+# ============================================================================
+
+def tab_schema_generation():
+    """Schema generation tab with 2-step flow: clarification then generation"""
+    st.header("📋 Semantic Schema Generation")
+
+    if not st.session_state.session:
+        st.warning("⚠️ No active session")
+        return
+
+    session = st.session_state.session
+
     selected_source_id = st.selectbox(
         "Select Source",
         options=[s.source_id for s in session.sources],
         key="schema_source_select"
     )
-    
+
     # Use cleaned df if available, otherwise clean, otherwise raw
     df = st.session_state.cleaned_dfs.get(
         selected_source_id,
@@ -521,63 +624,221 @@ def tab_schema_generation():
             st.session_state.raw_dfs.get(selected_source_id)
         )
     )
-    
+
     if df is None:
         st.error("No data available")
         return
-    
-    if st.button("🧠 Generate Schema", type="primary"):
-        with st.spinner("Generating semantic schema..."):
-            # Generate profiles
-            profiles = ProfileGenerator.generate_profiles(df)
-            sample_rows = ProfileGenerator.get_sample_rows(df)
-            
-            # Generate schema
-            schema_gen = SchemaGenerator(
-                api_key=st.session_state.api_key,
-                model=st.session_state.model
-            )
-            schema, questions = schema_gen.generate_schema(profiles, sample_rows)
-            
-            # Store results
-            if 'schema_results' not in st.session_state:
-                st.session_state.schema_results = {}
-            
-            st.session_state.schema_results[selected_source_id] = {
-                'profiles': profiles,
-                'schema': schema,
-                'questions': questions
-            }
-            
-            # Update session
-            session.profiles.update(profiles)
-            session.schema.update(schema)
-            session.questions.extend(questions)
-            
-            st.success(f"✅ Generated schema for {len(schema)} columns")
-            st.rerun()
-    
-    # Display schema
+
+    st.markdown("""
+    **Two-Step Schema Generation Process:**
+
+    1. **Step 1**: Analyze data and generate clarification questions (units, formats, constraints, etc.)
+    2. **Step 2**: Answer questions and generate final schema
+    """)
+
+    st.divider()
+
+    # Initialize state for clarification flow
+    if 'clarification_questions' not in st.session_state:
+        st.session_state.clarification_questions = {}
+
+    if 'clarification_answers' not in st.session_state:
+        st.session_state.clarification_answers = {}
+
+    # ============================================================================
+    # STEP 1: Generate Clarification Questions
+    # ============================================================================
+    st.subheader("📝 Step 1: Data Analysis & Clarification Questions")
+
+    clarif_questions = st.session_state.clarification_questions.get(selected_source_id, [])
+
+    if not clarif_questions:
+        if st.button("🔍 Analyze Data & Generate Questions", type="primary"):
+            with st.spinner("Analyzing data and generating clarification questions..."):
+                # Generate profiles
+                profiles = ProfileGenerator.generate_profiles(df)
+                sample_rows = ProfileGenerator.get_sample_rows(df)
+
+                # Store profiles
+                if 'profiles' not in st.session_state:
+                    st.session_state.profiles = {}
+                st.session_state.profiles[selected_source_id] = {
+                    'profiles': profiles,
+                    'sample_rows': sample_rows
+                }
+
+                # Generate clarification questions
+                schema_gen = SchemaGenerator(
+                    api_key=st.session_state.api_key,
+                    model=st.session_state.model
+                )
+                questions = schema_gen.generate_clarification_questions(
+                    profiles,
+                    sample_rows,
+                    question_set=session.question_set
+                )
+
+                st.session_state.clarification_questions[selected_source_id] = questions
+                st.success(f"✅ Generated {len(questions)} clarification questions!")
+                st.rerun()
+
+        st.info("👆 Click the button above to analyze your data and generate clarification questions")
+
+    else:
+        st.success(f"✅ Generated {len(clarif_questions)} questions. Please answer them below.")
+
+        st.divider()
+
+        # ============================================================================
+        # Display and Answer Clarification Questions
+        # ============================================================================
+        st.subheader("❓ Clarification Questions")
+        st.write("Please answer these questions to help generate an accurate schema:")
+
+        # Initialize answers dict for this source
+        if selected_source_id not in st.session_state.clarification_answers:
+            st.session_state.clarification_answers[selected_source_id] = {}
+
+        answers_dict = st.session_state.clarification_answers[selected_source_id]
+
+        for i, q in enumerate(clarif_questions):
+            with st.expander(f"**Question {i+1}: {q.question}**", expanded=True):
+                col1, col2 = st.columns([3, 1])
+
+                with col1:
+                    st.write(f"**Target Field:** `{q.target}`")
+                    if q.suggested_answer:
+                        st.write(f"**Suggested Answer:** {q.suggested_answer}")
+
+                    # Answer input
+                    answer_value = st.text_input(
+                        "Your answer:",
+                        value=answers_dict.get(q.id, q.suggested_answer or ""),
+                        key=f"answer_{q.id}_{selected_source_id}",
+                        placeholder="Enter your answer..."
+                    )
+
+                    answers_dict[q.id] = answer_value
+
+                with col2:
+                    if answer_value:
+                        st.success("✓ Answered")
+                    else:
+                        st.warning("⚠️ Empty")
+
+        st.divider()
+
+        # Show progress
+        answered_count = sum(1 for ans in answers_dict.values() if ans)
+        total_count = len(clarif_questions)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Questions", total_count)
+        with col2:
+            st.metric("Answered", answered_count)
+        with col3:
+            progress = answered_count / total_count if total_count > 0 else 0
+            st.metric("Progress", f"{progress:.0%}")
+
+        # ============================================================================
+        # STEP 2: Generate Schema
+        # ============================================================================
+        st.divider()
+        st.subheader("🧠 Step 2: Generate Final Schema")
+
+        col1, col2 = st.columns([1, 3])
+
+        with col1:
+            if st.button("🗑️ Reset & Start Over"):
+                st.session_state.clarification_questions.pop(selected_source_id, None)
+                st.session_state.clarification_answers.pop(selected_source_id, None)
+                st.session_state.schema_results.pop(selected_source_id, None)
+                st.success("✓ Reset! Please analyze data again.")
+                st.rerun()
+
+        with col2:
+            can_generate = answered_count >= total_count * 0.5  # At least 50% answered
+
+            if not can_generate:
+                st.warning(f"⚠️ Please answer at least {int(total_count * 0.5)} questions before generating schema")
+
+            if st.button("🚀 Generate Final Schema", type="primary", disabled=not can_generate):
+                with st.spinner("Generating schema with your answers..."):
+                    # Get profiles
+                    profiles_data = st.session_state.profiles.get(selected_source_id)
+                    if not profiles_data:
+                        st.error("Profiles not found. Please run Step 1 again.")
+                        return
+
+                    profiles = profiles_data['profiles']
+                    sample_rows = profiles_data['sample_rows']
+
+                    # Convert answers to Answer objects
+                    clarification_answers = [
+                        Answer(
+                            question_id=q_id,
+                            answer=ans,
+                            timestamp=datetime.now().isoformat(),
+                            applied=True
+                        )
+                        for q_id, ans in answers_dict.items() if ans
+                    ]
+
+                    # Generate schema
+                    schema_gen = SchemaGenerator(
+                        api_key=st.session_state.api_key,
+                        model=st.session_state.model
+                    )
+                    schema, additional_questions = schema_gen.generate_schema(
+                        profiles,
+                        sample_rows,
+                        question_set=session.question_set,
+                        clarification_answers=clarification_answers
+                    )
+
+                    # Store results
+                    if 'schema_results' not in st.session_state:
+                        st.session_state.schema_results = {}
+
+                    st.session_state.schema_results[selected_source_id] = {
+                        'profiles': profiles,
+                        'schema': schema,
+                        'questions': additional_questions,
+                        'clarification_answers': clarification_answers
+                    }
+
+                    # Update session
+                    session.profiles.update(profiles)
+                    session.schema.update(schema)
+                    session.answers.extend(clarification_answers)
+
+                    st.success(f"✅ Generated schema for {len(schema)} columns!")
+                    st.rerun()
+
+    # ============================================================================
+    # Display Generated Schema
+    # ============================================================================
     if hasattr(st.session_state, 'schema_results') and selected_source_id in st.session_state.schema_results:
         results = st.session_state.schema_results[selected_source_id]
-        
+
         st.divider()
-        st.subheader("📊 Column Profiles & Schema")
-        
+        st.subheader("📊 Generated Schema")
+
         # Create tabs for each column
         column_names = list(results['schema'].keys())
-        
+
         if column_names:
             tabs = st.tabs(column_names[:10])  # Limit to first 10 for UI
-            
+
             for tab, col_name in zip(tabs, column_names[:10]):
                 with tab:
                     profile = results['profiles'][col_name]
                     schema_col = results['schema'][col_name]
-                    
+
                     # Metrics
                     col1, col2, col3, col4 = st.columns(4)
-                    
+
                     with col1:
                         st.metric("Non-Null Count", profile.non_null_count)
                     with col2:
@@ -586,90 +847,109 @@ def tab_schema_generation():
                         st.metric("Unique Values", profile.n_unique)
                     with col4:
                         st.metric("Required", "✅" if schema_col.is_required else "❌")
-                    
+
                     # Schema details
                     st.subheader("Schema Details")
-                    
+
                     col_left, col_right = st.columns(2)
-                    
+
                     with col_left:
                         st.write(f"**Description:** {schema_col.description}")
                         st.write(f"**Semantic Type:** `{schema_col.semantic_type}`")
                         st.write(f"**Physical Type:** `{schema_col.physical_type}`")
-                    
+
                     with col_right:
                         st.write(f"**Original Type:** `{schema_col.original_type}`")
                         st.write(f"**Unit:** {schema_col.unit or 'N/A'}")
                         if schema_col.constraints:
                             st.write(f"**Constraints:** `{json.dumps(schema_col.constraints)}`")
-                    
+
                     # Sample values
                     st.subheader("Sample Values")
                     st.write(profile.sample_values[:10])
-        
-        # Questions
-        if results['questions']:
+
+        # Additional refinement questions (if any)
+        if results.get('questions'):
             st.divider()
-            st.subheader("❓ Clarification Questions")
-            
+            st.subheader("💡 Additional Refinement Questions")
+            st.info("These are optional follow-up questions for further refinement")
+
             for q in results['questions']:
                 with st.expander(f"**{q.question}**"):
                     st.write(f"**Target:** `{q.target}`")
                     st.write(f"**Suggested Answer:** {q.suggested_answer or 'N/A'}")
-                    
+
                     # Answer input
-                    answer_key = f"answer_{q.id}"
+                    answer_key = f"refine_answer_{q.id}"
                     user_answer = st.text_input(
                         "Your answer",
                         value=q.suggested_answer or "",
                         key=answer_key
                     )
-                    
-                    if st.button("✅ Submit Answer", key=f"submit_{q.id}"):
+
+                    if st.button("✅ Submit Answer", key=f"submit_refine_{q.id}"):
                         answer = Answer(
                             question_id=q.id,
                             answer=user_answer,
                             timestamp=datetime.now().isoformat()
                         )
                         session.answers.append(answer)
-                        
+
                         # Apply answer
                         engine = RefinementEngine(session)
                         if engine.apply_answer(answer):
                             st.success(f"✅ Applied: {user_answer}")
                             st.rerun()
-
-
 # ============================================================================
 # Tab 5: Agent Q&A
 # ============================================================================
 class SQLQueryTool:
-    """Tool to execute SQL queries"""
-    
+    """Tool to execute SQL queries - thread-safe for Streamlit"""
+
     def __init__(self, db_path: str, df: pd.DataFrame, table_name: str = "data"):
         self.db_path = db_path
         self.table_name = table_name
-        self.conn = None
+        self.df_hash = hash(str(df.values.tobytes()))  # Track df changes
         self._create_database(df)
-    
+
     def _create_database(self, df: pd.DataFrame):
+        """Create/recreate database with data"""
         try:
-            self.conn = sqlite3.connect(self.db_path)
+            # Close any existing connection first
+            if hasattr(self, 'conn') and self.conn:
+                self.conn.close()
+
+            # Create new connection with check_same_thread=False for Streamlit
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
             df.to_sql(self.table_name, self.conn, if_exists='replace', index=False)
         except Exception as e:
             raise RuntimeError(f"Failed to create database: {str(e)}")
-    
+
+    def _ensure_connection(self):
+        """Ensure connection is valid, recreate if needed"""
+        try:
+            if not self.conn:
+                self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            # Test connection
+            self.conn.execute("SELECT 1")
+        except:
+            # Recreate connection if failed
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+
     def execute_query(self, query: str):
         try:
             if not query.upper().strip().startswith('SELECT'):
                 return pd.DataFrame(), "Only SELECT allowed"
+
+            self._ensure_connection()
             result_df = pd.read_sql_query(query, self.conn)
             return result_df, None
         except Exception as e:
             return pd.DataFrame(), f"Error: {str(e)}"
-    
+
     def get_schema_info(self):
         try:
+            self._ensure_connection()
             cursor = self.conn.cursor()
             cursor.execute(f"PRAGMA table_info({self.table_name})")
             columns = cursor.fetchall()
@@ -680,11 +960,11 @@ class SQLQueryTool:
                 "columns": [{"name": col[1], "type": col[2]} for col in columns],
                 "row_count": row_count
             }
-        except:
-            return {}
-    
+        except Exception as e:
+            return {"error": str(e)}
+
     def close(self):
-        if self.conn:
+        if hasattr(self, 'conn') and self.conn:
             self.conn.close()
 def tab_agent_qa():
     """Enhanced Agent Q&A with SQL capability"""
@@ -709,36 +989,64 @@ def tab_agent_qa():
             st.session_state.raw_dfs.get(selected_source_id)
         )
     )
-    
-    # Initialize SQL capability
+
+    if df_cleaned is None:
+        st.warning("⚠️ No data available. Please complete data ingestion and cleaning first.")
+        return
+
+    # Calculate current df hash to detect changes
+    current_df_hash = hash(str(df_cleaned.values.tobytes()))
+
+    # Initialize or recreate SQL capability if df changed
+    need_recreate = False
     if 'sql_tool' not in st.session_state or st.session_state.sql_tool is None:
-        if df_cleaned is not None:
-            with st.spinner("Setting up SQL database..."):
-                db_dir = Path("./agent_databases")
-                db_dir.mkdir(exist_ok=True)
-                db_path = db_dir / f"data_{session.session_id}.db"
-                
-                sql_tool = SQLQueryTool(str(db_path), df_cleaned)
-                st.session_state.sql_tool = sql_tool
-                
-                st.success("✅ SQL database created! Agent can now query your data.")
-    
+        need_recreate = True
+    elif 'sql_tool_df_hash' not in st.session_state:
+        need_recreate = True
+    elif st.session_state.sql_tool_df_hash != current_df_hash:
+        need_recreate = True
+        st.info("🔄 Data has changed, recreating SQL database...")
+
+    if need_recreate:
+        with st.spinner("Setting up SQL database..."):
+            db_dir = Path("./agent_databases")
+            db_dir.mkdir(exist_ok=True)
+            db_path = db_dir / f"data_{session.session_id}.db"
+
+            # Close old connection if exists
+            if 'sql_tool' in st.session_state and st.session_state.sql_tool:
+                try:
+                    st.session_state.sql_tool.close()
+                except:
+                    pass
+
+            sql_tool = SQLQueryTool(str(db_path), df_cleaned)
+            st.session_state.sql_tool = sql_tool
+            st.session_state.sql_tool_df_hash = current_df_hash
+
+            st.success("✅ SQL database created! Agent can now query your data.")
+
     sql_tool = st.session_state.get('sql_tool')
     
     # Info banner
     if sql_tool:
         schema_info = sql_tool.get_schema_info()
-        st.info(f"""
-        💡 **SQL Capability Enabled!** 
-        - Table: `{schema_info['table_name']}` 
-        - Rows: {schema_info['row_count']} 
-        - Columns: {len(schema_info['columns'])}
-        
-        You can ask questions like:
-        - "What is the average price?"
-        - "Show me the top 5 most expensive properties"
-        - "How many properties per district?"
-        """)
+        if schema_info and 'table_name' in schema_info and 'error' not in schema_info:
+            st.info(f"""
+            💡 **SQL Capability Enabled!**
+            - Table: `{schema_info['table_name']}`
+            - Rows: {schema_info['row_count']}
+            - Columns: {len(schema_info['columns'])}
+
+            You can ask questions like:
+            - "What is the average price?"
+            - "Show me the top 5 most expensive properties"
+            - "How many properties per district?"
+            """)
+        elif 'error' in schema_info:
+            st.error(f"⚠️ SQL database error: {schema_info['error']}")
+        else:
+            st.warning("⚠️ SQL tool initialized but schema info not available")
     else:
         st.info("💬 Ask questions about your schema (SQL queries not yet available)")
     
@@ -1043,9 +1351,9 @@ def main():
     
     # Sidebar
     with st.sidebar:
-        st.title("📊 Data Schema Pipeline V4")
-        st.write("Complete workflow + Type Cleaning + Agent Q&A")
-        
+        st.title("📊 Data Schema Pipeline V5")
+        st.write("Complete workflow + Question-Driven Schema Generation")
+
         st.divider()
         
         # Session info
@@ -1075,10 +1383,13 @@ def main():
             1. **Ingestion**: Upload files
             2. **Structure**: Fix structure issues
             3. **Type Cleaning**: Convert formatted numbers
-            4. **Schema**: Generate semantic schema
-            5. **Agent Q&A**: Chat about your data
-            6. **Checkpoints**: Review transformations
-            7. **Export**: Download results
+            4. **Question Collection**: Define expected usage (optional)
+            5. **Schema Generation**:
+               - Step 1: Analyze data → Generate clarification questions
+               - Step 2: Answer questions → Generate final schema
+            6. **Agent Q&A**: Chat & query your data with SQL
+            7. **Checkpoints**: Review transformations
+            8. **Export**: Download results
             """)
     
     # Main content - tabs
@@ -1086,31 +1397,35 @@ def main():
         "📁 Ingestion",
         "🔍 Structure Analysis",
         "🧹 Type Cleaning",
+        "❓ Question Collection",
         "📋 Schema Generation",
         "🤖 Agent Q&A",
         "💾 Checkpoints",
         "📤 Export"
     ])
-    
+
     with tabs[0]:
         tab_ingestion()
-    
+
     with tabs[1]:
         tab_structure_analysis()
-    
+
     with tabs[2]:
         tab_type_cleaning()
-    
+
     with tabs[3]:
-        tab_schema_generation()
-    
+        tab_question_collection()
+
     with tabs[4]:
-        tab_agent_qa()
-    
+        tab_schema_generation()
+
     with tabs[5]:
-        tab_checkpoints()
-    
+        tab_agent_qa()
+
     with tabs[6]:
+        tab_checkpoints()
+
+    with tabs[7]:
         tab_export()
 
 
