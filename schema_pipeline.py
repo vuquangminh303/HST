@@ -76,7 +76,20 @@ class Transformation(BaseModel):
     params: Dict[str, Any]
     confidence: float
     applied: bool = False
-    
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class TransformationOption(BaseModel):
+    """A set of transformations representing one approach to clean data"""
+    id: str
+    name: str  # e.g., "Auto-detect and fix structure", "Custom user transform"
+    description: str
+    transformations: List[Transformation]
+    confidence: float
+    is_recommended: bool = False
+
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()
 
@@ -668,55 +681,118 @@ class DataIngestor:
 # ============================================================================
 
 class StructureAnalyzer:
-    """Analyzes raw DataFrame structure with improved clean data detection"""
-    
+    """Analyzes raw DataFrame structure and types, proposes multiple transformation options"""
+
     def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
         self.client = OpenAI(api_key=api_key)
         self.model = model
-    
-    def analyze_structure(
-        self, 
-        df: pd.DataFrame, 
+
+    def analyze_structure_and_types(
+        self,
+        df: pd.DataFrame,
         max_preview_rows: int = 10
-    ) -> Tuple[Dict[str, Any], List[Transformation], List[Question], bool]:
+    ) -> Tuple[Dict[str, Any], List[TransformationOption], Dict[str, ColumnProfile], List[CleaningRule], List[Question], bool]:
         """
-        Analyze raw structure and propose transformations.
-        Returns: (structure_info, transformations, questions, is_clean)
+        Comprehensive analysis: structure + types, propose multiple transformation options.
+        Returns: (structure_info, transformation_options, column_profiles, cleaning_rules, questions, is_clean)
         """
-        
-        # First, perform heuristic check
-        is_clean, issues = self._heuristic_structure_check(df)
-        
-        if is_clean:
-            logger.info("✓ Data structure appears clean - no transformations needed")
-            structure_info = self._extract_structure_info(df, max_preview_rows)
-            return structure_info, [], [], True
-        
-        logger.info(f"⚠ Detected structure issues: {', '.join(issues)}")
-        
-        # Perform LLM analysis
+
+        # First, perform heuristic structure check
+        is_clean_structure, structure_issues = self._heuristic_structure_check(df)
+
+        # Extract structure info
         structure_info = self._extract_structure_info(df, max_preview_rows)
-        prompt = self._build_structure_prompt(structure_info, issues)
-        
+
+        # Analyze types (regardless of structure cleanliness)
+        column_profiles = {}
+        for col in df.columns:
+            inferred_type, metadata = TypeInferenceEngine.infer_type(df[col])
+            profile = ColumnProfile(
+                name=str(col),
+                pandas_dtype=str(df[col].dtype),
+                inferred_type=inferred_type,
+                non_null_count=int(df[col].notna().sum()),
+                null_count=int(df[col].isna().sum()),
+                null_ratio=float(df[col].isna().sum() / len(df)) if len(df) > 0 else 0.0,
+                n_unique=int(df[col].nunique()),
+                sample_values=df[col].dropna().head(5).tolist(),
+                sample_raw_values=df[col].dropna().head(5).astype(str).tolist(),
+                has_thousand_separator=bool(metadata.get('thousand_separator')),
+                decimal_separator=metadata.get('decimal_separator')
+            )
+            column_profiles[str(col)] = profile
+
+        # Generate type cleaning rules
+        cleaning_rules = TypeInferenceEngine.generate_cleaning_rules(df, column_profiles)
+
+        # If structure is clean, return with only type cleaning
+        if is_clean_structure:
+            logger.info("✓ Data structure appears clean")
+            logger.info(f"✓ Generated {len(cleaning_rules)} type cleaning rules")
+
+            # Create a "no structure change" option
+            options = [
+                TransformationOption(
+                    id="no_structure_change",
+                    name="Keep Current Structure",
+                    description="Data structure is clean, only type cleaning needed",
+                    transformations=[],
+                    confidence=1.0,
+                    is_recommended=True
+                )
+            ]
+
+            return structure_info, options, column_profiles, cleaning_rules, [], True
+
+        logger.info(f"⚠ Detected structure issues: {', '.join(structure_issues)}")
+
+        # Perform LLM analysis to get multiple transformation options
+        prompt = self._build_enhanced_structure_prompt(structure_info, structure_issues, column_profiles)
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": self._get_structure_system_prompt()},
+                    {"role": "system", "content": self._get_enhanced_structure_system_prompt()},
                     {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.3
+                temperature=0.5  # Higher temp for more diverse options
             )
-            
+
             result = json.loads(response.choices[0].message.content)
-            
-            transformations = [Transformation(**t) for t in result.get("transformations", [])]
+
+            # Parse transformation options
+            transformation_options = []
+            for opt in result.get("transformation_options", []):
+                transformations = [Transformation(**t) for t in opt.get("transformations", [])]
+                option = TransformationOption(
+                    id=opt["id"],
+                    name=opt["name"],
+                    description=opt["description"],
+                    transformations=transformations,
+                    confidence=opt.get("confidence", 0.5),
+                    is_recommended=opt.get("is_recommended", False)
+                )
+                transformation_options.append(option)
+
+            # Add a "custom" option for user-defined transforms
+            transformation_options.append(
+                TransformationOption(
+                    id="custom_user_transform",
+                    name="Custom Transformation",
+                    description="Define your own transformation steps",
+                    transformations=[],
+                    confidence=0.0,
+                    is_recommended=False
+                )
+            )
+
             questions = [Question(**q) for q in result.get("questions", [])]
-            
-            logger.info(f"✓ Analyzed structure: {len(transformations)} transformations proposed, {len(questions)} questions")
-            return structure_info, transformations, questions, False
-            
+
+            logger.info(f"✓ Analyzed structure: {len(transformation_options)} options proposed, {len(questions)} questions")
+            return structure_info, transformation_options, column_profiles, cleaning_rules, questions, False
+
         except Exception as e:
             raise RuntimeError(f"Structure analysis failed: {str(e)}")
     
@@ -775,8 +851,100 @@ class StructureAnalyzer:
             "first_row_values": df.iloc[0].tolist() if len(df) > 0 else []
         }
     
+    def _build_enhanced_structure_prompt(
+        self,
+        info: Dict[str, Any],
+        detected_issues: List[str],
+        column_profiles: Dict[str, ColumnProfile]
+    ) -> str:
+        """Build enhanced prompt for structure analysis with multiple options"""
+
+        # Summarize type issues
+        type_issues = []
+        for col_name, profile in column_profiles.items():
+            if profile.has_thousand_separator:
+                type_issues.append(f"Column '{col_name}': has thousand separator (e.g., {profile.sample_raw_values[0]})")
+            if profile.inferred_type != profile.pandas_dtype and profile.pandas_dtype == 'object':
+                type_issues.append(f"Column '{col_name}': stored as string but inferred as {profile.inferred_type}")
+
+        return f"""Analyze this DataFrame and propose MULTIPLE transformation options.
+
+**Detected Structure Issues:**
+{chr(10).join('- ' + issue for issue in detected_issues)}
+
+**Detected Type Issues:**
+{chr(10).join('- ' + issue for issue in type_issues[:5])}
+(Total {len(type_issues)} type issues detected)
+
+**DataFrame Info:**
+- Shape: {info['shape']['rows']} rows × {info['shape']['columns']} columns
+- Current column names: {info['column_names']}
+- First row values: {info['first_row_values'][:10]}
+
+**Preview (first few rows):**
+```json
+{json.dumps(info['preview_data'][:5], indent=2, default=str)}
+```
+
+**Column Type Summary:**
+{json.dumps({col: f"{profile.pandas_dtype} → {profile.inferred_type}" for col, profile in list(column_profiles.items())[:10]}, indent=2)}
+
+**Instructions:**
+1. Propose 2-3 DIFFERENT approaches to fix the structure issues
+2. Each approach should be a complete transformation pipeline
+3. Consider conservative vs aggressive fixes
+4. Examples of different approaches:
+   - Option 1: Minimal fix (only critical issues)
+   - Option 2: Recommended fix (balance safety & completeness)
+   - Option 3: Aggressive fix (maximum cleanup)
+
+**Response Format:**
+{{
+  "transformation_options": [
+    {{
+      "id": "minimal_fix",
+      "name": "Minimal Fix",
+      "description": "Only fix critical structural issues",
+      "transformations": [
+        {{
+          "id": "unique_id",
+          "type": "use_row_as_header" | "skip_rows" | "drop_columns" | "rename_columns" | ...,
+          "description": "Human-readable description",
+          "params": {{"row_index": 0}} or {{"rows_to_skip": 2}} etc,
+          "confidence": 0.95
+        }}
+      ],
+      "confidence": 0.9,
+      "is_recommended": false
+    }},
+    {{
+      "id": "recommended_fix",
+      "name": "Recommended Fix",
+      "description": "Balanced approach fixing structure + preparing for type cleaning",
+      "transformations": [...],
+      "confidence": 0.95,
+      "is_recommended": true
+    }}
+  ],
+  "questions": [
+    {{
+      "id": "question_id",
+      "question": "Should we...?",
+      "suggested_answer": "yes" or null,
+      "target": "transform.unique_id",
+      "question_type": "structural"
+    }}
+  ]
+}}
+
+**IMPORTANT:**
+- Propose at least 2 different options
+- Mark one as is_recommended=true
+- Type cleaning will be handled separately - focus on structural transformations here
+"""
+
     def _build_structure_prompt(self, info: Dict[str, Any], detected_issues: List[str]) -> str:
-        """Build prompt for structure analysis"""
+        """Build prompt for structure analysis (legacy, kept for compatibility)"""
         return f"""Analyze this raw DataFrame structure and propose transformations.
 
 **Detected Issues (from heuristics):**
@@ -835,8 +1003,26 @@ class StructureAnalyzer:
 **IMPORTANT:** If the data already has proper headers and clean structure, return empty transformations list!
 """
     
+    def _get_enhanced_structure_system_prompt(self) -> str:
+        """Enhanced system prompt for structure analysis with multiple options"""
+        return """You are an expert data analyst specializing in detecting and fixing structural issues in raw tabular data.
+
+Your job is to:
+1. Identify structural problems (wrong headers, empty rows, malformed columns)
+2. Propose MULTIPLE different transformation approaches (2-3 options)
+3. Each option should represent a different strategy (minimal, recommended, aggressive)
+4. Ask clarifying questions when uncertain
+
+Guidelines:
+- Minimal Fix: Only fix critical issues that would break data processing
+- Recommended Fix: Balanced approach, fix structure issues + prepare for type cleaning
+- Aggressive Fix: Maximum cleanup, drop suspicious columns/rows, rename everything
+
+Always respond in valid JSON format with "transformation_options" and "questions" arrays.
+Each option must have: id, name, description, transformations array, confidence, is_recommended."""
+
     def _get_structure_system_prompt(self) -> str:
-        """System prompt for structure analysis"""
+        """System prompt for structure analysis (legacy)"""
         return """You are an expert data analyst specializing in detecting and fixing structural issues in raw tabular data.
 
 Your job is to:
@@ -876,11 +1062,23 @@ Always respond in valid JSON format with "transformations" and "questions" array
                 df_result = df_result.rename(columns=mapping)
             
             logger.info(f"✓ Applied: {trans.description}")
-            
+
         except Exception as e:
             logger.error(f"✗ Failed to apply {trans.id}: {str(e)}")
             raise
-        
+
+        return df_result
+
+    @staticmethod
+    def apply_transformation_option(df: pd.DataFrame, option: TransformationOption) -> pd.DataFrame:
+        """Apply all transformations in an option sequentially"""
+        df_result = df.copy()
+
+        logger.info(f"Applying transformation option: {option.name}")
+        for trans in option.transformations:
+            df_result = StructureAnalyzer.apply_transformation(df_result, trans)
+
+        logger.info(f"✓ Completed transformation option: {option.name}")
         return df_result
 
 
