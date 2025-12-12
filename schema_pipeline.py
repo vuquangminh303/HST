@@ -1083,6 +1083,232 @@ Always respond in valid JSON format with "transformations" and "questions" array
 
 
 # ============================================================================
+# Data Insights Models
+# ============================================================================
+
+class DataPattern(BaseModel):
+    """Detected pattern in data"""
+    pattern_type: str  # "trend", "seasonality", "categorical", "unique_id", etc.
+    column: str
+    description: str
+    confidence: float
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class DataAnomaly(BaseModel):
+    """Detected anomaly in data"""
+    anomaly_type: str  # "outlier", "missing_pattern", "inconsistent_format", etc.
+    column: str
+    description: str
+    severity: str  # "low", "medium", "high"
+    affected_rows: int
+    examples: List[Any] = Field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class DataInsights(BaseModel):
+    """Complete insights about a dataset"""
+    patterns: List[DataPattern] = Field(default_factory=list)
+    anomalies: List[DataAnomaly] = Field(default_factory=list)
+    distributions: Dict[str, str] = Field(default_factory=dict)  # column -> distribution type
+    correlations: List[Dict[str, Any]] = Field(default_factory=list)
+    summary: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+# ============================================================================
+# Data Insights Analyzer (NEW STEP 3)
+# ============================================================================
+
+class DataInsightsAnalyzer:
+    """Analyze data patterns, anomalies, and distributions using LLM"""
+
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+
+    def analyze_insights(
+        self,
+        df: pd.DataFrame,
+        profiles: Dict[str, ColumnProfile]
+    ) -> DataInsights:
+        """
+        Analyze data patterns, anomalies, correlations, and distributions.
+        This runs AFTER structure is fixed and types are inferred.
+        """
+
+        # Build analysis prompt
+        prompt = self._build_insights_prompt(df, profiles)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_insights_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+
+            # Parse patterns
+            patterns = [DataPattern(**p) for p in result.get("patterns", [])]
+
+            # Parse anomalies
+            anomalies = [DataAnomaly(**a) for a in result.get("anomalies", [])]
+
+            insights = DataInsights(
+                patterns=patterns,
+                anomalies=anomalies,
+                distributions=result.get("distributions", {}),
+                correlations=result.get("correlations", []),
+                summary=result.get("summary", "")
+            )
+
+            logger.info(f"✓ Data insights: {len(patterns)} patterns, {len(anomalies)} anomalies detected")
+            return insights
+
+        except Exception as e:
+            raise RuntimeError(f"Insights analysis failed: {str(e)}")
+
+    def _build_insights_prompt(
+        self,
+        df: pd.DataFrame,
+        profiles: Dict[str, ColumnProfile]
+    ) -> str:
+        """Build prompt for data insights analysis"""
+
+        # Sample data
+        sample_rows = df.head(20).to_dict(orient='records')
+
+        # Basic statistics for numeric columns
+        numeric_stats = {}
+        for col in df.select_dtypes(include=[np.number]).columns:
+            numeric_stats[str(col)] = {
+                "mean": float(df[col].mean()) if not df[col].isna().all() else None,
+                "median": float(df[col].median()) if not df[col].isna().all() else None,
+                "std": float(df[col].std()) if not df[col].isna().all() else None,
+                "min": float(df[col].min()) if not df[col].isna().all() else None,
+                "max": float(df[col].max()) if not df[col].isna().all() else None
+            }
+
+        # Categorical columns
+        categorical_info = {}
+        for col in df.select_dtypes(include=['object']).columns:
+            if df[col].nunique() < 50:  # Only for low cardinality
+                categorical_info[str(col)] = {
+                    "unique_count": int(df[col].nunique()),
+                    "top_values": df[col].value_counts().head(10).to_dict()
+                }
+
+        return f"""Analyze this dataset and identify patterns, anomalies, and insights.
+
+**Dataset Overview:**
+- Shape: {df.shape[0]} rows × {df.shape[1]} columns
+- Columns: {list(df.columns)}
+
+**Column Profiles:**
+{json.dumps({col: {"type": profile.inferred_type, "null_ratio": profile.null_ratio, "unique": profile.n_unique} for col, profile in list(profiles.items())[:20]}, indent=2)}
+
+**Numeric Statistics:**
+{json.dumps(numeric_stats, indent=2, default=str)}
+
+**Categorical Info:**
+{json.dumps(categorical_info, indent=2, default=str)}
+
+**Sample Data (first 20 rows):**
+{json.dumps(sample_rows[:10], indent=2, default=str)}
+
+**Instructions:**
+Analyze the data and identify:
+
+1. **Patterns** (pattern_type, column, description, confidence, details):
+   - Trends (increasing/decreasing over time)
+   - Seasonality or cycles
+   - Unique identifiers (ID columns)
+   - Categorical groupings
+   - Date/time patterns
+   - Hierarchical relationships
+
+2. **Anomalies** (anomaly_type, column, description, severity, affected_rows, examples):
+   - Outliers in numeric data
+   - Missing data patterns
+   - Inconsistent formats
+   - Duplicate entries
+   - Data quality issues
+
+3. **Distributions** (column -> distribution type):
+   - "normal", "uniform", "skewed_left", "skewed_right", "bimodal", "categorical", etc.
+
+4. **Correlations** (list of related columns):
+   - Strong correlations between numeric columns
+   - Relationships between categorical and numeric
+
+5. **Summary**: Brief overview of key findings
+
+**Response Format:**
+{{
+  "patterns": [
+    {{
+      "pattern_type": "unique_id" | "trend" | "categorical" | "temporal" | ...,
+      "column": "column_name",
+      "description": "Description of the pattern",
+      "confidence": 0.95,
+      "details": {{"key": "value"}}
+    }}
+  ],
+  "anomalies": [
+    {{
+      "anomaly_type": "outlier" | "missing_pattern" | "inconsistent_format" | ...,
+      "column": "column_name",
+      "description": "Description of the anomaly",
+      "severity": "low" | "medium" | "high",
+      "affected_rows": 10,
+      "examples": ["example1", "example2"]
+    }}
+  ],
+  "distributions": {{
+    "column_name": "normal",
+    "another_column": "skewed_right"
+  }},
+  "correlations": [
+    {{
+      "columns": ["col1", "col2"],
+      "type": "positive" | "negative",
+      "strength": "strong" | "moderate" | "weak",
+      "description": "Description"
+    }}
+  ],
+  "summary": "Brief summary of key insights about this dataset"
+}}
+"""
+
+    def _get_insights_system_prompt(self) -> str:
+        """System prompt for insights analysis"""
+        return """You are an expert data scientist specializing in exploratory data analysis.
+
+Your job is to:
+1. Identify meaningful patterns in the data
+2. Detect anomalies and data quality issues
+3. Determine statistical distributions
+4. Find correlations and relationships between variables
+5. Provide actionable insights
+
+Be thorough but concise. Focus on insights that would help users understand their data better.
+
+Always respond in valid JSON format."""
+
+
+# ============================================================================
 # Profile Generation (Enhanced with Type Inference)
 # ============================================================================
 

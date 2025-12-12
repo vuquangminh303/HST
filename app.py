@@ -20,7 +20,17 @@ from schema_pipeline import (
     SessionManager, RefinementEngine, DataSource, Session, Transformation,
     Question, Answer, ColumnProfile, ColumnSchema, DataFrameCheckpoint,
     TypeInferenceEngine, CleaningRule, DataSchemaAgent, AgentMessage,
-    UserQuestion, OutputField, QuestionSet, SchemaValidator
+    UserQuestion, OutputField, QuestionSet, SchemaValidator,
+    DataInsightsAnalyzer, DataPattern, DataAnomaly, DataInsights
+)
+
+# Import new pipeline tabs
+from app_pipeline_tabs import (
+    tab_structure_analysis_new,
+    tab_type_inference,
+    tab_data_insights,
+    tab_transformations,
+    tab_data_cleaning
 )
 
 # Page config
@@ -1796,38 +1806,55 @@ def main():
         # Help
         with st.expander("❓ Help"):
             st.markdown("""
-            **New Workflow:**
-            1. **Ingestion**: Upload CSV/Excel files
-            2. **Structure & Type Analysis**:
-               - Analyze structure and data types together
-               - Choose from multiple transformation options (Minimal, Recommended, Aggressive)
-               - Define custom transformations if needed
-               - Apply type cleaning rules
-            3. **Schema Generation**:
-               - Step 1: Analyze data → Generate clarification questions (units, formats, constraints)
-               - Step 2: Answer questions → Generate final schema with metadata
-            4. **Question Validation**:
-               - Add questions you want to ask
-               - Validate if schema can answer them
-               - If not sufficient, go back to refine data/schema
-            5. **Agent Q&A**: Chat & query your data with SQL capability
-            6. **Checkpoints**: Review and restore transformations
-            7. **Export**: Download cleaned data and schema
+            **NEW PIPELINE - STRICT ORDER:**
 
-            **Key Features:**
-            - Multiple transformation options with different strategies
-            - Custom transformation input
-            - Schema validation against expected questions
-            - Iterative refinement workflow
+            **⚠️ CRITICAL:** Must complete Structure Analysis BEFORE other steps!
+
+            1. **📁 Ingestion**: Upload CSV/Excel files
+            2. **🏗️ Structure Analysis** ⭐ MUST BE FIRST!
+               - Detect structural issues (wrong headers, empty rows, etc.)
+               - Fix structure before any other analysis
+            3. **🔢 Type Inference**:
+               - Detect type mismatches (numbers as strings, etc.)
+               - Identify formatting issues (thousand separators, etc.)
+            4. **🔍 Data Insights** (NEW!):
+               - Discover patterns (trends, seasonality, unique IDs)
+               - Detect anomalies (outliers, missing patterns, duplicates)
+               - Analyze distributions and correlations
+            5. **🔧 Transformations**:
+               - Review suggested transformations based on insights
+               - Select and apply transformations
+            6. **🧹 Data Cleaning**:
+               - Apply type conversions
+               - Clean formatted numbers
+            7. **📋 Schema Generation**:
+               - Generate clarification questions (units, formats)
+               - Answer questions → Final schema
+            8. **❓ Question Validation**:
+               - Add expected questions
+               - Validate schema sufficiency
+               - Loop back if needed
+            9. **🤖 Agent Q&A**: Query your data
+
+            **Why This Order?**
+            - Structure issues (wrong headers) break ALL downstream analysis
+            - Type inference needs correct structure
+            - Insights analysis needs correct types
+            - Transformations based on insights
+            - Schema generation needs clean data
             """)
     
-    # Main content - tabs
+    # Main content - tabs (NEW PIPELINE)
     tabs = st.tabs([
-        "📁 Ingestion",
-        "🔍 Structure & Type Analysis",
-        "📋 Schema Generation",
-        "❓ Question Validation",
-        "🤖 Agent Q&A",
+        "📁 1. Ingestion",
+        "🏗️ 2. Structure Analysis",
+        "🔢 3. Type Inference",
+        "🔍 4. Data Insights",
+        "🔧 5. Transformations",
+        "🧹 6. Data Cleaning",
+        "📋 7. Schema Generation",
+        "❓ 8. Question Validation",
+        "🤖 9. Agent Q&A",
         "💾 Checkpoints",
         "📤 Export"
     ])
@@ -1836,21 +1863,33 @@ def main():
         tab_ingestion()
 
     with tabs[1]:
-        tab_structure_and_type_analysis()
+        tab_structure_analysis_new()
 
     with tabs[2]:
-        tab_schema_generation()
+        tab_type_inference()
 
     with tabs[3]:
-        tab_question_validation()
+        tab_data_insights()
 
     with tabs[4]:
-        tab_agent_qa()
+        tab_transformations()
 
     with tabs[5]:
-        tab_checkpoints()
+        tab_data_cleaning()
 
     with tabs[6]:
+        tab_schema_generation()
+
+    with tabs[7]:
+        tab_question_validation()
+
+    with tabs[8]:
+        tab_agent_qa()
+
+    with tabs[9]:
+        tab_checkpoints()
+
+    with tabs[10]:
         tab_export()
 
 
