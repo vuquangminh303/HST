@@ -64,6 +64,31 @@ st.markdown("""
 
 
 # ============================================================================
+# Helper Functions
+# ============================================================================
+
+def safe_display_dataframe(df, *args, **kwargs):
+    """
+    Safely display DataFrame in Streamlit, handling PyArrow conversion errors.
+    Converts problematic columns to string to avoid mixed-type issues.
+    """
+    try:
+        # Try direct display first
+        st.dataframe(df, *args, **kwargs)
+    except Exception as e:
+        # If fails, convert object columns to string
+        if "ArrowTypeError" in str(type(e).__name__) or "Expected bytes" in str(e):
+            df_display = df.copy()
+            for col in df_display.columns:
+                if df_display[col].dtype == 'object':
+                    df_display[col] = df_display[col].astype(str)
+            st.dataframe(df_display, *args, **kwargs)
+        else:
+            # Re-raise if different error
+            raise
+
+
+# ============================================================================
 # Session State Management
 # ============================================================================
 
@@ -201,7 +226,7 @@ def tab_ingestion():
                 "Columns": len(df.columns) if df is not None else 0
             })
         
-        st.dataframe(pd.DataFrame(source_data), use_container_width=True)
+        safe_display_dataframe(pd.DataFrame(source_data), use_container_width=True)
         
         # Preview
         st.subheader("👁️ Data Preview")
@@ -212,7 +237,7 @@ def tab_ingestion():
         
         if selected_source and selected_source in st.session_state.raw_dfs:
             df = st.session_state.raw_dfs[selected_source]
-            st.dataframe(df.head(20), use_container_width=True)
+            safe_display_dataframe(df.head(20), use_container_width=True)
 
 
 # ============================================================================
@@ -340,13 +365,13 @@ def tab_structure_analysis():
             with col1:
                 st.write("**Before (Raw)**")
                 df_raw = st.session_state.raw_dfs[selected_source_id]
-                st.dataframe(df_raw.head(10), use_container_width=True)
+                safe_display_dataframe(df_raw.head(10), use_container_width=True)
                 st.caption(f"Shape: {df_raw.shape[0]} rows × {df_raw.shape[1]} columns")
             
             with col2:
                 st.write("**After (Transformed)**")
                 df_clean = st.session_state.clean_dfs[selected_source_id]
-                st.dataframe(df_clean.head(10), use_container_width=True)
+                safe_display_dataframe(df_clean.head(10), use_container_width=True)
                 st.caption(f"Shape: {df_clean.shape[0]} rows × {df_clean.shape[1]} columns")
 
         # Custom Transformations Section
@@ -581,7 +606,7 @@ def tab_type_cleaning():
                 "Example Value": profile.sample_raw_values[0] if profile.sample_raw_values else ""
             })
         
-        st.dataframe(pd.DataFrame(type_data), use_container_width=True)
+        safe_display_dataframe(pd.DataFrame(type_data), use_container_width=True)
         
         # Cleaning rules
         if results['cleaning_rules']:
@@ -642,7 +667,7 @@ def tab_type_cleaning():
             with col2:
                 st.metric("Columns", df_cleaned.shape[1])
             
-            st.dataframe(df_cleaned.head(20), use_container_width=True)
+            safe_display_dataframe(df_cleaned.head(20), use_container_width=True)
             
             # Show dtype changes
             st.write("**Data Types After Cleaning:**")
@@ -650,7 +675,7 @@ def tab_type_cleaning():
                 "Column": df_cleaned.columns,
                 "Type": [str(dtype) for dtype in df_cleaned.dtypes]
             })
-            st.dataframe(dtype_df, use_container_width=True)
+            safe_display_dataframe(dtype_df, use_container_width=True)
 
     # Custom Cleaning Rules Section
     st.divider()
@@ -1027,7 +1052,7 @@ def tab_question_collection():
                     "Description": schema_col.description,
                     "Unit": schema_col.unit or ""
                 })
-            st.dataframe(pd.DataFrame(schema_data), use_container_width=True)
+            safe_display_dataframe(pd.DataFrame(schema_data), use_container_width=True)
 
 # ============================================================================
 # Tab 5: Schema Generation
@@ -1689,7 +1714,7 @@ def tab_agent_qa():
                     st.error(error)
                 else:
                     st.success(f"✅ Query returned {len(result_df)} rows")
-                    st.dataframe(result_df, use_container_width=True)
+                    safe_display_dataframe(result_df, use_container_width=True)
 
 # ============================================================================
 # Tab 6: Checkpoints & History
@@ -1721,7 +1746,7 @@ def tab_checkpoints():
             })
         
         df_checkpoints = pd.DataFrame(checkpoint_data)
-        st.dataframe(df_checkpoints, use_container_width=True)
+        safe_display_dataframe(df_checkpoints, use_container_width=True)
         
         # Load checkpoint
         st.divider()
@@ -1743,7 +1768,7 @@ def tab_checkpoints():
                 with col2:
                     st.metric("Columns", df_checkpoint.shape[1])
                 
-                st.dataframe(df_checkpoint.head(20), use_container_width=True)
+                safe_display_dataframe(df_checkpoint.head(20), use_container_width=True)
                 
                 # Download option
                 csv = df_checkpoint.to_csv(index=False).encode('utf-8')
@@ -1874,9 +1899,17 @@ Show sales trend over time""",
             # Output Format
             st.subheader("📤 Output Format")
 
+            # Detect output format method from existing scenario
+            default_method_index = 0  # Default to JSON Schema
+            if current_scen and current_scen.output_format:
+                # If output_format only has "description" key, it was created with Free Text mode
+                if list(current_scen.output_format.keys()) == ["description"]:
+                    default_method_index = 1  # Free Text Description
+
             output_format_method = st.radio(
                 "Define output format as",
                 ["JSON Schema", "Free Text Description"],
+                index=default_method_index,
                 key="output_format_method",
                 horizontal=True
             )
@@ -1961,13 +1994,16 @@ Show sales trend over time""",
 
                     # Parse output format
                     if output_format_method == "JSON Schema":
-                        try:
-                            output_format = json.loads(output_format_json) if output_format_json.strip() else {}
-                        except json.JSONDecodeError:
-                            st.error("Invalid JSON in output format")
+                        if output_format_json.strip():
+                            try:
+                                output_format = json.loads(output_format_json)
+                            except json.JSONDecodeError as e:
+                                st.error(f"Invalid JSON in output format: {str(e)}")
+                                st.stop()  # Stop execution to prevent saving with empty dict
+                        else:
                             output_format = {}
                     else:
-                        output_format = {"description": output_format_text}
+                        output_format = {"description": output_format_text} if output_format_text.strip() else {}
 
                     # Parse examples
                     try:
@@ -2113,7 +2149,7 @@ def tab_export():
             })
         
         df_schema = pd.DataFrame(schema_data)
-        st.dataframe(df_schema, use_container_width=True)
+        safe_display_dataframe(df_schema, use_container_width=True)
         
         # Summary stats
         st.divider()
