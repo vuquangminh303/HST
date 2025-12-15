@@ -3,7 +3,7 @@ Streamlit UI V5 - Question-Driven Schema Generation
 Full workflow from V4 + User Question Collection + Schema Validation
 Allows users to define expected questions and output format before schema generation
 """
-
+import os
 import streamlit as st
 import pandas as pd
 import json
@@ -114,13 +114,16 @@ def tab_ingestion():
         )
     
     with col2:
+        api_key = os.getenv("OPENAI_API_KEY")
         st.subheader("Settings")
-        api_key = st.text_input(
-            "OpenAI API Key",
-            type="password",
-            value=st.session_state.get('api_key', ''),
-            help="Required for LLM analysis"
-        )
+        if not api_key:
+
+            api_key = st.text_input(
+                "OpenAI API Key",
+                type="password",
+                value=st.session_state.get('api_key', ''),
+                help="Required for LLM analysis"
+            )
         
         model = st.selectbox(
             "Model",
@@ -499,109 +502,215 @@ def tab_type_cleaning():
 # Tab 4: Question Collection
 # ============================================================================
 
+
 def tab_question_collection():
-    """Define expected questions and output format"""
-    st.header("❓ Question Collection")
+    """
+    Step 5: Schema Validation & Refinement
+    Allows users to define questions AFTER schema generation.
+    Validates if the schema can answer them, and triggers refinement if not.
+    """
+    st.header("✅ Schema Validation & Refinement")
 
     if not st.session_state.session:
         st.warning("⚠️ No active session")
         return
-
+        
     session = st.session_state.session
+    
+    # Check if schema exists first
+    if not session.schema:
+        st.warning("⚠️ Please generate a schema first (Tab 4: Schema Generation).")
+        return
 
     st.markdown("""
-    **Define how you will use this data:**
-
-    Help the system understand your needs by defining:
-    1. **Sample questions** you will frequently ask
-    2. **Expected output fields** you need in responses
+    **Validate your Schema:**
+    1. Enter questions you plan to ask the data.
+    2. The system will check if the current schema contains enough information.
+    3. If gaps are found, you can refine the schema right here.
     """)
 
-    # Initialize question_set if not exists
-    if not session.question_set:
-        session.question_set = QuestionSet()
-
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([1, 1])
 
     with col1:
-        st.subheader("📝 Sample Questions")
+        st.subheader("1. Define User Questions")
+        
+        # Load existing questions if any
+        current_qs = ""
+        if session.question_set and session.question_set.user_questions:
+            current_qs = "\n".join([q.question for q in session.question_set.user_questions])
+
         questions_text = st.text_area(
-            "Enter questions (one per line)",
-            value="\n".join([q.question for q in session.question_set.user_questions]) if session.question_set.user_questions else "",
-            placeholder="What is the total revenue by category?\nShow top 10 products by price\nHow many items per region?",
+            "What questions will you ask?",
+            value=current_qs,
+            placeholder="e.g., What is the total revenue?\nHow is profit calculated?\nFilter by specific region...",
             height=200,
-            key="questions_input"
+            key="val_questions_input"
         )
+        
+        if st.button("🔍 Validate Schema against Questions", type="primary"):
+            if not questions_text.strip():
+                st.error("Please enter at least one question.")
+                return
+                
+            with st.spinner("Validating schema capabilities..."):
+                # 1. Update Session QuestionSet
+                questions_list = [q.strip() for q in questions_text.split('\n') if q.strip()]
+                
+                if not session.question_set:
+                    session.question_set = QuestionSet()
+                
+                session.question_set.user_questions = [
+                    UserQuestion(id=f"uq_{i}", question=q) for i, q in enumerate(questions_list)
+                ]
+                
+                # 2. Run Validator
+                validator = SchemaValidator(
+                    api_key=st.session_state.api_key,
+                    model=st.session_state.model
+                )
+                
+                # Prepare data for validation
+                selected_source_id = session.current_source_id
+                
+                # --- [FIX LỖI QUAN TRỌNG] ---
+                # Sử dụng tham số default của hàm get() thay vì toán tử 'or'
+                # Nếu không tìm thấy trong cleaned_dfs, nó sẽ trả về kết quả của raw_dfs
+                df = st.session_state.cleaned_dfs.get(
+                    selected_source_id, 
+                    st.session_state.raw_dfs.get(selected_source_id)
+                )
+                # -----------------------------
+                
+                if df is None:
+                    st.error(f"Could not find data for source: {selected_source_id}")
+                    return
+
+                sample_rows = ProfileGenerator.get_sample_rows(df)
+                
+                is_sufficient, add_questions, report = validator.validate_schema_for_questions(
+                    schema=session.schema,
+                    profiles=session.profiles, 
+                    question_set=session.question_set,
+                    sample_rows=sample_rows
+                )
+                
+                # Store validation results
+                st.session_state.validation_result = {
+                    "is_sufficient": is_sufficient,
+                    "additional_questions": add_questions,
+                    "report": report,
+                    "timestamp": datetime.now().isoformat()
+                }
 
     with col2:
-        st.subheader("📊 Expected Output Fields")
-        fields_text = st.text_area(
-            "Enter field names (comma-separated or one per line)",
-            value=", ".join([f.field_name for f in session.question_set.output_fields]) if session.question_set.output_fields else "",
-            placeholder="total_revenue, category_name, product_count, average_price",
-            height=200,
-            key="fields_input"
-        )
+        st.subheader("2. Validation Report")
+        
+        if "validation_result" in st.session_state:
+            res = st.session_state.validation_result
+            
+            # Status Banner
+            if res["is_sufficient"]:
+                st.success("✅ Schema is Sufficient!")
+                st.write("The current schema contains enough information to answer your questions.")
+            else:
+                st.error("⚠️ Schema Needs Refinement")
+                st.write("Some information is missing or unclear based on your questions.")
+            
+            # Detailed Report
+            with st.expander("📄 View Detailed Report", expanded=True):
+                st.markdown(res["report"])
+            
+            # Refinement Loop
+            if not res["is_sufficient"] and res["additional_questions"]:
+                st.divider()
+                st.subheader("3. Refinement Required")
+                st.info("Please answer the following to update the schema:")
+                
+                # Initialize refinement answers storage
+                if "refinement_answers" not in st.session_state:
+                    st.session_state.refinement_answers = {}
+                
+                all_answered = True
+                
+                for i, q in enumerate(res["additional_questions"]):
+                    st.write(f"**Q{i+1}: {q.question}**")
+                    st.caption(f"Targeting: `{q.target}`")
+                    
+                    ans_key = f"val_ans_{q.id}"
+                    default_value = st.session_state.refinement_answers.get(q.id, q.suggested_answer or "")
+                    user_ans = st.text_input(
+                        "Answer:", 
+                        key=ans_key,
+                        value=default_value,
+                        help=f"Suggested: {q.suggested_answer}"
+                    )
+                    
+                    if user_ans:
+                        st.session_state.refinement_answers[q.id] = user_ans
+                    else:
+                        all_answered = False
+                
+                # Button Update Schema
+                if st.button("💾 Update Schema", disabled=not all_answered):
+                    with st.spinner("Updating schema..."):
+                        engine = RefinementEngine(session)
+                        
+                        count = 0
+                        for q in res["additional_questions"]:
+                            ans_text = st.session_state.refinement_answers.get(q.id)
+                            if ans_text:
+                                answer = Answer(
+                                    question_id=q.id,
+                                    answer=ans_text,
+                                    timestamp=datetime.now().isoformat()
+                                )
+                                
+                                q_exists = False
+                                for sq in session.questions:
+                                    if sq.id == q.id:
+                                        q_exists = True
+                                        break
+                                if not q_exists:
+                                    session.questions.append(q)
+                                # --------------------------
+                                
+                                if engine.apply_answer(answer):
+                                    session.answers.append(answer)
+                                    count += 1
+                        
+                        if count > 0:
+                            st.success(f"✅ Updated schema with {count} new details!")
+                            if "validation_result" in st.session_state:
+                                del st.session_state.validation_result
+                            if "refinement_answers" in st.session_state:
+                                del st.session_state.refinement_answers
+                            st.rerun()
+                        else:
+                            st.warning("No changes applied. Please check your answers.")
 
-    additional_notes = st.text_area(
-        "Additional context (optional)",
-        value=session.question_set.additional_notes if session.question_set else "",
-        placeholder="E.g., This data will be used for monthly financial reports...",
-        height=100,
-        key="notes_input"
-    )
-
-    if st.button("💾 Save Question Context", type="primary"):
-        # Parse questions
-        questions_list = [q.strip() for q in questions_text.split('\n') if q.strip()]
-        session.question_set.user_questions = [
-            UserQuestion(
-                id=f"uq_{i}_{datetime.now().timestamp()}",
-                question=q,
-                description="",
-                priority="medium"
-            ) for i, q in enumerate(questions_list)
-        ]
-
-        # Parse fields
-        if ',' in fields_text:
-            fields_list = [f.strip() for f in fields_text.split(',') if f.strip()]
         else:
-            fields_list = [f.strip() for f in fields_text.split('\n') if f.strip()]
+            st.info("Enter questions and click Validate to see the report.")
 
-        session.question_set.output_fields = [
-            OutputField(
-                field_name=f,
-                description=f"Field: {f}",
-                data_type="string",
-                required=True
-            ) for f in fields_list
-        ]
-
-        session.question_set.additional_notes = additional_notes
-
-        st.success(f"✓ Saved {len(session.question_set.user_questions)} questions and {len(session.question_set.output_fields)} fields")
-        st.rerun()
-
-    # Show summary
-    if session.question_set and (session.question_set.user_questions or session.question_set.output_fields):
-        st.divider()
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Questions", len(session.question_set.user_questions))
-        with col2:
-            st.metric("Output Fields", len(session.question_set.output_fields))
-        with col3:
-            has_notes = "Yes" if session.question_set.additional_notes else "No"
-            st.metric("Additional Notes", has_notes)
-
+    # Show Current Schema Summary for Reference
+    st.divider()
+    with st.expander("👀 View Current Schema Summary"):
+        if session.schema:
+            schema_data = []
+            for col_name, schema_col in session.schema.items():
+                schema_data.append({
+                    "Column": col_name,
+                    "Semantic Type": schema_col.semantic_type,
+                    "Description": schema_col.description,
+                    "Unit": schema_col.unit or ""
+                })
+            st.dataframe(pd.DataFrame(schema_data), use_container_width=True)
 
 # ============================================================================
 # Tab 5: Schema Generation
 # ============================================================================
 
 def tab_schema_generation():
-    """Schema generation tab with 2-step flow: clarification then generation"""
+    """Schema generation tab (Now Step 4)"""
     st.header("📋 Semantic Schema Generation")
 
     if not st.session_state.session:
@@ -609,14 +718,14 @@ def tab_schema_generation():
         return
 
     session = st.session_state.session
-
+    
+    # ... (Giữ nguyên phần chọn Source và lấy DF) ...
     selected_source_id = st.selectbox(
         "Select Source",
         options=[s.source_id for s in session.sources],
         key="schema_source_select"
     )
 
-    # Use cleaned df if available, otherwise clean, otherwise raw
     df = st.session_state.cleaned_dfs.get(
         selected_source_id,
         st.session_state.clean_dfs.get(
@@ -624,7 +733,7 @@ def tab_schema_generation():
             st.session_state.raw_dfs.get(selected_source_id)
         )
     )
-
+    
     if df is None:
         st.error("No data available")
         return
@@ -1397,8 +1506,8 @@ def main():
         "📁 Ingestion",
         "🔍 Structure Analysis",
         "🧹 Type Cleaning",
-        "❓ Question Collection",
         "📋 Schema Generation",
+        "❓ Question Collection",
         "🤖 Agent Q&A",
         "💾 Checkpoints",
         "📤 Export"
@@ -1414,10 +1523,10 @@ def main():
         tab_type_cleaning()
 
     with tabs[3]:
-        tab_question_collection()
+        tab_schema_generation()
 
     with tabs[4]:
-        tab_schema_generation()
+        tab_question_collection()
 
     with tabs[5]:
         tab_agent_qa()

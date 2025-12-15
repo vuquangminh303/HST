@@ -220,8 +220,47 @@ class QuestionSet(BaseModel):
             "output_fields": [f.to_dict() for f in self.output_fields],
             "additional_notes": self.additional_notes
         }
+class DataPattern(BaseModel):
 
+    """Detected pattern in data"""
 
+    pattern_type: str  # "trend", "seasonality", "categorical", "unique_id", etc.
+    column: str
+    description: str
+    confidence: float
+    details: Dict[str, Any] = Field(default_factory=dict)
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+class DataAnomaly(BaseModel):
+    """Detected anomaly in data"""
+    anomaly_type: str  # "outlier", "missing_pattern", "inconsistent_format", etc.
+    column: str
+    description: str
+    severity: str  # "low", "medium", "high"
+    affected_rows: int
+    examples: List[Any] = Field(default_factory=list)
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+class DataInsights(BaseModel):
+    """Complete insights about a dataset"""
+    patterns: List[DataPattern] = Field(default_factory=list)
+    anomalies: List[DataAnomaly] = Field(default_factory=list)
+    distributions: Dict[str, str] = Field(default_factory=dict)  # column -> distribution type
+    correlations: List[Dict[str, Any]] = Field(default_factory=list)
+    summary: str = ""
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+class TransformationOption(BaseModel):
+    """A set of transformations representing one approach to clean data"""
+    id: str
+    name: str  # e.g., "Auto-detect and fix structure", "Custom user transform"
+    description: str
+    transformations: List[Transformation]
+    confidence: float
+    is_recommended: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
 class Session(BaseModel):
     """Complete session state"""
     session_id: str
@@ -883,7 +922,185 @@ Always respond in valid JSON format with "transformations" and "questions" array
         
         return df_result
 
+class DataInsightsAnalyzer:
+    """Analyze data patterns, anomalies, and distributions using LLM"""
 
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+
+    def analyze_insights(
+        self,
+        df: pd.DataFrame,
+        profiles: Dict[str, ColumnProfile]
+    ) -> DataInsights:
+        """
+        Analyze data patterns, anomalies, correlations, and distributions.
+        This runs AFTER structure is fixed and types are inferred.
+        """
+
+        # Build analysis prompt
+        prompt = self._build_insights_prompt(df, profiles)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_insights_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+
+            # Parse patterns
+            patterns = [DataPattern(**p) for p in result.get("patterns", [])]
+
+            # Parse anomalies
+            anomalies = [DataAnomaly(**a) for a in result.get("anomalies", [])]
+
+            insights = DataInsights(
+                patterns=patterns,
+                anomalies=anomalies,
+                distributions=result.get("distributions", {}),
+                correlations=result.get("correlations", []),
+                summary=result.get("summary", "")
+            )
+
+            logger.info(f"✓ Data insights: {len(patterns)} patterns, {len(anomalies)} anomalies detected")
+            return insights
+
+        except Exception as e:
+            raise RuntimeError(f"Insights analysis failed: {str(e)}")
+
+    def _build_insights_prompt(
+        self,
+        df: pd.DataFrame,
+        profiles: Dict[str, ColumnProfile]
+    ) -> str:
+        """Build prompt for data insights analysis"""
+
+        # Sample data
+        sample_rows = df.head(20).to_dict(orient='records')
+
+        # Basic statistics for numeric columns
+        numeric_stats = {}
+        for col in df.select_dtypes(include=[np.number]).columns:
+            numeric_stats[str(col)] = {
+                "mean": float(df[col].mean()) if not df[col].isna().all() else None,
+                "median": float(df[col].median()) if not df[col].isna().all() else None,
+                "std": float(df[col].std()) if not df[col].isna().all() else None,
+                "min": float(df[col].min()) if not df[col].isna().all() else None,
+                "max": float(df[col].max()) if not df[col].isna().all() else None
+            }
+
+        # Categorical columns
+        categorical_info = {}
+        for col in df.select_dtypes(include=['object']).columns:
+            if df[col].nunique() < 50:  # Only for low cardinality
+                categorical_info[str(col)] = {
+                    "unique_count": int(df[col].nunique()),
+                    "top_values": df[col].value_counts().head(10).to_dict()
+                }
+
+        return f"""Analyze this dataset and identify patterns, anomalies, and insights.
+
+**Dataset Overview:**
+- Shape: {df.shape[0]} rows × {df.shape[1]} columns
+- Columns: {list(df.columns)}
+
+**Column Profiles:**
+{json.dumps({col: {"type": profile.inferred_type, "null_ratio": profile.null_ratio, "unique": profile.n_unique} for col, profile in list(profiles.items())[:20]}, indent=2)}
+
+**Numeric Statistics:**
+{json.dumps(numeric_stats, indent=2, default=str)}
+
+**Categorical Info:**
+{json.dumps(categorical_info, indent=2, default=str)}
+
+**Sample Data (first 20 rows):**
+{json.dumps(sample_rows[:10], indent=2, default=str)}
+
+**Instructions:**
+Analyze the data and identify:
+
+1. **Patterns** (pattern_type, column, description, confidence, details):
+   - Trends (increasing/decreasing over time)
+   - Seasonality or cycles
+   - Unique identifiers (ID columns)
+   - Categorical groupings
+   - Date/time patterns
+   - Hierarchical relationships
+
+2. **Anomalies** (anomaly_type, column, description, severity, affected_rows, examples):
+   - Outliers in numeric data
+   - Missing data patterns
+   - Inconsistent formats
+   - Duplicate entries
+   - Data quality issues
+
+3. **Distributions** (column -> distribution type):
+   - "normal", "uniform", "skewed_left", "skewed_right", "bimodal", "categorical", etc.
+
+4. **Correlations** (list of related columns):
+   - Strong correlations between numeric columns
+   - Relationships between categorical and numeric
+
+5. **Summary**: Brief overview of key findings
+
+**Response Format:**
+{{
+  "patterns": [
+    {{
+      "pattern_type": "unique_id" | "trend" | "categorical" | "temporal" | ...,
+      "column": "column_name",
+      "description": "Description of the pattern",
+      "confidence": 0.95,
+      "details": {{"key": "value"}}
+    }}
+  ],
+  "anomalies": [
+    {{
+      "anomaly_type": "outlier" | "missing_pattern" | "inconsistent_format" | ...,
+      "column": "column_name",
+      "description": "Description of the anomaly",
+      "severity": "low" | "medium" | "high",
+      "affected_rows": 10,
+      "examples": ["example1", "example2"]
+    }}
+  ],
+  "distributions": {{
+    "column_name": "normal",
+    "another_column": "skewed_right"
+  }},
+  "correlations": [
+    {{
+      "columns": ["col1", "col2"],
+      "type": "positive" | "negative",
+      "strength": "strong" | "moderate" | "weak",
+      "description": "Description"
+    }}
+  ],
+  "summary": "Brief summary of key insights about this dataset"
+}}
+"""
+
+    def _get_insights_system_prompt(self) -> str:
+        """System prompt for insights analysis"""
+        return """You are an expert data scientist specializing in exploratory data analysis.
+
+Your job is to:
+1. Identify meaningful patterns in the data
+2. Detect anomalies and data quality issues
+3. Determine statistical distributions
+4. Find correlations and relationships between variables
+5. Provide actionable insights
+
+Be thorough but concise. Focus on insights that would help users understand their data better.
+
+Always respond in valid JSON format."""
 # ============================================================================
 # Profile Generation (Enhanced with Type Inference)
 # ============================================================================
@@ -1256,61 +1473,55 @@ class SchemaValidator:
         question_set: QuestionSet,
         sample_rows: List[Dict[str, Any]]
     ) -> str:
-        """Build validation prompt"""
+        """Build validation prompt with robust serialization"""
+        
+        schema_json = {k: v.to_dict() for k, v in schema.items()} if schema else {}
+        
+        questions_json = []
+        if question_set and question_set.user_questions:
+            questions_json = [q.to_dict() for q in question_set.user_questions]
 
-        schema_json = {k: v.to_dict() for k, v in schema.items()}
-        profiles_json = {k: v.to_dict() for k, v in profiles.items()}
+        fields_json = []
+        if question_set and question_set.output_fields:
+            fields_json = [f.to_dict() for f in question_set.output_fields]
 
         return f"""Validate if the current schema can adequately answer the user's questions.
 
-**User Questions to Answer:**
-{json.dumps([q.to_dict() for q in question_set.user_questions], indent=2)}
+    **User Questions:**
+    {json.dumps(questions_json, indent=2)}
 
-**Expected Output Fields:**
-{json.dumps([f.to_dict() for f in question_set.output_fields], indent=2)}
+    **Expected Output Fields:**
+    {json.dumps(fields_json, indent=2)}
 
-**Additional Notes:**
-{question_set.additional_notes}
+    **Current Schema:**
+    {json.dumps(schema_json, indent=2, default=str)}
 
-**Current Schema:**
-```json
-{json.dumps(schema_json, indent=2, default=str)}
-```
+    **Sample Data:**
+    {json.dumps(sample_rows[:5] if sample_rows else [], indent=2, default=str)}
 
-**Column Profiles:**
-```json
-{json.dumps(profiles_json, indent=2, default=str)}
-```
+    **Instructions:**
+    1. If a user asks for a field (e.g., "Net Worth") that DOES NOT exist in the schema:
+    - Check if it can be calculated from existing columns (e.g., Salary, Tax).
+    - If yes, ask the user for the FORMULA or LOGIC.
+    - Set target as "Global.logic" or "ColumnName.calculation".
 
-**Sample Data Rows:**
-```json
-{json.dumps(sample_rows[:5], indent=2, default=str)}
-```
+    2. If a column exists but is ambiguous, ask for clarification.
 
-Analyze whether the current schema provides enough information to:
-1. Answer each user question accurately
-2. Generate the expected output fields
-3. Handle the data transformations required
-
-**Response Format:**
-{{
-  "is_sufficient": true | false,
-  "validation_report": "Detailed explanation of what can/cannot be answered",
-  "additional_questions": [
+    **Response Format:**
     {{
-      "id": "unique_id",
-      "question": "What specific information is needed?",
-      "suggested_answer": "Possible answer",
-      "target": "schema_field_path",
-      "question_type": "semantic"
+    "is_sufficient": false,
+    "validation_report": "Missing 'Net Worth' column.",
+    "additional_questions": [
+        {{
+        "id": "missing_net_worth",
+        "question": "The dataset has 'rawsalary' but no 'Net Worth'. How should Net Worth be calculated?",
+        "suggested_answer": "Net Worth = rawsalary - 10%",
+        "target": "Global.calculation",
+        "question_type": "semantic"
+        }}
+    ]
     }}
-  ],
-  "missing_fields": ["field1", "field2"],
-  "unclear_mappings": {{
-    "user_question_id": "explanation of why it's unclear"
-  }}
-}}
-"""
+    """
 
     def _get_validation_system_prompt(self) -> str:
         """System prompt for validation"""
@@ -1800,41 +2011,34 @@ Only SELECT queries are allowed.""",
             }
         }]
 
+# File: schema_pipeline.py -> Class: DataSchemaAgent
+
     def _build_context(self) -> str:
-        """Build context from session state"""
+        """Build context including Business Logic/Notes"""
         parts = []
 
-        # Data source info
+        # 1. Data Source Info
         if self.session.sources:
-            source = self.session.sources[0]
-            parts.append(f"**Data Source:** {source.file_path}")
-            if source.sheet_name:
-                parts.append(f"**Sheet:** {source.sheet_name}")
+            parts.append(f"**Data Source:** {self.session.sources[0].file_path}")
 
-        # Data shape
-        if self.df_cleaned is not None:
-            parts.append(f"**Data Shape:** {self.df_cleaned.shape[0]} rows × {self.df_cleaned.shape[1]} columns")
+        # 2. BUSINESS LOGIC & NOTES (Thêm phần này)
+        if self.session.question_set and self.session.question_set.additional_notes:
+            parts.append(f"**⚠️ BUSINESS RULES & CALCULATIONS:**\n{self.session.question_set.additional_notes}")
+            parts.append("(IMPORTANT: Use these rules when generating SQL queries)")
 
-        # Schema summary (first 10 columns)
+        # 3. Schema Summary
         if self.session.schema:
             schema_lines = []
-            for col, col_schema in list(self.session.schema.items())[:10]:
-                line = f"- **{col}**: {col_schema.semantic_type} ({col_schema.physical_type})"
-                if col_schema.unit:
-                    line += f", Unit: {col_schema.unit}"
+            for col, col_schema in list(self.session.schema.items())[:20]: # Show more columns
+                line = f"- {col}: {col_schema.semantic_type} ({col_schema.physical_type})"
+                if col_schema.description:
+                    line += f" | Desc: {col_schema.description}" # Show description
                 schema_lines.append(line)
-
-            if len(self.session.schema) > 10:
-                schema_lines.append(f"... and {len(self.session.schema) - 10} more columns")
-
+            
             parts.append("**Schema:**\n" + "\n".join(schema_lines))
 
-        # SQL capability status
-        if self.sql_tool:
-            parts.append(f"**SQL Database:** Ready for queries")
-
         return "\n\n".join(parts)
-
+    
     def enable_sql(self, df_cleaned: pd.DataFrame, sql_tool: Optional['SQLQueryTool'] = None):
         """
         Enable SQL capability
@@ -1872,56 +2076,63 @@ class RefinementEngine:
     def __init__(self, session: 'Session'):
         self.session = session
     
+
     def apply_answer(self, answer: Answer) -> bool:
-        """Apply user answer to schema"""
+        """Apply user answer to schema with fallback for general notes"""
         try:
-            question = next(q for q in self.session.questions if q.id == answer.question_id)
+            question = next((q for q in self.session.questions if q.id == answer.question_id), None)
+            if not question:
+                return False
             
             parts = question.target.split(".")
-            if len(parts) != 2:
-                logger.warning(f"Invalid target: {question.target}")
-                return False
+            target_col = parts[0]
             
-            col_name, field = parts
+            if target_col.lower() == "global" or target_col not in self.session.schema:
+                if self.session.question_set:
+                    timestamp = datetime.now().strftime("%H:%M")
+
+                    new_logic = f"\n- [Business Logic] {question.question} -> Rule: {answer.answer}"
+                    self.session.question_set.additional_notes += new_logic
+                    
+                    logger.info(f"✓ Added business logic: {answer.answer}")
+                    answer.applied = True
+                    return True
             
-            if col_name not in self.session.schema:
-                logger.warning(f"Column not found: {col_name}")
-                return False
-            
-            schema_col = self.session.schema[col_name]
-            
-            if field == "unit":
-                schema_col.unit = answer.answer
-            elif field == "description":
-                schema_col.description = answer.answer
-            elif field == "semantic_type":
-                schema_col.semantic_type = answer.answer
-            elif field == "physical_type":
-                schema_col.physical_type = answer.answer
-            elif field == "is_required":
-                schema_col.is_required = answer.answer.lower() in ('true', 'yes', '1')
-            else:
-                logger.warning(f"Unknown field: {field}")
-                return False
-            
-            answer.applied = True
-            
-            self.session.history.append(HistoryEntry(
-                timestamp=datetime.now().isoformat(),
-                action="question_answered",
-                details={
-                    "question_id": answer.question_id,
-                    "question": question.question,
-                    "answer": answer.answer,
-                    "target": question.target
-                },
-                schema_version=self.session.schema_version
-            ))
-            
-            self.session.schema_version += 1
-            
-            logger.info(f"✓ Applied answer to {question.target}: {answer.answer}")
-            return True
+            if target_col in self.session.schema:
+                schema_col = self.session.schema[target_col]
+                field = parts[1] if len(parts) > 1 else "description"
+                
+                if field == "unit":
+                    schema_col.unit = answer.answer
+                elif field in ["description", "calculation", "formula"]:
+                    # Nếu là calculation, cộng dồn vào description
+                    schema_col.description += f" | Calculation: {answer.answer}"
+                elif field == "semantic_type":
+                    schema_col.semantic_type = answer.answer
+                elif field == "physical_type":
+                    schema_col.physical_type = answer.answer
+                elif field == "is_required":
+                    schema_col.is_required = answer.answer.lower() in ('true', 'yes', '1')
+                else:
+                    # Fallback cho trường hợp field lạ cũng đưa vào description
+                    schema_col.description += f" ({field}: {answer.answer})"
+                
+                answer.applied = True
+                
+                # Update history... (giữ nguyên code cũ)
+                self.session.history.append(HistoryEntry(
+                    timestamp=datetime.now().isoformat(),
+                    action="question_answered",
+                    details={
+                        "question_id": answer.question_id,
+                        "answer": answer.answer,
+                        "target": question.target
+                    },
+                    schema_version=self.session.schema_version
+                ))
+                
+                self.session.schema_version += 1
+                return True
             
         except Exception as e:
             logger.error(f"Failed to apply answer: {str(e)}")
