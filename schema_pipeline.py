@@ -235,6 +235,32 @@ class QuestionSet(BaseModel):
         }
 
 
+class Scenario(BaseModel):
+    """User-defined use case scenario with selected fields, questions, and output format"""
+    id: str
+    name: str
+    description: str = ""
+
+    # Selected fields from data
+    selected_fields: List[str] = Field(default_factory=list)  # Column names
+
+    # Questions for this scenario
+    questions: List[UserQuestion] = Field(default_factory=list)
+
+    # Expected output format
+    output_format: Dict[str, Any] = Field(default_factory=dict)  # Format specification
+    output_fields: List[OutputField] = Field(default_factory=list)
+
+    # Optional: Example input/output pairs
+    examples: List[Dict[str, Any]] = Field(default_factory=list)
+
+    created_at: Optional[str] = None
+    active: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
 class Session(BaseModel):
     """Complete session state"""
     session_id: str
@@ -270,7 +296,13 @@ class Session(BaseModel):
     
     is_clean_structure: bool = False
     structure_issues: List[str] = Field(default_factory=list)
-    
+
+    # Pipeline state tracking (NEW)
+    pipeline_state: Dict[str, bool] = Field(default_factory=dict)
+
+    # Scenarios (NEW - user-defined use cases)
+    scenarios: List['Scenario'] = Field(default_factory=list)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "session_id": self.session_id,
