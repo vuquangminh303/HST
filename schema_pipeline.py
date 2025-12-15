@@ -43,6 +43,18 @@ class DataCleaningAction(str, Enum):
     STRIP_WHITESPACE = "strip_whitespace"
     NORMALIZE_CASE = "normalize_case"
     REPLACE_VALUES = "replace_values"
+    # Advanced numeric cleaning
+    REMOVE_CURRENCY_SYMBOL = "remove_currency_symbol"
+    CONVERT_PERCENT_TO_FLOAT = "convert_percent_to_float"
+    CONVERT_PARENTHESES_TO_NEGATIVE = "convert_parentheses_to_negative"
+    EXTRACT_NUMBER_FROM_STRING = "extract_number_from_string"
+    # Advanced datetime cleaning
+    CONVERT_EXCEL_SERIAL_DATE = "convert_excel_serial_date"
+    PARSE_TEXT_DATE = "parse_text_date"
+    # Boolean cleaning
+    MAP_TO_BOOLEAN = "map_to_boolean"
+    # Null handling
+    REPLACE_PLACEHOLDERS_WITH_NAN = "replace_placeholders_with_nan"
 
 
 class CleaningRule(BaseModel):
@@ -84,7 +96,8 @@ class ColumnProfile(BaseModel):
     sample_raw_values: List[str]  # Original string values
     has_thousand_separator: bool = False
     decimal_separator: Optional[str] = None
-    
+    data_issues: List[Dict[str, Any]] = Field(default_factory=list)  # Detected data quality issues
+
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()
 
@@ -407,8 +420,25 @@ class SQLQueryTool:
 # ============================================================================
 
 class TypeInferenceEngine:
-    """Smart type inference that handles formatted numbers"""
-    
+    """Smart type inference that handles formatted numbers and various data issues"""
+
+    # Common null placeholders
+    NULL_PLACEHOLDERS = {'N/A', 'n/a', 'NA', 'null', 'NULL', 'None', 'NONE', '-', '?', 'Unknown', 'unknown', '', ' '}
+
+    # Currency symbols
+    CURRENCY_SYMBOLS = {'$', '€', '£', '¥', 'USD', 'EUR', 'GBP', 'JPY', 'VND', 'VNĐ', '₫'}
+
+    # Boolean mappings
+    BOOLEAN_MAPPINGS = {
+        'yes': True, 'no': False,
+        'y': True, 'n': False,
+        'true': True, 'false': False,
+        'có': True, 'không': False,
+        'enabled': True, 'disabled': False,
+        '1': True, '0': False,
+        'on': True, 'off': False
+    }
+
     @staticmethod
     def detect_thousand_separator(series: pd.Series) -> Optional[str]:
         """Detect thousand separator (. or ,)"""
@@ -513,13 +543,121 @@ class TypeInferenceEngine:
                 pass
         
         return 'string', {}
-    
+
+    @staticmethod
+    def detect_data_issues(series: pd.Series) -> List[Dict[str, Any]]:
+        """
+        Detect various data quality issues in a series.
+        Returns list of issues with type and details.
+        """
+        issues = []
+        sample = series.dropna().astype(str).head(100)
+
+        if len(sample) == 0:
+            return issues
+
+        # 1. Currency symbols
+        currency_pattern = r'[$€£¥₫]|USD|EUR|GBP|JPY|VND|VNĐ'
+        has_currency = sample.str.contains(currency_pattern, regex=True, na=False).any()
+        if has_currency:
+            issues.append({
+                'type': 'currency',
+                'action': DataCleaningAction.REMOVE_CURRENCY_SYMBOL,
+                'description': 'Contains currency symbols',
+                'examples': sample[sample.str.contains(currency_pattern, regex=True, na=False)].head(3).tolist()
+            })
+
+        # 2. Percentages
+        percent_pattern = r'^\s*-?\d+(?:[.,]\d+)?\s*%\s*$'
+        has_percent = sample.str.match(percent_pattern, na=False).any()
+        if has_percent:
+            issues.append({
+                'type': 'percentage',
+                'action': DataCleaningAction.CONVERT_PERCENT_TO_FLOAT,
+                'description': 'Contains percentage values',
+                'examples': sample[sample.str.match(percent_pattern, na=False)].head(3).tolist()
+            })
+
+        # 3. Accounting negatives (parentheses)
+        paren_pattern = r'^\(\s*\d+(?:[.,]\d+)?\s*\)$'
+        has_parentheses = sample.str.match(paren_pattern, na=False).any()
+        if has_parentheses:
+            issues.append({
+                'type': 'accounting_negative',
+                'action': DataCleaningAction.CONVERT_PARENTHESES_TO_NEGATIVE,
+                'description': 'Contains accounting-style negative numbers (parentheses)',
+                'examples': sample[sample.str.match(paren_pattern, na=False)].head(3).tolist()
+            })
+
+        # 4. Units (numbers with text suffix)
+        unit_pattern = r'^\s*\d+(?:[.,]\d+)?\s+[a-zA-Z]+\d*\s*$'
+        has_units = sample.str.match(unit_pattern, na=False).any()
+        if has_units:
+            issues.append({
+                'type': 'units_suffix',
+                'action': DataCleaningAction.EXTRACT_NUMBER_FROM_STRING,
+                'description': 'Contains numbers with unit suffixes (kg, cm, m2, etc.)',
+                'examples': sample[sample.str.match(unit_pattern, na=False)].head(3).tolist()
+            })
+
+        # 5. Excel serial dates
+        try:
+            numeric_values = pd.to_numeric(sample, errors='coerce')
+            if numeric_values.notna().sum() > 0:
+                # Excel serial dates typically range from 1 to 50000+
+                in_date_range = (numeric_values >= 1) & (numeric_values <= 100000)
+                if in_date_range.sum() / len(numeric_values) > 0.5:
+                    issues.append({
+                        'type': 'excel_serial_date',
+                        'action': DataCleaningAction.CONVERT_EXCEL_SERIAL_DATE,
+                        'description': 'Looks like Excel serial date numbers',
+                        'examples': sample.head(3).tolist()
+                    })
+        except:
+            pass
+
+        # 6. Boolean-like values
+        unique_lower = set(sample.str.lower().str.strip())
+        boolean_keys = set(TypeInferenceEngine.BOOLEAN_MAPPINGS.keys())
+        if unique_lower.issubset(boolean_keys | {'nan', 'none'}):
+            issues.append({
+                'type': 'boolean_text',
+                'action': DataCleaningAction.MAP_TO_BOOLEAN,
+                'description': 'Contains boolean-like text values',
+                'examples': list(unique_lower)[:5]
+            })
+
+        # 7. Null placeholders
+        null_placeholders_found = unique_lower & TypeInferenceEngine.NULL_PLACEHOLDERS
+        if null_placeholders_found:
+            issues.append({
+                'type': 'null_placeholders',
+                'action': DataCleaningAction.REPLACE_PLACEHOLDERS_WITH_NAN,
+                'description': 'Contains text representing null values',
+                'examples': list(null_placeholders_found)
+            })
+
+        return issues
+
     @staticmethod
     def generate_cleaning_rules(df: pd.DataFrame, profiles: Dict[str, ColumnProfile]) -> List[CleaningRule]:
-        """Generate cleaning rules based on inferred types"""
+        """Generate cleaning rules based on inferred types and detected issues"""
         rules = []
-        
+
         for col_name, profile in profiles.items():
+            # First, generate rules from detected data issues
+            for issue in profile.data_issues:
+                rule_id = f"clean_{col_name}_{issue['type']}"
+                rules.append(CleaningRule(
+                    id=rule_id,
+                    column=col_name,
+                    action=issue['action'],
+                    description=f"{col_name}: {issue['description']} (e.g., {issue['examples'][:2]})",
+                    params=issue.get('params', {}),
+                    applied=False
+                ))
+
+            # Then, existing logic for type conversions
             # Skip if inferred type matches pandas type
             if profile.inferred_type == 'int' and df[col_name].dtype in ['int64', 'int32']:
                 continue
@@ -629,11 +767,69 @@ class TypeInferenceEngine:
                 elif case_type == 'upper':
                     df_result[col] = df_result[col].astype(str).str.upper()
                 logger.info(f"✓ Normalized case for '{col}'")
-            
+
+            # Advanced numeric cleaning
+            elif rule.action == DataCleaningAction.REMOVE_CURRENCY_SYMBOL:
+                # Remove currency symbols and convert to numeric
+                currency_pattern = r'[$€£¥₫]|USD|EUR|GBP|JPY|VND|VNĐ'
+                series = df_result[col].astype(str).str.replace(currency_pattern, '', regex=True)
+                series = series.str.replace(',', '').str.strip()
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Removed currency symbols from '{col}'")
+
+            elif rule.action == DataCleaningAction.CONVERT_PERCENT_TO_FLOAT:
+                # Remove % and convert to float (optionally divide by 100)
+                series = df_result[col].astype(str).str.replace('%', '').str.strip()
+                df_result[col] = pd.to_numeric(series, errors='coerce') / 100
+                logger.info(f"✓ Converted percentages to floats in '{col}'")
+
+            elif rule.action == DataCleaningAction.CONVERT_PARENTHESES_TO_NEGATIVE:
+                # Convert (500) to -500
+                def convert_paren(x):
+                    s = str(x).strip()
+                    if s.startswith('(') and s.endswith(')'):
+                        return '-' + s[1:-1]
+                    return s
+                series = df_result[col].apply(convert_paren)
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Converted parentheses to negatives in '{col}'")
+
+            elif rule.action == DataCleaningAction.EXTRACT_NUMBER_FROM_STRING:
+                # Extract numeric part from strings like "50 kg", "175 cm"
+                series = df_result[col].astype(str).str.extract(r'([-+]?\d+(?:[.,]\d+)?)', expand=False)
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Extracted numbers from strings in '{col}'")
+
+            # Advanced datetime cleaning
+            elif rule.action == DataCleaningAction.CONVERT_EXCEL_SERIAL_DATE:
+                # Convert Excel serial dates to datetime
+                numeric = pd.to_numeric(df_result[col], errors='coerce')
+                df_result[col] = pd.to_datetime(numeric, unit='D', origin='1899-12-30', errors='coerce')
+                logger.info(f"✓ Converted Excel serial dates in '{col}'")
+
+            elif rule.action == DataCleaningAction.PARSE_TEXT_DATE:
+                # Parse textual dates with flexible format
+                df_result[col] = pd.to_datetime(df_result[col], errors='coerce', infer_datetime_format=True)
+                logger.info(f"✓ Parsed text dates in '{col}'")
+
+            # Boolean mapping
+            elif rule.action == DataCleaningAction.MAP_TO_BOOLEAN:
+                # Map various text values to boolean
+                df_result[col] = df_result[col].astype(str).str.lower().str.strip().map(
+                    TypeInferenceEngine.BOOLEAN_MAPPINGS
+                )
+                logger.info(f"✓ Mapped to boolean in '{col}'")
+
+            # Null handling
+            elif rule.action == DataCleaningAction.REPLACE_PLACEHOLDERS_WITH_NAN:
+                # Replace null placeholders with actual NaN
+                df_result[col] = df_result[col].replace(list(TypeInferenceEngine.NULL_PLACEHOLDERS), pd.NA)
+                logger.info(f"✓ Replaced null placeholders in '{col}'")
+
         except Exception as e:
             logger.error(f"✗ Failed to apply cleaning rule {rule.id}: {str(e)}")
             raise
-        
+
         return df_result
 
 
@@ -1140,7 +1336,10 @@ class ProfileGenerator:
             
             # Type inference
             inferred_type, metadata = TypeInferenceEngine.infer_type(series)
-            
+
+            # Detect data issues
+            data_issues = TypeInferenceEngine.detect_data_issues(series)
+
             profile = ColumnProfile(
                 name=str(col),
                 pandas_dtype=str(series.dtype),
@@ -1152,7 +1351,8 @@ class ProfileGenerator:
                 sample_values=samples,
                 sample_raw_values=raw_samples,
                 has_thousand_separator=metadata.get('thousand_separator') is not None,
-                decimal_separator=metadata.get('decimal_separator')
+                decimal_separator=metadata.get('decimal_separator'),
+                data_issues=data_issues
             )
             profiles[str(col)] = profile
         
@@ -1306,13 +1506,28 @@ Always respond in valid JSON format."""
             )
             
             result = json.loads(response.choices[0].message.content)
-            
+
+            # Create case-insensitive mapping for column names
+            profile_mapping = {col.lower(): col for col in profiles.keys()}
+
             schema = {}
             for col, spec in result["schema"].items():
-                # Add original_type from profile
-                original_type = profiles[col].pandas_dtype
-                spec['original_type'] = original_type
-                schema[col] = ColumnSchema(**spec)
+                # Try to find matching column in profiles (case-insensitive)
+                col_lower = col.lower()
+                original_col = profile_mapping.get(col_lower, col)
+
+                # Add original_type from profile if found
+                if original_col in profiles:
+                    original_type = profiles[original_col].pandas_dtype
+                    spec['original_type'] = original_type
+                else:
+                    # Fallback: try to find best match or use 'object' as default
+                    logger.warning(f"Column '{col}' not found in profiles, using default 'object' type")
+                    spec['original_type'] = 'object'
+
+                # Use original column name from data
+                spec['name'] = original_col if original_col in profiles else col
+                schema[original_col if original_col in profiles else col] = ColumnSchema(**spec)
             
             questions = [Question(**q) for q in result.get("questions", [])]
             

@@ -598,15 +598,39 @@ def tab_type_cleaning():
         # Show inferred types table
         type_data = []
         for col_name, profile in results['profiles'].items():
+            # Format data issues
+            if profile.data_issues:
+                issues_str = ", ".join([issue['type'] for issue in profile.data_issues])
+                issues_display = f"⚠️ {issues_str}"
+            elif profile.has_thousand_separator:
+                issues_display = "⚠️ thousand_separator"
+            else:
+                issues_display = "✅ Clean"
+
             type_data.append({
                 "Column": col_name,
                 "Current Type": profile.pandas_dtype,
                 "Inferred Type": profile.inferred_type,
-                "Has Separator": "✅" if profile.has_thousand_separator else "❌",
+                "Data Issues": issues_display,
                 "Example Value": profile.sample_raw_values[0] if profile.sample_raw_values else ""
             })
-        
+
         safe_display_dataframe(pd.DataFrame(type_data), use_container_width=True)
+
+        # Show detailed issues breakdown
+        if any(profile.data_issues for profile in results['profiles'].values()):
+            st.divider()
+            st.subheader("🔍 Detailed Data Quality Issues")
+
+            for col_name, profile in results['profiles'].items():
+                if profile.data_issues:
+                    with st.expander(f"**{col_name}** - {len(profile.data_issues)} issue(s) detected", expanded=False):
+                        for issue in profile.data_issues:
+                            st.markdown(f"**Issue Type:** `{issue['type']}`")
+                            st.markdown(f"**Description:** {issue['description']}")
+                            st.markdown(f"**Examples:** {issue['examples'][:3]}")
+                            st.markdown(f"**Suggested Action:** `{issue['action']}`")
+                            st.divider()
         
         # Cleaning rules
         if results['cleaning_rules']:
@@ -2003,7 +2027,8 @@ Show sales trend over time""",
                         else:
                             output_format = {}
                     else:
-                        output_format = {"description": output_format_text} if output_format_text.strip() else {}
+                        # Always save description, even if empty - this preserves the free text mode
+                        output_format = {"description": output_format_text}
 
                     # Parse examples
                     try:
