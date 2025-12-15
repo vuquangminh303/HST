@@ -424,14 +424,14 @@ class TypeInferenceEngine:
     def generate_cleaning_rules(df: pd.DataFrame, profiles: Dict[str, ColumnProfile]) -> List[CleaningRule]:
         """Generate cleaning rules based on inferred types"""
         rules = []
-        
+
         for col_name, profile in profiles.items():
             # Skip if inferred type matches pandas type
             if profile.inferred_type == 'int' and df[col_name].dtype in ['int64', 'int32']:
                 continue
             if profile.inferred_type == 'float' and df[col_name].dtype in ['float64', 'float32']:
                 continue
-            
+
             # Generate cleaning rule for number with thousand separator
             if profile.has_thousand_separator:
                 if profile.decimal_separator:
@@ -457,7 +457,7 @@ class TypeInferenceEngine:
                             'thousand_separator': '.'
                         }
                     ))
-            
+
             # Generate rule for plain numeric conversion
             elif profile.inferred_type == 'int' and df[col_name].dtype == 'object':
                 rules.append(CleaningRule(
@@ -467,7 +467,7 @@ class TypeInferenceEngine:
                     description=f"Convert '{col_name}' to integer",
                     params={}
                 ))
-            
+
             elif profile.inferred_type == 'float' and df[col_name].dtype == 'object':
                 rules.append(CleaningRule(
                     id=f"clean_{col_name}_to_float",
@@ -476,7 +476,7 @@ class TypeInferenceEngine:
                     description=f"Convert '{col_name}' to float",
                     params={}
                 ))
-            
+
             elif profile.inferred_type == 'datetime' and df[col_name].dtype == 'object':
                 rules.append(CleaningRule(
                     id=f"clean_{col_name}_to_datetime",
@@ -485,8 +485,84 @@ class TypeInferenceEngine:
                     description=f"Convert '{col_name}' to datetime",
                     params={}
                 ))
-        
+
         return rules
+
+    @staticmethod
+    def generate_custom_cleaning_rule(df: pd.DataFrame, user_request: str) -> Optional[CleaningRule]:
+        """Generate a custom cleaning rule based on user's natural language request"""
+        from openai import OpenAI
+        import os
+
+        # Get column information
+        columns_info = {
+            col: {
+                'dtype': str(df[col].dtype),
+                'sample': df[col].dropna().head(3).tolist()
+            }
+            for col in df.columns
+        }
+
+        prompt = f"""Based on this user request for data cleaning:
+
+"{user_request}"
+
+And given these DataFrame columns:
+{json.dumps(columns_info, indent=2, default=str)}
+
+Generate a cleaning rule that fulfills the user's request.
+
+Available cleaning actions:
+- REMOVE_THOUSAND_SEPARATOR: Remove thousand separators from numbers
+- CONVERT_TO_INT: Convert to integer type
+- CONVERT_TO_FLOAT: Convert to float type
+- CONVERT_TO_DATETIME: Convert to datetime type
+- STRIP_WHITESPACE: Remove leading/trailing whitespace
+- NORMALIZE_CASE: Convert to lowercase/uppercase
+- REPLACE_VALUES: Replace specific values
+
+**Response Format (JSON):**
+{{
+  "id": "custom_clean_<unique_id>",
+  "column": "column_name",
+  "action": "CONVERT_TO_INT" | "CONVERT_TO_FLOAT" | "STRIP_WHITESPACE" | etc,
+  "description": "Clear description of what this cleaning does",
+  "params": {{relevant parameters like "case": "lower", "thousand_separator": "."}}
+}}
+
+Only return the JSON object, nothing else.
+"""
+
+        try:
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                logger.error("OpenAI API key not found")
+                return None
+
+            client = OpenAI(api_key=api_key)
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a data cleaning expert. Generate precise cleaning rule specifications from natural language requests."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+
+            # Create CleaningRule object
+            rule = CleaningRule(**result)
+            rule.is_custom = True  # Mark as custom
+
+            logger.info(f"✓ Generated custom cleaning rule: {rule.description}")
+            return rule
+
+        except Exception as e:
+            logger.error(f"✗ Failed to generate custom cleaning rule: {str(e)}")
+            return None
     
     @staticmethod
     def apply_cleaning_rule(df: pd.DataFrame, rule: CleaningRule) -> pd.DataFrame:
@@ -805,39 +881,103 @@ Be conservative: if the data looks clean, don't propose unnecessary transformati
 
 Always respond in valid JSON format with "transformations" and "questions" arrays."""
     
+    def generate_custom_transformation(
+        self,
+        df: pd.DataFrame,
+        user_request: str
+    ) -> Optional[Transformation]:
+        """Generate a custom transformation based on user's natural language request"""
+
+        # Get DataFrame structure info
+        structure_info = self._extract_structure_info(df, max_rows=5)
+
+        prompt = f"""Based on this user request for data transformation:
+
+"{user_request}"
+
+And given this DataFrame structure:
+- Columns: {structure_info['column_names']}
+- Shape: {structure_info['shape']['rows']} rows × {structure_info['shape']['columns']} columns
+- Sample data (first 3 rows):
+{json.dumps(structure_info['preview_data'][:3], indent=2, default=str)}
+
+Generate a transformation that fulfills the user's request.
+
+**Response Format (JSON):**
+{{
+  "id": "custom_<unique_id>",
+  "type": "use_row_as_header" | "skip_rows" | "drop_columns" | "rename_columns" | "drop_rows" | "custom",
+  "description": "Clear description of what this transformation does",
+  "params": {{relevant parameters}},
+  "confidence": 0.0-1.0
+}}
+
+Example transformations:
+- "Remove first 2 rows": {{"type": "skip_rows", "params": {{"rows_to_skip": 2}}}}
+- "Use row 3 as header": {{"type": "use_row_as_header", "params": {{"row_index": 2}}}}
+- "Rename column X to Y": {{"type": "rename_columns", "params": {{"mapping": {{"X": "Y"}}}}}}
+- "Drop empty columns": {{"type": "drop_columns", "params": {{"columns": ["col1", "col2"]}}}}
+
+Only return the JSON object, nothing else.
+"""
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a data transformation expert. Generate precise transformation specifications from natural language requests."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+
+            # Create Transformation object
+            trans = Transformation(**result)
+            trans.is_custom = True  # Mark as custom
+
+            logger.info(f"✓ Generated custom transformation: {trans.description}")
+            return trans
+
+        except Exception as e:
+            logger.error(f"✗ Failed to generate custom transformation: {str(e)}")
+            return None
+
     @staticmethod
     def apply_transformation(df: pd.DataFrame, trans: Transformation) -> pd.DataFrame:
         """Apply a single transformation to DataFrame"""
         df_result = df.copy()
-        
+
         try:
             if trans.type == TransformationType.USE_ROW_AS_HEADER:
                 row_idx = trans.params["row_index"]
                 df_result.columns = df_result.iloc[row_idx].astype(str).tolist()
                 df_result = df_result.iloc[row_idx + 1:].reset_index(drop=True)
-                
+
             elif trans.type == TransformationType.SKIP_ROWS:
                 rows_to_skip = trans.params["rows_to_skip"]
                 df_result = df_result.iloc[rows_to_skip:].reset_index(drop=True)
-                
+
             elif trans.type == TransformationType.DROP_COLUMNS:
                 cols = trans.params["columns"]
                 df_result = df_result.drop(columns=cols, errors='ignore')
-                
+
             elif trans.type == TransformationType.DROP_ROWS:
                 indices = trans.params["indices"]
                 df_result = df_result.drop(index=indices, errors='ignore').reset_index(drop=True)
-                
+
             elif trans.type == TransformationType.RENAME_COLUMNS:
                 mapping = trans.params["mapping"]
                 df_result = df_result.rename(columns=mapping)
-            
+
             logger.info(f"✓ Applied: {trans.description}")
-            
+
         except Exception as e:
             logger.error(f"✗ Failed to apply {trans.id}: {str(e)}")
             raise
-        
+
         return df_result
 
 

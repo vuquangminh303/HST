@@ -222,13 +222,13 @@ def tab_ingestion():
 def tab_structure_analysis():
     """Structure analysis and transformation tab"""
     st.header("🔍 Structure Analysis & Transformation")
-    
+
     if not st.session_state.session:
         st.warning("⚠️ Please ingest data first (go to 'Ingestion' tab)")
         return
-    
+
     session = st.session_state.session
-    
+
     # Select source
     st.subheader("Select Data Source")
     selected_source_id = st.selectbox(
@@ -236,39 +236,85 @@ def tab_structure_analysis():
         options=[s.source_id for s in session.sources],
         key="structure_source_select"
     )
-    
+
     source = next(s for s in session.sources if s.source_id == selected_source_id)
-    
-    if st.button("🔍 Analyze Structure", type="primary"):
-        with st.spinner("Analyzing structure..."):
-            analyzer = StructureAnalyzer(
-                api_key=st.session_state.api_key,
-                model=st.session_state.model
-            )
-            
-            df_raw = st.session_state.raw_dfs[selected_source_id]
-            
-            structure_info, transformations, questions, is_clean = analyzer.analyze_structure(df_raw)
-            
-            # Store results
-            if 'structure_results' not in st.session_state:
-                st.session_state.structure_results = {}
-            
-            st.session_state.structure_results[selected_source_id] = {
-                'structure_info': structure_info,
-                'transformations': transformations,
-                'questions': questions,
-                'is_clean': is_clean
-            }
-            
-            session.raw_structure_info[selected_source_id] = structure_info
-            session.is_clean_structure = is_clean
-            
-            if not is_clean:
-                _, issues = analyzer._heuristic_structure_check(df_raw)
-                session.structure_issues = issues
-            
-            st.rerun()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("🔍 Analyze Structure", type="primary"):
+            with st.spinner("Analyzing structure..."):
+                analyzer = StructureAnalyzer(
+                    api_key=st.session_state.api_key,
+                    model=st.session_state.model
+                )
+
+                df_raw = st.session_state.raw_dfs[selected_source_id]
+
+                structure_info, transformations, questions, is_clean = analyzer.analyze_structure(df_raw)
+
+                # Store results
+                if 'structure_results' not in st.session_state:
+                    st.session_state.structure_results = {}
+
+                st.session_state.structure_results[selected_source_id] = {
+                    'structure_info': structure_info,
+                    'transformations': transformations,
+                    'questions': questions,
+                    'is_clean': is_clean
+                }
+
+                session.raw_structure_info[selected_source_id] = structure_info
+                session.is_clean_structure = is_clean
+
+                if not is_clean:
+                    _, issues = analyzer._heuristic_structure_check(df_raw)
+                    session.structure_issues = issues
+
+                st.rerun()
+
+    # Custom transformation input
+    st.divider()
+    st.subheader("✍️ Custom Transformation Request")
+
+    with st.expander("Request Custom Transformation", expanded=False):
+        st.write("Describe the transformation you want to apply to your data:")
+
+        custom_request = st.text_area(
+            "Your request:",
+            placeholder="Example: Remove the first 2 rows and use row 3 as header\nExample: Rename column 'Price' to 'Price_VND'\nExample: Drop all columns that are completely empty",
+            height=100,
+            key="custom_structure_request"
+        )
+
+        if st.button("🤖 Generate Custom Transformation", key="gen_custom_trans"):
+            if custom_request:
+                with st.spinner("Generating custom transformation..."):
+                    analyzer = StructureAnalyzer(
+                        api_key=st.session_state.api_key,
+                        model=st.session_state.model
+                    )
+
+                    df_raw = st.session_state.raw_dfs[selected_source_id]
+
+                    # Generate custom transformation
+                    custom_trans = analyzer.generate_custom_transformation(df_raw, custom_request)
+
+                    if custom_trans:
+                        # Store in session
+                        if 'custom_transformations' not in st.session_state:
+                            st.session_state.custom_transformations = {}
+
+                        if selected_source_id not in st.session_state.custom_transformations:
+                            st.session_state.custom_transformations[selected_source_id] = []
+
+                        st.session_state.custom_transformations[selected_source_id].append(custom_trans)
+                        st.success("✅ Custom transformation generated!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Could not generate transformation from your request")
+            else:
+                st.warning("Please enter a transformation request")
     
     # Display results
     if hasattr(st.session_state, 'structure_results') and selected_source_id in st.session_state.structure_results:
@@ -297,36 +343,47 @@ def tab_structure_analysis():
             st.divider()
         
         # Transformations
-        if results['transformations']:
+        all_transformations = results['transformations'].copy()
+
+        # Add custom transformations if any
+        if hasattr(st.session_state, 'custom_transformations') and selected_source_id in st.session_state.custom_transformations:
+            all_transformations.extend(st.session_state.custom_transformations[selected_source_id])
+
+        if all_transformations:
             st.subheader("🔧 Proposed Transformations")
-            
-            for i, trans in enumerate(results['transformations']):
-                with st.expander(f"**{trans.description}**", expanded=True):
+
+            for i, trans in enumerate(all_transformations):
+                is_custom = hasattr(trans, 'is_custom') and trans.is_custom
+                label_prefix = "🖊️ Custom: " if is_custom else ""
+
+                with st.expander(f"**{label_prefix}{trans.description}**", expanded=True):
                     col1, col2, col3 = st.columns([2, 1, 1])
-                    
+
                     with col1:
                         st.write(f"**Type:** `{trans.type}`")
                         st.write(f"**Parameters:** `{json.dumps(trans.params, indent=2)}`")
-                    
+                        if is_custom:
+                            st.info("🖊️ This is a custom transformation")
+
                     with col2:
                         st.metric("Confidence", f"{trans.confidence:.0%}")
-                    
+
                     with col3:
                         if st.button(f"✅ Apply", key=f"apply_{trans.id}"):
                             df_raw = st.session_state.raw_dfs[selected_source_id]
                             df_transformed = StructureAnalyzer.apply_transformation(df_raw, trans)
-                            
+
                             # Save checkpoint
                             st.session_state.session_manager.save_checkpoint(
                                 session, df_transformed, f"transform_{trans.id}",
                                 f"After: {trans.description}"
                             )
-                            
+
                             # Update current df
                             st.session_state.clean_dfs[selected_source_id] = df_transformed
                             trans.applied = True
                             session.applied_transformations.append(trans.id)
-                            
+
                             st.success(f"✅ Applied: {trans.description}")
                             st.rerun()
         
@@ -381,27 +438,66 @@ def tab_type_cleaning():
         st.error("No data available for this source")
         return
     
-    if st.button("🔍 Analyze Types", type="primary"):
-        with st.spinner("Analyzing types and generating cleaning rules..."):
-            # Generate profiles with type inference
-            profiles = ProfileGenerator.generate_profiles(df)
-            
-            # Generate cleaning rules
-            cleaning_rules = TypeInferenceEngine.generate_cleaning_rules(df, profiles)
-            
-            # Store results
-            if 'cleaning_results' not in st.session_state:
-                st.session_state.cleaning_results = {}
-            
-            st.session_state.cleaning_results[selected_source_id] = {
-                'profiles': profiles,
-                'cleaning_rules': cleaning_rules
-            }
-            
-            session.cleaning_rules.extend(cleaning_rules)
-            
-            st.success(f"✅ Found {len(cleaning_rules)} cleaning rule(s)")
-            st.rerun()
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("🔍 Analyze Types", type="primary"):
+            with st.spinner("Analyzing types and generating cleaning rules..."):
+                # Generate profiles with type inference
+                profiles = ProfileGenerator.generate_profiles(df)
+
+                # Generate cleaning rules
+                cleaning_rules = TypeInferenceEngine.generate_cleaning_rules(df, profiles)
+
+                # Store results
+                if 'cleaning_results' not in st.session_state:
+                    st.session_state.cleaning_results = {}
+
+                st.session_state.cleaning_results[selected_source_id] = {
+                    'profiles': profiles,
+                    'cleaning_rules': cleaning_rules
+                }
+
+                session.cleaning_rules.extend(cleaning_rules)
+
+                st.success(f"✅ Found {len(cleaning_rules)} cleaning rule(s)")
+                st.rerun()
+
+    # Custom cleaning input
+    st.divider()
+    st.subheader("✍️ Custom Cleaning Request")
+
+    with st.expander("Request Custom Cleaning", expanded=False):
+        st.write("Describe the cleaning operation you want to apply:")
+
+        custom_clean_request = st.text_area(
+            "Your request:",
+            placeholder="Example: Convert all text columns to lowercase\nExample: Remove special characters from column 'Name'\nExample: Convert column 'Date' to datetime format\nExample: Fill missing values in column 'Price' with 0",
+            height=100,
+            key="custom_cleaning_request"
+        )
+
+        if st.button("🤖 Generate Custom Cleaning Rule", key="gen_custom_clean"):
+            if custom_clean_request:
+                with st.spinner("Generating custom cleaning rule..."):
+                    # Generate custom cleaning rule
+                    custom_rule = TypeInferenceEngine.generate_custom_cleaning_rule(df, custom_clean_request)
+
+                    if custom_rule:
+                        # Store in session
+                        if 'custom_cleaning_rules' not in st.session_state:
+                            st.session_state.custom_cleaning_rules = {}
+
+                        if selected_source_id not in st.session_state.custom_cleaning_rules:
+                            st.session_state.custom_cleaning_rules[selected_source_id] = []
+
+                        st.session_state.custom_cleaning_rules[selected_source_id].append(custom_rule)
+                        st.success("✅ Custom cleaning rule generated!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Could not generate cleaning rule from your request")
+            else:
+                st.warning("Please enter a cleaning request")
     
     # Display results
     if hasattr(st.session_state, 'cleaning_results') and selected_source_id in st.session_state.cleaning_results:
@@ -424,46 +520,59 @@ def tab_type_cleaning():
         st.dataframe(pd.DataFrame(type_data), use_container_width=True)
         
         # Cleaning rules
-        if results['cleaning_rules']:
+        all_cleaning_rules = results['cleaning_rules'].copy()
+
+        # Add custom cleaning rules if any
+        if hasattr(st.session_state, 'custom_cleaning_rules') and selected_source_id in st.session_state.custom_cleaning_rules:
+            all_cleaning_rules.extend(st.session_state.custom_cleaning_rules[selected_source_id])
+
+        if all_cleaning_rules:
             st.divider()
             st.subheader("🧹 Data Cleaning Rules")
-            
-            st.info(f"💡 Found {len(results['cleaning_rules'])} columns that need type conversion")
-            
-            for rule in results['cleaning_rules']:
-                with st.expander(f"**{rule.description}**", expanded=True):
+
+            st.info(f"💡 Found {len(all_cleaning_rules)} cleaning rule(s)")
+
+            for rule in all_cleaning_rules:
+                is_custom = hasattr(rule, 'is_custom') and rule.is_custom
+                label_prefix = "🖊️ Custom: " if is_custom else ""
+
+                with st.expander(f"**{label_prefix}{rule.description}**", expanded=True):
                     st.markdown(f"""
                     <div class="cleaning-card">
                         <strong>Column:</strong> {rule.column}<br>
                         <strong>Action:</strong> {rule.action}<br>
+                        {"<strong>Custom Rule</strong><br>" if is_custom else ""}
                         <strong>Target Type:</strong> {rule.column} will be converted to proper numeric type
                     </div>
                     """, unsafe_allow_html=True)
-                    
+
                     # Show before/after preview
                     col1, col2 = st.columns([2, 1])
-                    
+
                     with col1:
                         st.write("**Before Cleaning (sample values):**")
-                        before_sample = df[rule.column].dropna().head(5).tolist()
-                        st.code("\n".join(str(v) for v in before_sample))
-                    
+                        if rule.column in df.columns:
+                            before_sample = df[rule.column].dropna().head(5).tolist()
+                            st.code("\n".join(str(v) for v in before_sample))
+                        else:
+                            st.warning(f"Column '{rule.column}' not found")
+
                     with col2:
                         if st.button(f"✅ Apply Cleaning", key=f"apply_clean_{rule.id}"):
                             df_current = st.session_state.clean_dfs.get(
                                 selected_source_id, df
                             )
-                            
+
                             df_cleaned = TypeInferenceEngine.apply_cleaning_rule(df_current, rule)
-                            
+
                             st.session_state.session_manager.save_checkpoint(
                                 session, df_cleaned, f"clean_{rule.id}", rule.description
                             )
-                            
+
                             st.session_state.cleaned_dfs[selected_source_id] = df_cleaned
                             session.applied_cleaning_rules.append(rule.id)
                             rule.applied = True
-                            
+
                             st.success("✅ Cleaning applied!")
                             st.rerun()
         else:
@@ -641,7 +750,269 @@ def tab_schema_generation():
 
 
 # ============================================================================
-# Tab 5: Agent Q&A
+# Tab 5: Scenarios
+# ============================================================================
+
+def tab_scenarios():
+    """Scenario definition and management tab"""
+    st.header("🎯 Scenario Definition & Management")
+
+    if not st.session_state.session:
+        st.warning("⚠️ Please ingest data first")
+        return
+
+    session = st.session_state.session
+
+    # Initialize scenarios in session state
+    if 'scenarios' not in st.session_state:
+        st.session_state.scenarios = []
+
+    # Select source
+    selected_source_id = st.selectbox(
+        "Select Source",
+        options=[s.source_id for s in session.sources],
+        key="scenario_source_select"
+    )
+
+    # Get current df
+    df = st.session_state.cleaned_dfs.get(
+        selected_source_id,
+        st.session_state.clean_dfs.get(
+            selected_source_id,
+            st.session_state.raw_dfs.get(selected_source_id)
+        )
+    )
+
+    if df is None:
+        st.error("No data available for this source")
+        return
+
+    st.divider()
+
+    # Create new scenario
+    st.subheader("➕ Create New Scenario")
+
+    with st.expander("Define a New Scenario", expanded=True):
+        scenario_name = st.text_input(
+            "Scenario Name",
+            placeholder="e.g., Customer Analysis, Sales Report, Data Quality Check",
+            key="new_scenario_name"
+        )
+
+        scenario_description = st.text_area(
+            "Description",
+            placeholder="Describe what this scenario is for...",
+            height=80,
+            key="new_scenario_description"
+        )
+
+        st.write("**Select Fields (Columns):**")
+        available_columns = df.columns.tolist()
+        selected_fields = st.multiselect(
+            "Choose columns to include in this scenario",
+            options=available_columns,
+            key="scenario_fields"
+        )
+
+        st.write("**Define Questions:**")
+        st.caption("Add questions you want to ask about the selected fields")
+
+        # Questions input
+        if 'scenario_questions' not in st.session_state:
+            st.session_state.scenario_questions = []
+
+        col1, col2 = st.columns([3, 1])
+
+        with col1:
+            new_question = st.text_input(
+                "Add a question",
+                placeholder="e.g., What is the average value? How many unique entries?",
+                key="new_question_input"
+            )
+
+        with col2:
+            if st.button("➕ Add Question", key="add_question_btn"):
+                if new_question:
+                    st.session_state.scenario_questions.append(new_question)
+                    st.rerun()
+
+        # Display current questions
+        if st.session_state.scenario_questions:
+            st.write("**Current Questions:**")
+            for i, q in enumerate(st.session_state.scenario_questions):
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    st.write(f"{i+1}. {q}")
+                with col2:
+                    if st.button("🗑️", key=f"remove_q_{i}"):
+                        st.session_state.scenario_questions.pop(i)
+                        st.rerun()
+
+        st.write("**Define Output Format:**")
+        output_format = st.text_area(
+            "Specify the desired output format",
+            placeholder="Example:\n{\n  'field_name': 'value',\n  'summary': 'text description',\n  'statistics': {'mean': 0, 'count': 0}\n}\n\nOR\n\nTable format with columns: Name, Value, Description",
+            height=150,
+            key="output_format_input"
+        )
+
+        # Save scenario
+        if st.button("💾 Save Scenario", type="primary", key="save_scenario_btn"):
+            if scenario_name and selected_fields:
+                new_scenario = {
+                    'id': f"scenario_{len(st.session_state.scenarios)}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                    'name': scenario_name,
+                    'description': scenario_description,
+                    'source_id': selected_source_id,
+                    'fields': selected_fields,
+                    'questions': st.session_state.scenario_questions.copy(),
+                    'output_format': output_format,
+                    'created_at': datetime.now().isoformat()
+                }
+
+                st.session_state.scenarios.append(new_scenario)
+                st.session_state.scenario_questions = []  # Clear questions
+                st.success(f"✅ Scenario '{scenario_name}' saved!")
+                st.rerun()
+            else:
+                st.warning("Please provide at least a scenario name and select some fields")
+
+    # Display existing scenarios
+    if st.session_state.scenarios:
+        st.divider()
+        st.subheader("📋 Existing Scenarios")
+
+        for idx, scenario in enumerate(st.session_state.scenarios):
+            with st.expander(f"**{scenario['name']}** - {scenario['source_id']}", expanded=False):
+                st.write(f"**Description:** {scenario['description']}")
+                st.write(f"**Created:** {scenario['created_at'][:19]}")
+
+                st.write(f"**Selected Fields ({len(scenario['fields'])}):**")
+                st.code(", ".join(scenario['fields']))
+
+                st.write(f"**Questions ({len(scenario['questions'])}):**")
+                for i, q in enumerate(scenario['questions'], 1):
+                    st.write(f"{i}. {q}")
+
+                st.write("**Output Format:**")
+                st.code(scenario['output_format'])
+
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    if st.button("🔍 Apply Scenario", key=f"apply_scenario_{idx}"):
+                        with st.spinner("Applying scenario..."):
+                            # Apply scenario and get results
+                            results = apply_scenario(df, scenario, st.session_state.api_key, st.session_state.model)
+
+                            if results:
+                                st.success("✅ Scenario applied successfully!")
+
+                                # Store results
+                                if 'scenario_results' not in st.session_state:
+                                    st.session_state.scenario_results = {}
+
+                                st.session_state.scenario_results[scenario['id']] = results
+                                st.rerun()
+
+                with col2:
+                    if st.button("📥 Export Scenario", key=f"export_scenario_{idx}"):
+                        scenario_json = json.dumps(scenario, indent=2, ensure_ascii=False)
+                        st.download_button(
+                            label="⬇️ Download JSON",
+                            data=scenario_json,
+                            file_name=f"scenario_{scenario['name']}.json",
+                            mime="application/json",
+                            key=f"download_scenario_{idx}"
+                        )
+
+                with col3:
+                    if st.button("🗑️ Delete", key=f"delete_scenario_{idx}"):
+                        st.session_state.scenarios.pop(idx)
+                        st.success(f"✅ Deleted scenario '{scenario['name']}'")
+                        st.rerun()
+
+                # Display results if available
+                if 'scenario_results' in st.session_state and scenario['id'] in st.session_state.scenario_results:
+                    st.divider()
+                    st.write("**📊 Results:**")
+                    results = st.session_state.scenario_results[scenario['id']]
+
+                    st.write(results.get('summary', 'No summary available'))
+
+                    if 'data' in results:
+                        st.dataframe(results['data'], use_container_width=True)
+
+                    if 'answers' in results:
+                        st.write("**Answers to Questions:**")
+                        for q, a in zip(scenario['questions'], results['answers']):
+                            st.write(f"**Q:** {q}")
+                            st.write(f"**A:** {a}")
+                            st.write("")
+
+
+def apply_scenario(df: pd.DataFrame, scenario: Dict[str, Any], api_key: str, model: str) -> Dict[str, Any]:
+    """Apply a scenario to the data and return results"""
+    from openai import OpenAI
+
+    try:
+        # Extract relevant data
+        selected_data = df[scenario['fields']]
+
+        # Create prompt for LLM
+        prompt = f"""
+Given the following data scenario:
+
+**Scenario Name:** {scenario['name']}
+**Description:** {scenario['description']}
+
+**Selected Fields:** {', '.join(scenario['fields'])}
+
+**Data Summary:**
+- Shape: {selected_data.shape[0]} rows × {selected_data.shape[1]} columns
+- Sample data (first 5 rows):
+{selected_data.head().to_string()}
+
+**Questions to Answer:**
+{chr(10).join(f"{i+1}. {q}" for i, q in enumerate(scenario['questions']))}
+
+**Desired Output Format:**
+{scenario['output_format']}
+
+Please analyze the data and provide:
+1. Answers to all questions based on the data
+2. A summary of key findings
+3. Format the output according to the specified format
+
+Provide your response in JSON format with keys: 'answers' (list), 'summary' (string), 'formatted_output' (string)
+"""
+
+        client = OpenAI(api_key=api_key)
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a data analysis assistant. Analyze data scenarios and provide structured insights."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.3
+        )
+
+        result = json.loads(response.choices[0].message.content)
+
+        # Add the selected data
+        result['data'] = selected_data
+
+        return result
+
+    except Exception as e:
+        st.error(f"Error applying scenario: {str(e)}")
+        return None
+
+
+# ============================================================================
+# Tab 6: Agent Q&A
 # ============================================================================
 class SQLQueryTool:
     """Tool to execute SQL queries"""
@@ -1087,30 +1458,34 @@ def main():
         "🔍 Structure Analysis",
         "🧹 Type Cleaning",
         "📋 Schema Generation",
+        "🎯 Scenarios",
         "🤖 Agent Q&A",
         "💾 Checkpoints",
         "📤 Export"
     ])
-    
+
     with tabs[0]:
         tab_ingestion()
-    
+
     with tabs[1]:
         tab_structure_analysis()
-    
+
     with tabs[2]:
         tab_type_cleaning()
-    
+
     with tabs[3]:
         tab_schema_generation()
-    
+
     with tabs[4]:
-        tab_agent_qa()
-    
+        tab_scenarios()
+
     with tabs[5]:
-        tab_checkpoints()
-    
+        tab_agent_qa()
+
     with tabs[6]:
+        tab_checkpoints()
+
+    with tabs[7]:
         tab_export()
 
 
