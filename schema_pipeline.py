@@ -210,6 +210,24 @@ class QuestionSet(BaseModel):
             "output_fields": [f.to_dict() for f in self.output_fields],
             "additional_notes": self.additional_notes
         }
+
+
+class Scenario(BaseModel):
+    """A scenario defining use case, questions, and expected output format"""
+    id: str
+    name: str
+    description: str = ""
+    selected_fields: List[str] = Field(default_factory=list)  # List of column names
+    questions: List[str] = Field(default_factory=list)  # Questions for this scenario
+    output_format: Dict[str, Any] = Field(default_factory=dict)  # JSON schema for output
+    example_input: Optional[Dict[str, Any]] = None  # Example input data
+    example_output: Optional[Dict[str, Any]] = None  # Example expected output
+    created_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
 class DataPattern(BaseModel):
 
     """Detected pattern in data"""
@@ -269,7 +287,10 @@ class Session(BaseModel):
 
     # User questions and output format
     question_set: Optional[QuestionSet] = None
-    
+
+    # Scenarios
+    scenarios: List[Scenario] = Field(default_factory=list)
+
     schema: Dict[str, ColumnSchema]
     profiles: Dict[str, ColumnProfile]
     
@@ -299,6 +320,7 @@ class Session(BaseModel):
             "cleaning_rules": [r.to_dict() for r in self.cleaning_rules],
             "applied_cleaning_rules": self.applied_cleaning_rules,
             "question_set": self.question_set.to_dict() if self.question_set else None,
+            "scenarios": [s.to_dict() for s in self.scenarios],
             "schema": {k: v.to_dict() for k, v in self.schema.items()},
             "profiles": {k: v.to_dict() for k, v in self.profiles.items()},
             "questions": [q.to_dict() for q in self.questions],
