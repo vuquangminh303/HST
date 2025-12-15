@@ -1,13 +1,3 @@
-"""
-Enhanced Data Schema Analysis Pipeline V5
-- Smart type inference (handles 500.000 → int, not str)
-- Data cleaning and type conversion
-- Question-driven schema generation
-- Schema validation against user questions
-- Interactive Q&A agent after schema refinement
-- Full Streamlit integration
-"""
-
 import json
 import os
 import re
@@ -220,6 +210,24 @@ class QuestionSet(BaseModel):
             "output_fields": [f.to_dict() for f in self.output_fields],
             "additional_notes": self.additional_notes
         }
+
+
+class Scenario(BaseModel):
+    """A scenario defining use case, questions, and expected output format"""
+    id: str
+    name: str
+    description: str = ""
+    selected_fields: List[str] = Field(default_factory=list)  # List of column names
+    questions: List[str] = Field(default_factory=list)  # Questions for this scenario
+    output_format: Dict[str, Any] = Field(default_factory=dict)  # JSON schema for output
+    example_input: Optional[Dict[str, Any]] = None  # Example input data
+    example_output: Optional[Dict[str, Any]] = None  # Example expected output
+    created_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
 class DataPattern(BaseModel):
 
     """Detected pattern in data"""
@@ -279,7 +287,10 @@ class Session(BaseModel):
 
     # User questions and output format
     question_set: Optional[QuestionSet] = None
-    
+
+    # Scenarios
+    scenarios: List[Scenario] = Field(default_factory=list)
+
     schema: Dict[str, ColumnSchema]
     profiles: Dict[str, ColumnProfile]
     
@@ -309,6 +320,7 @@ class Session(BaseModel):
             "cleaning_rules": [r.to_dict() for r in self.cleaning_rules],
             "applied_cleaning_rules": self.applied_cleaning_rules,
             "question_set": self.question_set.to_dict() if self.question_set else None,
+            "scenarios": [s.to_dict() for s in self.scenarios],
             "schema": {k: v.to_dict() for k, v in self.schema.items()},
             "profiles": {k: v.to_dict() for k, v in self.profiles.items()},
             "questions": [q.to_dict() for q in self.questions],
@@ -2184,10 +2196,10 @@ class SessionManager:
         return session
     
     def save_checkpoint(
-        self,
-        session: Session,
-        df: pd.DataFrame,
-        stage: str,
+        self, 
+        session: Session, 
+        df: pd.DataFrame, 
+        stage: str, 
         description: str
     ) -> DataFrameCheckpoint:
         """Save DataFrame checkpoint"""
@@ -2195,7 +2207,41 @@ class SessionManager:
         timestamp = datetime.now().isoformat()
         
         checkpoint_file = self.checkpoints_dir / f"{checkpoint_id}.parquet"
-        df.to_parquet(checkpoint_file, index=False)
+        
+        # --- FIX START: Sanitize DataFrame for Parquet ---
+        df_save = df.copy()
+        
+        # 1. Force column names to string
+        df_save.columns = df_save.columns.astype(str)
+        
+        # 2. De-duplicate column names
+        # Example: ["ID", "Name", "ID"] -> ["ID", "Name", "ID.1"]
+        # This prevents df[col] from returning a DataFrame (causing the crash)
+        if not df_save.columns.is_unique:
+            new_columns = []
+            seen = {}
+            for col in df_save.columns:
+                if col in seen:
+                    seen[col] += 1
+                    new_columns.append(f"{col}.{seen[col]}")
+                else:
+                    seen[col] = 0
+                    new_columns.append(col)
+            df_save.columns = new_columns
+
+        # 3. Handle mixed types in object columns
+        for col in df_save.columns:
+            # Now safe because columns are unique, so df_save[col] is always a Series
+            if df_save[col].dtype == 'object':
+                df_save[col] = df_save[col].astype(str)
+        # --- FIX END ---
+
+        try:
+            df_save.to_parquet(checkpoint_file, index=False)
+        except Exception as e:
+            logger.warning(f"Parquet save failed: {e}. Falling back to CSV.")
+            checkpoint_file = self.checkpoints_dir / f"{checkpoint_id}.csv"
+            df.to_csv(checkpoint_file, index=False)
         
         checkpoint = DataFrameCheckpoint(
             checkpoint_id=checkpoint_id,
@@ -2209,17 +2255,23 @@ class SessionManager:
         session.checkpoints.append(checkpoint)
         
         logger.info(f"✓ Checkpoint: {stage} ({checkpoint.shape[0]}×{checkpoint.shape[1]})")
-        return checkpoint
-    
+        return checkpoint    
     def load_checkpoint(self, checkpoint: DataFrameCheckpoint) -> pd.DataFrame:
         """Load DataFrame from checkpoint"""
         if not checkpoint.file_path:
             raise ValueError("No file path")
         
-        df = pd.read_parquet(checkpoint.file_path)
+        path = Path(checkpoint.file_path)
+        
+        if path.suffix == '.parquet':
+            df = pd.read_parquet(path)
+        elif path.suffix == '.csv':
+            df = pd.read_csv(path)
+        else:
+            raise ValueError(f"Unsupported checkpoint format: {path.suffix}")
+            
         logger.info(f"✓ Loaded: {checkpoint.stage}")
-        return df
-    
+        return df    
     def save_session(self, session: Session):
         """Save session to JSON"""
         session_file = self.output_dir / f"session_{session.session_id}.json"
