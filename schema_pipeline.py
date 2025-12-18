@@ -1,17 +1,9 @@
-"""
-Enhanced Data Schema Analysis Pipeline V4
-- Smart type inference (handles 500.000 → int, not str)
-- Data cleaning and type conversion
-- Interactive Q&A agent after schema refinement
-- Full Streamlit integration
-"""
-
 import json
 import os
 import re
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Tuple, Union
+from typing import Dict, List, Any, Optional, Tuple, Union,Generator
 from enum import Enum
 import argparse
 from pydantic import BaseModel, Field
@@ -51,6 +43,18 @@ class DataCleaningAction(str, Enum):
     STRIP_WHITESPACE = "strip_whitespace"
     NORMALIZE_CASE = "normalize_case"
     REPLACE_VALUES = "replace_values"
+    # Advanced numeric cleaning
+    REMOVE_CURRENCY_SYMBOL = "remove_currency_symbol"
+    CONVERT_PERCENT_TO_FLOAT = "convert_percent_to_float"
+    CONVERT_PARENTHESES_TO_NEGATIVE = "convert_parentheses_to_negative"
+    EXTRACT_NUMBER_FROM_STRING = "extract_number_from_string"
+    # Advanced datetime cleaning
+    CONVERT_EXCEL_SERIAL_DATE = "convert_excel_serial_date"
+    PARSE_TEXT_DATE = "parse_text_date"
+    # Boolean cleaning
+    MAP_TO_BOOLEAN = "map_to_boolean"
+    # Null handling
+    REPLACE_PLACEHOLDERS_WITH_NAN = "replace_placeholders_with_nan"
 
 
 class CleaningRule(BaseModel):
@@ -92,7 +96,8 @@ class ColumnProfile(BaseModel):
     sample_raw_values: List[str]  # Original string values
     has_thousand_separator: bool = False
     decimal_separator: Optional[str] = None
-    
+    data_issues: List[Dict[str, Any]] = Field(default_factory=list)  # Detected data quality issues
+
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()
 
@@ -183,22 +188,122 @@ class DataSource(BaseModel):
         return self.model_dump()
 
 
+class UserQuestion(BaseModel):
+    """User-defined question that will be frequently asked"""
+    id: str
+    question: str
+    description: str = ""  # Optional description of what the question is about
+    priority: str = "medium"  # low, medium, high
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class OutputField(BaseModel):
+    """Expected output field definition"""
+    field_name: str
+    description: str
+    data_type: str  # Expected data type (string, number, date, etc.)
+    required: bool = True
+    example_value: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class QuestionSet(BaseModel):
+    """Collection of user questions and expected output format"""
+    user_questions: List[UserQuestion] = Field(default_factory=list)
+    output_fields: List[OutputField] = Field(default_factory=list)
+    additional_notes: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "user_questions": [q.to_dict() for q in self.user_questions],
+            "output_fields": [f.to_dict() for f in self.output_fields],
+            "additional_notes": self.additional_notes
+        }
+
+
+class Scenario(BaseModel):
+    """A scenario defining use case, questions, and expected output format"""
+    id: str
+    name: str
+    description: str = ""
+    selected_fields: List[str] = Field(default_factory=list)  # List of column names
+    questions: List[str] = Field(default_factory=list)  # Questions for this scenario
+    output_format: Dict[str, Any] = Field(default_factory=dict)  # JSON schema for output
+    example_input: Optional[Dict[str, Any]] = None  # Example input data
+    example_output: Optional[Dict[str, Any]] = None  # Example expected output
+    created_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class DataPattern(BaseModel):
+
+    """Detected pattern in data"""
+
+    pattern_type: str  # "trend", "seasonality", "categorical", "unique_id", etc.
+    column: str
+    description: str
+    confidence: float
+    details: Dict[str, Any] = Field(default_factory=dict)
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+class DataAnomaly(BaseModel):
+    """Detected anomaly in data"""
+    anomaly_type: str  # "outlier", "missing_pattern", "inconsistent_format", etc.
+    column: str
+    description: str
+    severity: str  # "low", "medium", "high"
+    affected_rows: int
+    examples: List[Any] = Field(default_factory=list)
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+class DataInsights(BaseModel):
+    """Complete insights about a dataset"""
+    patterns: List[DataPattern] = Field(default_factory=list)
+    anomalies: List[DataAnomaly] = Field(default_factory=list)
+    distributions: Dict[str, str] = Field(default_factory=dict)  # column -> distribution type
+    correlations: List[Dict[str, Any]] = Field(default_factory=list)
+    summary: str = ""
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+class TransformationOption(BaseModel):
+    """A set of transformations representing one approach to clean data"""
+    id: str
+    name: str  # e.g., "Auto-detect and fix structure", "Custom user transform"
+    description: str
+    transformations: List[Transformation]
+    confidence: float
+    is_recommended: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
 class Session(BaseModel):
     """Complete session state"""
     session_id: str
     created_at: str
-    
+
     sources: List[DataSource]
     current_source_id: str
-    
+
     raw_structure_info: Dict[str, Any]
     transformations: List[Transformation]
     applied_transformations: List[str]
-    
+
     # Data cleaning
     cleaning_rules: List[CleaningRule] = Field(default_factory=list)
     applied_cleaning_rules: List[str] = Field(default_factory=list)
-    
+
+    # User questions and output format
+    question_set: Optional[QuestionSet] = None
+
+    # Scenarios
+    scenarios: List[Scenario] = Field(default_factory=list)
+
     schema: Dict[str, ColumnSchema]
     profiles: Dict[str, ColumnProfile]
     
@@ -227,6 +332,8 @@ class Session(BaseModel):
             "applied_transformations": self.applied_transformations,
             "cleaning_rules": [r.to_dict() for r in self.cleaning_rules],
             "applied_cleaning_rules": self.applied_cleaning_rules,
+            "question_set": self.question_set.to_dict() if self.question_set else None,
+            "scenarios": [s.to_dict() for s in self.scenarios],
             "schema": {k: v.to_dict() for k, v in self.schema.items()},
             "profiles": {k: v.to_dict() for k, v in self.profiles.items()},
             "questions": [q.to_dict() for q in self.questions],
@@ -313,8 +420,25 @@ class SQLQueryTool:
 # ============================================================================
 
 class TypeInferenceEngine:
-    """Smart type inference that handles formatted numbers"""
-    
+    """Smart type inference that handles formatted numbers and various data issues"""
+
+    # Common null placeholders
+    NULL_PLACEHOLDERS = {'N/A', 'n/a', 'NA', 'null', 'NULL', 'None', 'NONE', '-', '?', 'Unknown', 'unknown', '', ' '}
+
+    # Currency symbols
+    CURRENCY_SYMBOLS = {'$', '€', '£', '¥', 'USD', 'EUR', 'GBP', 'JPY', 'VND', 'VNĐ', '₫'}
+
+    # Boolean mappings
+    BOOLEAN_MAPPINGS = {
+        'yes': True, 'no': False,
+        'y': True, 'n': False,
+        'true': True, 'false': False,
+        'có': True, 'không': False,
+        'enabled': True, 'disabled': False,
+        '1': True, '0': False,
+        'on': True, 'off': False
+    }
+
     @staticmethod
     def detect_thousand_separator(series: pd.Series) -> Optional[str]:
         """Detect thousand separator (. or ,)"""
@@ -327,9 +451,9 @@ class TypeInferenceEngine:
         dot_matches = sum(1 for val in sample if re.match(dot_pattern, val.strip()))
         comma_matches = sum(1 for val in sample if re.match(comma_pattern, val.strip()))
         
-        if dot_matches > len(sample) * 0.5:
+        if dot_matches > 0:
             return '.'
-        if comma_matches > len(sample) * 0.5:
+        if comma_matches > 0:
             return ','
         
         return None
@@ -419,13 +543,121 @@ class TypeInferenceEngine:
                 pass
         
         return 'string', {}
-    
+
+    @staticmethod
+    def detect_data_issues(series: pd.Series) -> List[Dict[str, Any]]:
+        """
+        Detect various data quality issues in a series.
+        Returns list of issues with type and details.
+        """
+        issues = []
+        sample = series.dropna().astype(str).head(100)
+
+        if len(sample) == 0:
+            return issues
+
+        # 1. Currency symbols
+        currency_pattern = r'[$€£¥₫]|USD|EUR|GBP|JPY|VND|VNĐ'
+        has_currency = sample.str.contains(currency_pattern, regex=True, na=False).any()
+        if has_currency:
+            issues.append({
+                'type': 'currency',
+                'action': DataCleaningAction.REMOVE_CURRENCY_SYMBOL,
+                'description': 'Contains currency symbols',
+                'examples': sample[sample.str.contains(currency_pattern, regex=True, na=False)].head(3).tolist()
+            })
+
+        # 2. Percentages
+        percent_pattern = r'^\s*-?\d+(?:[.,]\d+)?\s*%\s*$'
+        has_percent = sample.str.match(percent_pattern, na=False).any()
+        if has_percent:
+            issues.append({
+                'type': 'percentage',
+                'action': DataCleaningAction.CONVERT_PERCENT_TO_FLOAT,
+                'description': 'Contains percentage values',
+                'examples': sample[sample.str.match(percent_pattern, na=False)].head(3).tolist()
+            })
+
+        # 3. Accounting negatives (parentheses)
+        paren_pattern = r'^\(\s*\d+(?:[.,]\d+)?\s*\)$'
+        has_parentheses = sample.str.match(paren_pattern, na=False).any()
+        if has_parentheses:
+            issues.append({
+                'type': 'accounting_negative',
+                'action': DataCleaningAction.CONVERT_PARENTHESES_TO_NEGATIVE,
+                'description': 'Contains accounting-style negative numbers (parentheses)',
+                'examples': sample[sample.str.match(paren_pattern, na=False)].head(3).tolist()
+            })
+
+        # 4. Units (numbers with text suffix)
+        unit_pattern = r'^\s*\d+(?:[.,]\d+)?\s+[a-zA-Z]+\d*\s*$'
+        has_units = sample.str.match(unit_pattern, na=False).any()
+        if has_units:
+            issues.append({
+                'type': 'units_suffix',
+                'action': DataCleaningAction.EXTRACT_NUMBER_FROM_STRING,
+                'description': 'Contains numbers with unit suffixes (kg, cm, m2, etc.)',
+                'examples': sample[sample.str.match(unit_pattern, na=False)].head(3).tolist()
+            })
+
+        # 5. Excel serial dates
+        try:
+            numeric_values = pd.to_numeric(sample, errors='coerce')
+            if numeric_values.notna().sum() > 0:
+                # Excel serial dates typically range from 1 to 50000+
+                in_date_range = (numeric_values >= 1) & (numeric_values <= 100000)
+                if in_date_range.sum() / len(numeric_values) > 0.5:
+                    issues.append({
+                        'type': 'excel_serial_date',
+                        'action': DataCleaningAction.CONVERT_EXCEL_SERIAL_DATE,
+                        'description': 'Looks like Excel serial date numbers',
+                        'examples': sample.head(3).tolist()
+                    })
+        except:
+            pass
+
+        # 6. Boolean-like values
+        unique_lower = set(sample.str.lower().str.strip())
+        boolean_keys = set(TypeInferenceEngine.BOOLEAN_MAPPINGS.keys())
+        if unique_lower.issubset(boolean_keys | {'nan', 'none'}):
+            issues.append({
+                'type': 'boolean_text',
+                'action': DataCleaningAction.MAP_TO_BOOLEAN,
+                'description': 'Contains boolean-like text values',
+                'examples': list(unique_lower)[:5]
+            })
+
+        # 7. Null placeholders
+        null_placeholders_found = unique_lower & TypeInferenceEngine.NULL_PLACEHOLDERS
+        if null_placeholders_found:
+            issues.append({
+                'type': 'null_placeholders',
+                'action': DataCleaningAction.REPLACE_PLACEHOLDERS_WITH_NAN,
+                'description': 'Contains text representing null values',
+                'examples': list(null_placeholders_found)
+            })
+
+        return issues
+
     @staticmethod
     def generate_cleaning_rules(df: pd.DataFrame, profiles: Dict[str, ColumnProfile]) -> List[CleaningRule]:
-        """Generate cleaning rules based on inferred types"""
+        """Generate cleaning rules based on inferred types and detected issues"""
         rules = []
-        
+
         for col_name, profile in profiles.items():
+            # First, generate rules from detected data issues
+            for issue in profile.data_issues:
+                rule_id = f"clean_{col_name}_{issue['type']}"
+                rules.append(CleaningRule(
+                    id=rule_id,
+                    column=col_name,
+                    action=issue['action'],
+                    description=f"{col_name}: {issue['description']} (e.g., {issue['examples'][:2]})",
+                    params=issue.get('params', {}),
+                    applied=False
+                ))
+
+            # Then, existing logic for type conversions
             # Skip if inferred type matches pandas type
             if profile.inferred_type == 'int' and df[col_name].dtype in ['int64', 'int32']:
                 continue
@@ -535,11 +767,69 @@ class TypeInferenceEngine:
                 elif case_type == 'upper':
                     df_result[col] = df_result[col].astype(str).str.upper()
                 logger.info(f"✓ Normalized case for '{col}'")
-            
+
+            # Advanced numeric cleaning
+            elif rule.action == DataCleaningAction.REMOVE_CURRENCY_SYMBOL:
+                # Remove currency symbols and convert to numeric
+                currency_pattern = r'[$€£¥₫]|USD|EUR|GBP|JPY|VND|VNĐ'
+                series = df_result[col].astype(str).str.replace(currency_pattern, '', regex=True)
+                series = series.str.replace(',', '').str.strip()
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Removed currency symbols from '{col}'")
+
+            elif rule.action == DataCleaningAction.CONVERT_PERCENT_TO_FLOAT:
+                # Remove % and convert to float (optionally divide by 100)
+                series = df_result[col].astype(str).str.replace('%', '').str.strip()
+                df_result[col] = pd.to_numeric(series, errors='coerce') / 100
+                logger.info(f"✓ Converted percentages to floats in '{col}'")
+
+            elif rule.action == DataCleaningAction.CONVERT_PARENTHESES_TO_NEGATIVE:
+                # Convert (500) to -500
+                def convert_paren(x):
+                    s = str(x).strip()
+                    if s.startswith('(') and s.endswith(')'):
+                        return '-' + s[1:-1]
+                    return s
+                series = df_result[col].apply(convert_paren)
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Converted parentheses to negatives in '{col}'")
+
+            elif rule.action == DataCleaningAction.EXTRACT_NUMBER_FROM_STRING:
+                # Extract numeric part from strings like "50 kg", "175 cm"
+                series = df_result[col].astype(str).str.extract(r'([-+]?\d+(?:[.,]\d+)?)', expand=False)
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Extracted numbers from strings in '{col}'")
+
+            # Advanced datetime cleaning
+            elif rule.action == DataCleaningAction.CONVERT_EXCEL_SERIAL_DATE:
+                # Convert Excel serial dates to datetime
+                numeric = pd.to_numeric(df_result[col], errors='coerce')
+                df_result[col] = pd.to_datetime(numeric, unit='D', origin='1899-12-30', errors='coerce')
+                logger.info(f"✓ Converted Excel serial dates in '{col}'")
+
+            elif rule.action == DataCleaningAction.PARSE_TEXT_DATE:
+                # Parse textual dates with flexible format
+                df_result[col] = pd.to_datetime(df_result[col], errors='coerce', infer_datetime_format=True)
+                logger.info(f"✓ Parsed text dates in '{col}'")
+
+            # Boolean mapping
+            elif rule.action == DataCleaningAction.MAP_TO_BOOLEAN:
+                # Map various text values to boolean
+                df_result[col] = df_result[col].astype(str).str.lower().str.strip().map(
+                    TypeInferenceEngine.BOOLEAN_MAPPINGS
+                )
+                logger.info(f"✓ Mapped to boolean in '{col}'")
+
+            # Null handling
+            elif rule.action == DataCleaningAction.REPLACE_PLACEHOLDERS_WITH_NAN:
+                # Replace null placeholders with actual NaN
+                df_result[col] = df_result[col].replace(list(TypeInferenceEngine.NULL_PLACEHOLDERS), pd.NA)
+                logger.info(f"✓ Replaced null placeholders in '{col}'")
+
         except Exception as e:
             logger.error(f"✗ Failed to apply cleaning rule {rule.id}: {str(e)}")
             raise
-        
+
         return df_result
 
 
@@ -593,7 +883,7 @@ class DataIngestor:
         return sources
     
     @classmethod
-    def load_source(cls, source: DataSource, header: Optional[int] = None) -> pd.DataFrame:
+    def load_source(cls, source: DataSource, header: Optional[int] = 0) -> pd.DataFrame:
         """Load a specific data source"""
         try:
             if source.source_type == "csv":
@@ -616,8 +906,31 @@ class DataIngestor:
     
     @classmethod
     def load_raw(cls, source: DataSource) -> pd.DataFrame:
-        """Load raw data without headers"""
-        return cls.load_source(source, header=None)
+        """
+        Load raw data strictly as strings with NO header assumptions.
+        This prevents PyArrow errors with mixed types and allows correct structure analysis.
+        """
+        try:
+            # Luôn đọc tất cả là string để tránh lỗi mixed types của PyArrow
+            # Luôn để header=None để LLM nhìn thấy dòng đầu tiên thực tế
+            if source.source_type == "csv":
+                df = pd.read_csv(source.file_path, header=None, dtype=str)
+            else:
+                df = pd.read_excel(
+                    source.file_path, 
+                    sheet_name=source.sheet_name,
+                    header=None,
+                    dtype=str
+                )
+            
+            # Thay thế NaN bằng chuỗi rỗng để clean hơn khi hiển thị
+            df = df.fillna("")
+            
+            logger.info(f"✓ Loaded RAW {source.source_id}: {len(df)} rows (treated as string grid)")
+            return df
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load raw source {source.source_id}: {str(e)}")
 
 
 # ============================================================================
@@ -625,7 +938,7 @@ class DataIngestor:
 # ============================================================================
 
 class StructureAnalyzer:
-    """Analyzes raw DataFrame structure with improved clean data detection"""
+    """Analyzes raw DataFrame structure using LLM for clean data detection"""
     
     def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
         self.client = OpenAI(api_key=api_key)
@@ -637,23 +950,15 @@ class StructureAnalyzer:
         max_preview_rows: int = 10
     ) -> Tuple[Dict[str, Any], List[Transformation], List[Question], bool]:
         """
-        Analyze raw structure and propose transformations.
+        Analyze raw structure using LLM to check if data is clean.
         Returns: (structure_info, transformations, questions, is_clean)
         """
         
-        # First, perform heuristic check
-        is_clean, issues = self._heuristic_structure_check(df)
-        
-        if is_clean:
-            logger.info("✓ Data structure appears clean - no transformations needed")
-            structure_info = self._extract_structure_info(df, max_preview_rows)
-            return structure_info, [], [], True
-        
-        logger.info(f"⚠ Detected structure issues: {', '.join(issues)}")
-        
-        # Perform LLM analysis
+        # Extract structure info for LLM analysis
         structure_info = self._extract_structure_info(df, max_preview_rows)
-        prompt = self._build_structure_prompt(structure_info, issues)
+        
+        # Use LLM to check if data is clean and propose transformations
+        prompt = self._build_structure_prompt(structure_info)
         
         try:
             response = self.client.chat.completions.create(
@@ -668,56 +973,21 @@ class StructureAnalyzer:
             
             result = json.loads(response.choices[0].message.content)
             
+            is_clean = result.get("is_clean", False)
             transformations = [Transformation(**t) for t in result.get("transformations", [])]
             questions = [Question(**q) for q in result.get("questions", [])]
             
-            logger.info(f"✓ Analyzed structure: {len(transformations)} transformations proposed, {len(questions)} questions")
-            return structure_info, transformations, questions, False
+            if is_clean:
+                logger.info("✓ Data structure is clean - no transformations needed")
+                return structure_info, [], [], True, []
+            else:
+                issues = result.get("detected_issues", [])
+                logger.info(f"⚠ Detected structure issues: {', '.join(issues)}")
+                logger.info(f"✓ Analyzed structure: {len(transformations)} transformations proposed, {len(questions)} questions")
+                return structure_info, transformations, questions, False,issues
             
         except Exception as e:
             raise RuntimeError(f"Structure analysis failed: {str(e)}")
-    
-    def _heuristic_structure_check(self, df: pd.DataFrame) -> Tuple[bool, List[str]]:
-        """
-        Fast heuristic check for common structure issues.
-        Returns: (is_clean, list_of_issues)
-        """
-        issues = []
-        
-        first_row = df.iloc[0]
-        potential_headers = first_row.astype(str).tolist()
-        
-        numeric_headers = sum(1 for val in potential_headers if str(val).replace('.', '').replace('-', '').isdigit())
-        if numeric_headers > len(potential_headers) * 0.5:
-            issues.append("First row contains mostly numeric values (should be headers)")
-        
-        if all(str(col).isdigit() for col in df.columns):
-            issues.append("Column names are numeric indices (no header row detected)")
-        
-        empty_cols = sum(1 for col in df.columns if pd.isna(col) or str(col).strip() == '')
-        if empty_cols > 0:
-            issues.append(f"{empty_cols} empty column name(s)")
-        
-        # Check 4: Duplicate column names
-        if len(df.columns) != len(set(df.columns)):
-            issues.append("Duplicate column names detected")
-        
-        # Check 5: Excessive nulls in first few rows (might need to skip)
-        if len(df) > 3:
-            first_rows_null_ratio = df.head(3).isna().sum().sum() / (3 * len(df.columns))
-            if first_rows_null_ratio > 0.7:
-                issues.append("First 3 rows are mostly empty (might need to skip)")
-        
-        # Check 6: Are column names actually descriptive?
-        if not all(str(col).isdigit() for col in df.columns):
-            # We have string column names - check if they're descriptive
-            avg_length = sum(len(str(col)) for col in df.columns) / len(df.columns)
-            if avg_length < 3:
-                issues.append("Column names are too short (less than 3 characters on average)")
-        
-        is_clean = len(issues) == 0
-        
-        return is_clean, issues
     
     def _extract_structure_info(self, df: pd.DataFrame, max_rows: int = 10) -> Dict[str, Any]:
         """Extract structure information for LLM analysis"""
@@ -729,52 +999,82 @@ class StructureAnalyzer:
             "dtypes": df.dtypes.astype(str).to_dict(),
             "preview_data": df.head(preview_rows).to_dict(orient='records'),
             "null_counts": df.isna().sum().to_dict(),
-            "first_row_values": df.iloc[0].tolist() if len(df) > 0 else []
+            "first_row_values": df.iloc[0].tolist() if len(df) > 0 else [],
+            "last_few_rows": df.tail(3).to_dict(orient='records') if len(df) > 3 else []
         }
     
-    def _build_structure_prompt(self, info: Dict[str, Any], detected_issues: List[str]) -> str:
+    def _build_structure_prompt(self, info: Dict[str, Any]) -> str:
         """Build prompt for structure analysis"""
-        return f"""Analyze this raw DataFrame structure and propose transformations.
-
-**Detected Issues (from heuristics):**
-{chr(10).join('- ' + issue for issue in detected_issues)}
+        return f"""Analyze this raw DataFrame structure to determine if it's clean or needs transformations.
 
 **DataFrame Info:**
 - Shape: {info['shape']['rows']} rows × {info['shape']['columns']} columns
 - Current column names: {info['column_names']}
-- First row values: {info['first_row_values'][:10]}
+- Data types: {json.dumps(info['dtypes'], indent=2)}
+- Null counts: {json.dumps(info['null_counts'], indent=2)}
+
+**First row values:**
+{json.dumps(info['first_row_values'], indent=2, default=str)}
 
 **Preview (first few rows):**
 ```json
-{json.dumps(info['preview_data'][:5], indent=2, default=str)}
+{json.dumps(info['preview_data'], indent=2, default=str)}
+```
+
+**Last few rows (for context):**
+```json
+{json.dumps(info.get('last_few_rows', []), indent=2, default=str)}
 ```
 
 **Instructions:**
-1. Determine if this data needs structural transformation
-2. Common issues to look for:
-   - First row should be used as header
-   - Empty rows at the top that should be skipped
-   - Unnamed or poorly named columns
-   - Empty columns that should be dropped
-   - Merged header rows that need special handling
+1. **First, determine if this data is CLEAN or needs transformations**
+   
+   A clean dataset has:
+   - Proper descriptive column headers (not numeric indices like 0, 1, 2...)
+   - Column names are not in the first data row
+   - No empty/unnamed columns
+   - No duplicate column names
+   - Data starts from the correct row (no metadata rows at top)
+   - Consistent data structure throughout
 
-3. For each transformation, propose:
-   - A unique ID (e.g., "use_row_0_as_header")
+2. **If data is CLEAN:**
+   - Set "is_clean": true
+   - Leave "transformations" and "detected_issues" empty
+   - No questions needed
+
+3. **If data needs transformations:**
+   - Set "is_clean": false
+   - List all "detected_issues" 
+   - Propose transformations to fix each issue:
+     * Use first row as header
+     * Skip empty/metadata rows at the top
+     * Drop empty columns
+     * Rename poorly named columns
+     * Handle merged headers
+     * Remove duplicate columns
+   
+4. **For each transformation, include:**
+   - Unique ID (e.g., "use_row_0_as_header")
    - Type of transformation
-   - Description
-   - Parameters
+   - Clear description
+   - Required parameters
    - Confidence score (0.0-1.0)
 
-4. If you're uncertain about any transformation, create a question for the user
+5. **Ask questions only when:**
+   - You're uncertain about a transformation
+   - Multiple valid approaches exist
+   - User input is needed to decide
 
 **Response Format:**
 {{
+  "is_clean": true/false,
+  "detected_issues": ["issue 1", "issue 2", ...],
   "transformations": [
     {{
       "id": "unique_id",
-      "type": "use_row_as_header" | "skip_rows" | "drop_columns" | "rename_columns" | ...,
+      "type": "use_row_as_header" | "skip_rows" | "drop_columns" | "rename_columns" | "drop_rows",
       "description": "Human-readable description",
-      "params": {{"row_index": 0}} or {{"rows_to_skip": 2}} etc,
+      "params": {{"row_index": 0}} or {{"rows_to_skip": 2}} or {{"columns": [...]}} or {{"mapping": {{"col_name_pre":"col_name_post"}}}} or {{"indices": 1}} etc,
       "confidence": 0.95
     }}
   ],
@@ -789,21 +1089,38 @@ class StructureAnalyzer:
   ]
 }}
 
-**IMPORTANT:** If the data already has proper headers and clean structure, return empty transformations list!
+**IMPORTANT:** 
+- Be thorough in examining the data structure
+- Look at column names, first row, data types, and null patterns
+- If everything looks good, confidently mark as clean
+- Don't propose unnecessary transformations
 """
     
     def _get_structure_system_prompt(self) -> str:
         """System prompt for structure analysis"""
-        return """You are an expert data analyst specializing in detecting and fixing structural issues in raw tabular data.
+        return """You are an expert data analyst specializing in detecting structural issues in raw tabular data.
 
 Your job is to:
-1. Identify structural problems (wrong headers, empty rows, malformed columns)
-2. Propose specific transformations to fix them
-3. Ask clarifying questions when uncertain
+1. Carefully examine the DataFrame structure by looking at column names, first rows, data types, and patterns
+2. Determine if the data is CLEAN (ready to use) or needs TRANSFORMATIONS
+3. If transformations are needed, identify all structural problems and propose specific fixes
+4. Ask clarifying questions only when genuinely uncertain
 
-Be conservative: if the data looks clean, don't propose unnecessary transformations.
+**What makes data CLEAN:**
+- Descriptive column headers (not 0, 1, 2, or "Unnamed: X")
+- Headers are in the column name row, not in the first data row
+- No empty or duplicate columns
+- Data starts from the appropriate row
+- Consistent structure throughout
 
-Always respond in valid JSON format with "transformations" and "questions" arrays."""
+**Common structural issues:**
+- Numeric column indices (0, 1, 2...) instead of headers → first row likely contains real headers
+- First row contains text headers while column names are numeric → use first row as header
+- Empty rows at top (metadata, titles) → skip those rows
+- Unnamed or poorly named columns → rename or drop them
+- Merged or multi-level headers → special handling needed
+
+Be precise and confident in your assessment. Always respond in valid JSON format."""
     
     @staticmethod
     def apply_transformation(df: pd.DataFrame, trans: Transformation) -> pd.DataFrame:
@@ -815,11 +1132,12 @@ Always respond in valid JSON format with "transformations" and "questions" array
                 row_idx = trans.params["row_index"]
                 df_result.columns = df_result.iloc[row_idx].astype(str).tolist()
                 df_result = df_result.iloc[row_idx + 1:].reset_index(drop=True)
+                df_result = StructureAnalyzer.validate_and_fix_columns(df_result, f"[{trans.id}] ")
                 
             elif trans.type == TransformationType.SKIP_ROWS:
                 rows_to_skip = trans.params["rows_to_skip"]
                 df_result = df_result.iloc[rows_to_skip:].reset_index(drop=True)
-                
+                df_result = StructureAnalyzer.validate_and_fix_columns(df_result, f"[{trans.id}] ")
             elif trans.type == TransformationType.DROP_COLUMNS:
                 cols = trans.params["columns"]
                 df_result = df_result.drop(columns=cols, errors='ignore')
@@ -839,8 +1157,219 @@ Always respond in valid JSON format with "transformations" and "questions" array
             raise
         
         return df_result
+    @staticmethod
+    def validate_and_fix_columns(df: pd.DataFrame, log_prefix: str = "") -> pd.DataFrame:
+        """Validate and fix column names after transformation"""
+        df_result = df.copy()
+        
+        # Convert to strings
+        df_result.columns = [str(col).strip() if col is not None else '' for col in df_result.columns]
+        
+        # Fix empty columns
+        new_columns = []
+        unnamed_counter = 1
+        for col in df_result.columns:
+            if not col or col == '' or col.lower() == 'nan':
+                new_columns.append(f'Unnamed_{unnamed_counter}')
+                unnamed_counter += 1
+            else:
+                new_columns.append(col)
+        df_result.columns = new_columns
+        
+        # Fix duplicates
+        if df_result.columns.duplicated().any():
+            col_counts = {}
+            final_columns = []
+            for col in df_result.columns:
+                if col not in col_counts:
+                    col_counts[col] = 0
+                    final_columns.append(col)
+                else:
+                    col_counts[col] += 1
+                    final_columns.append(f"{col}_{col_counts[col]}")
+            df_result.columns = final_columns
+            logger.info(f"{log_prefix}✓ Fixed duplicate columns")
+        
+        return df_result
+class DataInsightsAnalyzer:
+    """Analyze data patterns, anomalies, and distributions using LLM"""
 
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
 
+    def analyze_insights(
+        self,
+        df: pd.DataFrame,
+        profiles: Dict[str, ColumnProfile]
+    ) -> DataInsights:
+        """
+        Analyze data patterns, anomalies, correlations, and distributions.
+        This runs AFTER structure is fixed and types are inferred.
+        """
+
+        # Build analysis prompt
+        prompt = self._build_insights_prompt(df, profiles)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_insights_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+
+            # Parse patterns
+            patterns = [DataPattern(**p) for p in result.get("patterns", [])]
+
+            # Parse anomalies
+            anomalies = [DataAnomaly(**a) for a in result.get("anomalies", [])]
+
+            insights = DataInsights(
+                patterns=patterns,
+                anomalies=anomalies,
+                distributions=result.get("distributions", {}),
+                correlations=result.get("correlations", []),
+                summary=result.get("summary", "")
+            )
+
+            logger.info(f"✓ Data insights: {len(patterns)} patterns, {len(anomalies)} anomalies detected")
+            return insights
+
+        except Exception as e:
+            raise RuntimeError(f"Insights analysis failed: {str(e)}")
+
+    def _build_insights_prompt(
+        self,
+        df: pd.DataFrame,
+        profiles: Dict[str, ColumnProfile]
+    ) -> str:
+        """Build prompt for data insights analysis"""
+
+        # Sample data
+        sample_rows = df.head(20).to_dict(orient='records')
+
+        # Basic statistics for numeric columns
+        numeric_stats = {}
+        for col in df.select_dtypes(include=[np.number]).columns:
+            numeric_stats[str(col)] = {
+                "mean": float(df[col].mean()) if not df[col].isna().all() else None,
+                "median": float(df[col].median()) if not df[col].isna().all() else None,
+                "std": float(df[col].std()) if not df[col].isna().all() else None,
+                "min": float(df[col].min()) if not df[col].isna().all() else None,
+                "max": float(df[col].max()) if not df[col].isna().all() else None
+            }
+
+        # Categorical columns
+        categorical_info = {}
+        for col in df.select_dtypes(include=['object']).columns:
+            if df[col].nunique() < 50:  # Only for low cardinality
+                categorical_info[str(col)] = {
+                    "unique_count": int(df[col].nunique()),
+                    "top_values": df[col].value_counts().head(10).to_dict()
+                }
+
+        return f"""Analyze this dataset and identify patterns, anomalies, and insights.
+
+**Dataset Overview:**
+- Shape: {df.shape[0]} rows × {df.shape[1]} columns
+- Columns: {list(df.columns)}
+
+**Column Profiles:**
+{json.dumps({col: {"type": profile.inferred_type, "null_ratio": profile.null_ratio, "unique": profile.n_unique} for col, profile in list(profiles.items())[:20]}, indent=2)}
+
+**Numeric Statistics:**
+{json.dumps(numeric_stats, indent=2, default=str)}
+
+**Categorical Info:**
+{json.dumps(categorical_info, indent=2, default=str)}
+
+**Sample Data (first 20 rows):**
+{json.dumps(sample_rows[:10], indent=2, default=str)}
+
+**Instructions:**
+Analyze the data and identify:
+
+1. **Patterns** (pattern_type, column, description, confidence, details):
+   - Trends (increasing/decreasing over time)
+   - Seasonality or cycles
+   - Unique identifiers (ID columns)
+   - Categorical groupings
+   - Date/time patterns
+   - Hierarchical relationships
+
+2. **Anomalies** (anomaly_type, column, description, severity, affected_rows, examples):
+   - Outliers in numeric data
+   - Missing data patterns
+   - Inconsistent formats
+   - Duplicate entries
+   - Data quality issues
+
+3. **Distributions** (column -> distribution type):
+   - "normal", "uniform", "skewed_left", "skewed_right", "bimodal", "categorical", etc.
+
+4. **Correlations** (list of related columns):
+   - Strong correlations between numeric columns
+   - Relationships between categorical and numeric
+
+5. **Summary**: Brief overview of key findings
+
+**Response Format:**
+{{
+  "patterns": [
+    {{
+      "pattern_type": "unique_id" | "trend" | "categorical" | "temporal" | ...,
+      "column": "column_name",
+      "description": "Description of the pattern",
+      "confidence": 0.95,
+      "details": {{"key": "value"}}
+    }}
+  ],
+  "anomalies": [
+    {{
+      "anomaly_type": "outlier" | "missing_pattern" | "inconsistent_format" | ...,
+      "column": "column_name",
+      "description": "Description of the anomaly",
+      "severity": "low" | "medium" | "high",
+      "affected_rows": 10,
+      "examples": ["example1", "example2"]
+    }}
+  ],
+  "distributions": {{
+    "column_name": "normal",
+    "another_column": "skewed_right"
+  }},
+  "correlations": [
+    {{
+      "columns": ["col1", "col2"],
+      "type": "positive" | "negative",
+      "strength": "strong" | "moderate" | "weak",
+      "description": "Description"
+    }}
+  ],
+  "summary": "Brief summary of key insights about this dataset"
+}}
+"""
+
+    def _get_insights_system_prompt(self) -> str:
+        """System prompt for insights analysis"""
+        return """You are an expert data scientist specializing in exploratory data analysis.
+
+Your job is to:
+1. Identify meaningful patterns in the data
+2. Detect anomalies and data quality issues
+3. Determine statistical distributions
+4. Find correlations and relationships between variables
+5. Provide actionable insights
+
+Be thorough but concise. Focus on insights that would help users understand their data better.
+
+Always respond in valid JSON format."""
 # ============================================================================
 # Profile Generation (Enhanced with Type Inference)
 # ============================================================================
@@ -854,6 +1383,22 @@ class ProfileGenerator:
         max_samples: int = 10
     ) -> Dict[str, ColumnProfile]:
         """Generate profile for each column with type inference"""
+        if df.columns.duplicated().any():
+            duplicates = df.columns[df.columns.duplicated()].tolist()
+            raise ValueError(
+                f"Duplicate column names found: {duplicates}. "
+                f"Please apply transformations to fix column names first."
+            )
+        
+        empty_cols = [col for col in df.columns if not str(col).strip()]
+        if empty_cols:
+            raise ValueError(
+                f"Empty column names found. Please rename these columns first."
+            )
+        
+        # ✅ Convert all to strings
+        df = df.copy()
+        df.columns = [str(col) for col in df.columns]
         profiles = {}
         
         for col in df.columns:
@@ -863,12 +1408,17 @@ class ProfileGenerator:
             total = len(series)
             
             # Sample values
-            samples = series.dropna().head(max_samples).tolist()
-            raw_samples = series.dropna().astype(str).head(max_samples).tolist()
-            
+            try:
+                samples = series.dropna().head(max_samples).tolist()
+                raw_samples = series.dropna().astype(str).head(max_samples).tolist()
+            except:
+                logger.info(f'DF: {df}')
             # Type inference
             inferred_type, metadata = TypeInferenceEngine.infer_type(series)
-            
+
+            # Detect data issues
+            data_issues = TypeInferenceEngine.detect_data_issues(series)
+
             profile = ColumnProfile(
                 name=str(col),
                 pandas_dtype=str(series.dtype),
@@ -880,7 +1430,8 @@ class ProfileGenerator:
                 sample_values=samples,
                 sample_raw_values=raw_samples,
                 has_thousand_separator=metadata.get('thousand_separator') is not None,
-                decimal_separator=metadata.get('decimal_separator')
+                decimal_separator=metadata.get('decimal_separator'),
+                data_issues=data_issues
             )
             profiles[str(col)] = profile
         
@@ -894,19 +1445,154 @@ class ProfileGenerator:
 
 class SchemaGenerator:
     """Generate semantic schema using LLM with type awareness"""
-    
+
     def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
         self.client = OpenAI(api_key=api_key)
         self.model = model
-    
-    def generate_schema(
-        self, 
+
+    def generate_clarification_questions(
+        self,
         profiles: Dict[str, ColumnProfile],
-        sample_rows: List[Dict[str, Any]]
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None
+    ) -> List[Question]:
+        """
+        Analyze data and generate clarification questions before schema generation.
+
+        Examples: unit of measurement, data format, constraints, relationships, etc.
+        """
+        prompt = self._build_clarification_prompt(profiles, sample_rows, question_set)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_clarification_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+            questions = [Question(**q) for q in result.get("questions", [])]
+
+            logger.info(f"✓ Generated {len(questions)} clarification questions")
+            return questions
+
+        except Exception as e:
+            raise RuntimeError(f"Clarification question generation failed: {str(e)}")
+
+    def _build_clarification_prompt(
+        self,
+        profiles: Dict[str, ColumnProfile],
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None
+    ) -> str:
+        """Build prompt for clarification questions"""
+
+        profiles_json = {col: prof.to_dict() for col, prof in profiles.items()}
+
+        user_context = ""
+        if question_set and (question_set.user_questions or question_set.output_fields):
+            user_context = f"""
+
+**User's Expected Usage:**
+- Questions: {json.dumps([q.question for q in question_set.user_questions], indent=2)}
+- Output Fields: {json.dumps([f.field_name for f in question_set.output_fields], indent=2)}
+- Notes: {question_set.additional_notes}
+"""
+#         return f"""
+# **Response Format:**
+# {{
+#   "questions": [
+#     {{
+#       "id": "salary_unit",
+#       "question": "What is the currency unit for the 'Salary' column?",
+#       "suggested_answer": "VND",
+#       "target": "Salary.unit",
+#       "question_type": "semantic"
+#     }},
+#     {{
+#       "id": "area_unit",
+#       "question": "What is the unit of measurement for 'Area'?",
+#       "suggested_answer": "m2",
+#       "target": "Area.unit",
+#       "question_type": "semantic"
+#     }}
+#   ]
+# }}
+# Return all NONE and just 1 question
+# """
+        return f"""Analyze this data and generate clarification questions to better understand the schema.{user_context}
+
+**Column Profiles:**
+```json
+{json.dumps(profiles_json, indent=2, default=str)}
+```
+
+**Sample Rows:**
+```json
+{json.dumps(sample_rows[:5], indent=2, default=str)}
+```
+
+Generate clarification questions about:
+1. **Units**: For numeric columns (price, area, salary, etc.) - what is the unit? (VND, USD, m², etc.)
+2. **Format**: For date/text columns - what format is expected?
+3. **Constraints**: Any min/max values, allowed ranges?
+4. **Relationships**: Foreign keys, categorical hierarchies?
+5. **Business Context**: What does this column represent in business terms?
+
+Focus on questions that will help generate an accurate, useful schema.
+
+**Response Format:**
+{{
+  "questions": [
+    {{
+      "id": "salary_unit",
+      "question": "What is the currency unit for the 'Salary' column?",
+      "suggested_answer": "VND",
+      "target": "Salary.unit",
+      "question_type": "semantic"
+    }},
+    {{
+      "id": "area_unit",
+      "question": "What is the unit of measurement for 'Area'?",
+      "suggested_answer": "m2",
+      "target": "Area.unit",
+      "question_type": "semantic"
+    }}
+  ]
+}}
+
+Generate necessary clarification questions to has a deep understand about schema.
+"""
+
+    def _get_clarification_system_prompt(self) -> str:
+        """System prompt for clarification questions"""
+        return """You are a data analyst expert who asks clarifying questions about data schemas.
+
+Your job is to analyze column profiles and sample data, then ask questions that will help:
+1. Understand units of measurement for numeric columns
+2. Clarify date/time formats
+3. Identify constraints and validation rules
+4. Understand business context and relationships
+
+Ask specific, actionable questions. Each question should help define a specific schema attribute.
+Be concise but thorough. Prioritize questions that impact data interpretation.
+
+Always respond in valid JSON format."""
+
+    def generate_schema(
+        self,
+        profiles: Dict[str, ColumnProfile],
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None,
+        clarification_answers: Optional[List[Answer]] = None
     ) -> Tuple[Dict[str, ColumnSchema], List[Question]]:
-        """Generate schema with semantic types"""
-        
-        prompt = self._build_schema_prompt(profiles, sample_rows)
+        """Generate schema with semantic types, guided by user questions and clarification answers"""
+
+        prompt = self._build_schema_prompt(profiles, sample_rows, question_set, clarification_answers)
         
         try:
             response = self.client.chat.completions.create(
@@ -920,13 +1606,28 @@ class SchemaGenerator:
             )
             
             result = json.loads(response.choices[0].message.content)
-            
+
+            # Create case-insensitive mapping for column names
+            profile_mapping = {col.lower(): col for col in profiles.keys()}
+
             schema = {}
             for col, spec in result["schema"].items():
-                # Add original_type from profile
-                original_type = profiles[col].pandas_dtype
-                spec['original_type'] = original_type
-                schema[col] = ColumnSchema(**spec)
+                # Try to find matching column in profiles (case-insensitive)
+                col_lower = col.lower()
+                original_col = profile_mapping.get(col_lower, col)
+
+                # Add original_type from profile if found
+                if original_col in profiles:
+                    original_type = profiles[original_col].pandas_dtype
+                    spec['original_type'] = original_type
+                else:
+                    # Fallback: try to find best match or use 'object' as default
+                    logger.warning(f"Column '{col}' not found in profiles, using default 'object' type")
+                    spec['original_type'] = 'object'
+
+                # Use original column name from data
+                spec['name'] = original_col if original_col in profiles else col
+                schema[original_col if original_col in profiles else col] = ColumnSchema(**spec)
             
             questions = [Question(**q) for q in result.get("questions", [])]
             
@@ -937,12 +1638,14 @@ class SchemaGenerator:
             raise RuntimeError(f"Schema generation failed: {str(e)}")
     
     def _build_schema_prompt(
-        self, 
+        self,
         profiles: Dict[str, ColumnProfile],
-        sample_rows: List[Dict[str, Any]]
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None,
+        clarification_answers: Optional[List[Answer]] = None
     ) -> str:
-        """Build prompt with type inference info"""
-        
+        """Build prompt with type inference info, user questions, and clarification answers"""
+
         profiles_json = {}
         for col, prof in profiles.items():
             prof_dict = prof.to_dict()
@@ -950,8 +1653,39 @@ class SchemaGenerator:
             if prof.has_thousand_separator:
                 prof_dict['note'] = f"Has thousand separator (e.g., {prof.sample_raw_values[0]!r}), should be {prof.inferred_type}"
             profiles_json[col] = prof_dict
-        
-        return f"""Analyze column profiles and generate semantic schema.
+
+        # Build clarification answers context
+        clarification_context = ""
+        if clarification_answers:
+            clarification_context = "\n\n**Clarification Answers:**\n"
+            for answer in clarification_answers:
+                clarification_context += f"- {answer.question_id}: {answer.answer}\n"
+
+        # Build user questions context if provided
+        user_context = ""
+        if question_set and (question_set.user_questions or question_set.output_fields):
+            user_context = f"""
+
+**IMPORTANT: User's Expected Usage**
+
+The user has specified how they intend to use this data:
+
+**Questions the user will ask:**
+{json.dumps([q.to_dict() for q in question_set.user_questions], indent=2)}
+
+**Expected output fields needed:**
+{json.dumps([f.to_dict() for f in question_set.output_fields], indent=2)}
+
+**Additional notes:**
+{question_set.additional_notes}
+
+Please ensure the schema you generate has enough semantic information to:
+1. Answer the user's questions accurately
+2. Map to the expected output fields
+3. Provide clear descriptions that help answer these questions
+"""
+
+        return f"""Analyze column profiles and generate semantic schema.{user_context}{clarification_context}
 
 **Column Profiles (with type inference):**
 ```json
@@ -1009,251 +1743,725 @@ it means the data has formatting (like 500.000) and should be treated as int aft
 Always respond in valid JSON."""
 
 
-# ============================================================================
-# Agent Q&A System
-# ============================================================================
+class SchemaValidator:
+    """Validate if schema can answer user questions and suggest refinements"""
+
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+
+    def validate_schema_for_questions(
+        self,
+        schema: Dict[str, ColumnSchema],
+        profiles: Dict[str, ColumnProfile],
+        question_set: QuestionSet,
+        sample_rows: List[Dict[str, Any]]
+    ) -> Tuple[bool, List[Question], str]:
+        """
+        Validate if current schema can answer user questions.
+
+        Returns:
+            - is_sufficient: Whether schema is sufficient
+            - additional_questions: Questions to ask if schema is insufficient
+            - validation_report: Detailed report of the validation
+        """
+        prompt = self._build_validation_prompt(schema, profiles, question_set, sample_rows)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_validation_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+
+            is_sufficient = result.get("is_sufficient", False)
+            additional_questions = [Question(**q) for q in result.get("additional_questions", [])]
+            validation_report = result.get("validation_report", "")
+
+            logger.info(f"✓ Schema validation: {'Sufficient' if is_sufficient else 'Needs refinement'}")
+            if not is_sufficient:
+                logger.info(f"  Additional questions needed: {len(additional_questions)}")
+
+            return is_sufficient, additional_questions, validation_report
+
+        except Exception as e:
+            raise RuntimeError(f"Schema validation failed: {str(e)}")
+
+    def _build_validation_prompt(
+        self,
+        schema: Dict[str, ColumnSchema],
+        profiles: Dict[str, ColumnProfile],
+        question_set: QuestionSet,
+        sample_rows: List[Dict[str, Any]]
+    ) -> str:
+        """Build validation prompt with robust serialization"""
+        
+        schema_json = {k: v.to_dict() for k, v in schema.items()} if schema else {}
+        
+        questions_json = []
+        if question_set and question_set.user_questions:
+            questions_json = [q.to_dict() for q in question_set.user_questions]
+        fields_json = []
+        if question_set and question_set.output_fields:
+            fields_json = [f.to_dict() for f in question_set.output_fields]
+            
+        # Lấy Notes
+        additional_json = "No additional notes."
+        if question_set and question_set.additional_notes:
+            additional_json = question_set.additional_notes
+            
+        logger.info(f'Sending Validation Prompt with Notes: {additional_json}')
+
+        return f"""Validate if the current schema can adequately answer the user's questions.
+
+    **🚨 EXISTING BUSINESS LOGIC & NOTES (CHECK HERE FIRST):**
+    ```text
+    {additional_json}
+    ```
+    *(If the answer to a question is found above, DO NOT ask for it again. Mark as sufficient.)*
+
+    **User Questions:**
+    {json.dumps(questions_json, indent=2)}
+
+    **Expected Output Fields:**
+    {json.dumps(fields_json, indent=2)}
+
+    **Current Schema:**
+    {json.dumps(schema_json, indent=2, default=str)}
+
+    **Sample Data:**
+    {json.dumps(sample_rows[:5] if sample_rows else [], indent=2, default=str)}
+
+    **Instructions:**
+    1. Check if "Existing Business Logic" answers the User Questions.
+    2. If a user asks for a field (e.g., "Net Worth") that is NOT in schema BUT is in Business Logic -> It is SUFFICIENT.
+    3. Only if truly missing:
+       - Ask for the FORMULA or LOGIC.
+       - Set target as "Global.logic" or "ColumnName.calculation".
+
+    **Response Format:**
+    {{
+    "is_sufficient": false,
+    "validation_report": "Missing 'Net Worth' column.",
+    "additional_questions": [
+        {{
+        "id": "missing_net_worth",
+        "question": "The dataset has 'rawsalary' but no 'Net Worth'. How should Net Worth be calculated?",
+        "suggested_answer": "Net Worth = rawsalary - 10%",
+        "target": "Global.calculation",
+        "question_type": "semantic"
+        }}
+    ]
+    }}
+    """
+
+    def _get_validation_system_prompt(self) -> str:
+        """System prompt for validation"""
+        return """You are an expert data schema validator.
+
+Your task is to determine if a data schema is sufficient to answer specific user questions.
+
+🚨 **CRITICAL RULE - READ THIS FIRST**:
+You MUST check the "Additional Notes / Business Logic" section provided in the context.
+1. **IF A QUESTION IS ALREADY ANSWERED IN "ADDITIONAL NOTES":**
+   - You must consider the schema **SUFFICIENT** for that question.
+   - Do **NOT** generate a new clarification question for it.
+   - Assume the user knows how to calculate it based on the note.
+
+2. **IF A COLUMN IS MISSING BUT A FORMULA IS IN "ADDITIONAL NOTES":**
+   - This counts as SUFFICIENT. Do not ask for the formula again.
+
+Analyze:
+1. Can each user question be answered with the current schema OR the provided Business Logic/Notes?
+2. Are the expected output fields mappable to schema columns OR calculate-able via Notes?
+3. Only generate new questions for information that is **completely missing** from BOTH the Schema AND the Additional Notes.
+
+Be thorough but practical. STOP asking about things that are already defined in the Notes.
+
+Always respond in valid JSON format."""
 
 class DataSchemaAgent:
-    """Enhanced Agent with SQL query capability"""
-    
+    """
+    Data Schema Agent following OpenAI Agent standard
+
+    Features:
+    - Streaming query interface (Generator pattern)
+    - SQL query execution with dynamic schema
+    - Helper methods: get_sample_rows, get_distinct_values, execute_query
+    - Can be instantiated and used from any code
+    - Fully flexible - adapts to any schema
+    """
+
+    DEFAULT_MODEL = "gpt-4o-mini"
+
     def __init__(
-        self, 
+        self,
         session: 'Session',
-        api_key: str, 
-        model: str = "gpt-4o-mini",
-        df_cleaned: Optional[pd.DataFrame] = None
+        api_key: str,
+        model: str = None,
+        df_cleaned: Optional[pd.DataFrame] = None,
+        sql_tool: Optional['SQLQueryTool'] = None,
+        system_prompt: str = None
     ):
+        """
+        Initialize Data Schema Agent
+
+        Args:
+            session: Session with schema info
+            api_key: OpenAI API key
+            model: Model to use (default: gpt-4o-mini)
+            df_cleaned: Cleaned DataFrame (optional)
+            sql_tool: SQL query tool (optional, will create if df_cleaned provided)
+            system_prompt: Custom system prompt (optional)
+        """
         self.session = session
         self.df_cleaned = df_cleaned
         self.client = OpenAI(api_key=api_key)
-        self.model = model
-        self.sql_tool = None
-        
-        # Create SQL database if cleaned data provided
-        if df_cleaned is not None:
+        self.model = model or self.DEFAULT_MODEL
+        self.sql_tool = sql_tool
+
+        # System prompt
+        self.system_prompt = system_prompt or self._default_system_prompt()
+
+        # Create SQL database if cleaned data provided and no sql_tool
+        if df_cleaned is not None and sql_tool is None:
             db_dir = Path("./agent_databases")
             db_dir.mkdir(exist_ok=True)
-            
+
             self.db_path = db_dir / f"data_{session.session_id}.db"
             self.sql_tool = SQLQueryTool(str(self.db_path), df_cleaned)
             logger.info("✓ Agent initialized with SQL capability")
-    
-    def enable_sql(self, df_cleaned: pd.DataFrame):
-        """Enable SQL capability with cleaned DataFrame"""
-        if self.sql_tool is None:
-            db_dir = Path("./agent_databases")
-            db_dir.mkdir(exist_ok=True)
-            
-            self.db_path = db_dir / f"data_{self.session.session_id}.db"
-            self.sql_tool = SQLQueryTool(str(self.db_path), df_cleaned)
-            self.df_cleaned = df_cleaned
-            logger.info("✓ SQL capability enabled for agent")
-    
-    def chat(self, user_message: str) -> str:
-        """Chat with agent - can execute SQL if enabled"""
+
+        logger.info(f"DataSchemaAgent initialized with model: {self.model}")
+
+    def _default_system_prompt(self) -> str:
+        """Default system prompt for data schema agent with scenarios support"""
+        base_prompt = """You are an intelligent data analyst assistant with SQL query capabilities.
+
+🚨 **CRITICAL: SCENARIO-FIRST APPROACH** 🚨
+When answering user questions, you MUST follow this priority order:
+
+1. **CHECK FOR SCENARIO MATCH FIRST** (HIGHEST PRIORITY)
+   - Look at the user's question
+   - Check if it matches any defined scenario pattern in the scenarios section below
+   - If YES: Follow that scenario's output template EXACTLY
+   - Use SQL to get data values, then format according to the template
+   
+2. **FREE-FORM QUERY** (Only if no scenario matches)
+   - Use SQL queries to analyze data
+   - Provide insights and recommendations
+
+**Your Capabilities:**
+- Understand and explain data schemas
+- Execute SQL queries to analyze data
+- Follow predefined output templates for common questions
+- Provide insights and recommendations
+
+**SQL Guidelines:**
+- You can only execute SELECT queries (no INSERT, UPDATE, DELETE)
+- Table name: 'data'
+- Use column names exactly as shown in the schema
+- Use LIMIT for previews (e.g., LIMIT 10)
+- Use aggregations: COUNT(), SUM(), AVG(), MIN(), MAX()
+- Use GROUP BY for category analysis
+- Use WHERE for filtering
+- Use ORDER BY for sorting
+
+**Query Examples:**
+- Preview data: `SELECT * FROM data LIMIT 5`
+- Calculate average: `SELECT AVG(price) FROM data WHERE category='A'`
+- Count by category: `SELECT category, COUNT(*) as count FROM data GROUP BY category ORDER BY count DESC`
+- Find top records: `SELECT * FROM data ORDER BY price DESC LIMIT 10`
+
+**Response Guidelines:**
+- Always explain your reasoning
+- Use specific numbers and facts from query results
+- Provide actionable insights
+- Be concise and helpful
+
+When you need to query data, use the execute_sql_query tool."""
+
+        # Add scenarios instruction if available
+        scenarios_instruction = self._format_scenarios_for_prompt()
+        if scenarios_instruction:
+            base_prompt = f"""{base_prompt}
+
+{scenarios_instruction}
+
+🔴 REMEMBER: Always check for scenario matches FIRST before doing free-form analysis!"""
         
-        context = self._build_context()
-        
-        self.session.agent_conversations.append(AgentMessage(
-            role="user",
-            content=user_message,
-            timestamp=datetime.now().isoformat()
-        ))
-        
-        messages = [
-            {"role": "system", "content": self._get_system_prompt()},
-            {"role": "user", "content": f"**Context:**\n{context}\n\n**Question:**\n{user_message}"}
-        ]
-        
-        # Add history
-        for msg in self.session.agent_conversations[-11:-1]:
-            messages.append({"role": msg.role, "content": msg.content})
-        
+        return base_prompt
+
+
+    def query(
+        self,
+        question: str,
+        conversation_history: List[Dict[str, Any]] = None,
+        model: str = None
+    ) -> Generator[str, None, Dict[str, Any]]:
+        """
+        Query with streaming response
+
+        Args:
+            question: User question
+            conversation_history: Previous conversation (optional)
+            model: Model to override default (optional)
+
+        Yields:
+            Response text chunks
+
+        Returns:
+            Metadata dict with usage info
+        """
+        import time
+        start_time = time.time()
+
         try:
-            # Call with tools if SQL enabled
-            if self.sql_tool:
+            # Build context
+            context = self._build_context()
+
+            # Build messages
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": f"**Context:**\n{context}\n\n**Question:**\n{question}"}
+            ]
+
+            # Add conversation history if provided
+            if conversation_history:
+                for msg in conversation_history[-10:]:  # Last 10 messages
+                    messages.append(msg)
+
+            # Determine if SQL tools should be available
+            tools = self._get_tools() if self.sql_tool else None
+
+            # Call OpenAI
+            use_model = model or self.model
+
+            if tools:
+                # With SQL capability - use tools
                 response = self.client.chat.completions.create(
-                    model=self.model,
+                    model=use_model,
                     messages=messages,
-                    tools=self._get_tools(),
+                    tools=tools,
                     tool_choice="auto",
                     temperature=0.7,
                     max_tokens=1000
                 )
-                
+
                 assistant_msg = response.choices[0].message
-                
+
+                # Handle tool calls
                 if assistant_msg.tool_calls:
-                    assistant_response = self._handle_tool_calls(assistant_msg, user_message)
+                    # Execute tools and get results
+                    tool_results = self._handle_tool_calls(assistant_msg, question)
+
+                    # Stream tool results
+                    for char in tool_results:
+                        yield char
+
+                    final_text = tool_results
                 else:
-                    assistant_response = assistant_msg.content
+                    # No tools called, stream response
+                    final_text = assistant_msg.content or ""
+                    for char in final_text:
+                        yield char
+
+                # Calculate usage
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                }
             else:
-                # No SQL - text only
+                # Without SQL - simple streaming response
                 response = self.client.chat.completions.create(
-                    model=self.model,
+                    model=use_model,
                     messages=messages,
                     temperature=0.7,
-                    max_tokens=500
+                    max_tokens=500,
+                    stream=True
                 )
-                assistant_response = response.choices[0].message.content
-            
-            self.session.agent_conversations.append(AgentMessage(
-                role="assistant",
-                content=assistant_response,
-                timestamp=datetime.now().isoformat(),
-                context={"used_sql": bool(self.sql_tool and assistant_msg.tool_calls if self.sql_tool else False)}
-            ))
-            
-            return assistant_response
-            
+
+                final_text = ""
+                for chunk in response:
+                    if chunk.choices[0].delta.content:
+                        text = chunk.choices[0].delta.content
+                        final_text += text
+                        yield text
+
+                usage = {"estimated_tokens": len(final_text) // 4}  # Rough estimate
+
+            # Record in conversation
+            if hasattr(self, 'session'):
+                self.session.agent_conversations.append(AgentMessage(
+                    role="user",
+                    content=question,
+                    timestamp=datetime.now().isoformat()
+                ))
+                self.session.agent_conversations.append(AgentMessage(
+                    role="assistant",
+                    content=final_text,
+                    timestamp=datetime.now().isoformat(),
+                    context={"used_sql": bool(tools)}
+                ))
+
+            # Return metadata
+            return {
+                "usage": usage,
+                "duration": time.time() - start_time,
+                "model": use_model,
+                "used_sql": bool(tools)
+            }
+
         except Exception as e:
-            error_msg = f"Sorry, error: {str(e)}"
-            self.session.agent_conversations.append(AgentMessage(
-                role="assistant",
-                content=error_msg,
-                timestamp=datetime.now().isoformat()
-            ))
-            return error_msg
-    
+            logger.error(f"Query failed: {str(e)}")
+            error_msg = f"\n\n⚠️ Error: {str(e)}"
+            yield error_msg
+
+            return {
+                "error": str(e),
+                "duration": time.time() - start_time,
+                "model": model or self.model
+            }
+
+    def chat(self, user_message: str) -> str:
+        """
+        Simple chat interface (non-streaming)
+
+        Args:
+            user_message: User message
+
+        Returns:
+            Assistant response text
+        """
+        result = []
+        metadata = None
+
+        for chunk in self.query(user_message):
+            if isinstance(chunk, dict):
+                metadata = chunk
+            else:
+                result.append(chunk)
+
+        return "".join(result)
+
     def _handle_tool_calls(self, assistant_message, original_question: str) -> str:
-        """Handle SQL query execution"""
+        """
+        Handle SQL query execution from tool calls
+
+        Args:
+            assistant_message: OpenAI assistant message with tool calls
+            original_question: Original user question
+
+        Returns:
+            Response text with query results and analysis
+        """
         responses = []
-        
+
         for tool_call in assistant_message.tool_calls:
             if tool_call.function.name == "execute_sql_query":
-                arguments = json.loads(tool_call.function.arguments)
-                query = arguments.get("query", "")
-                
-                logger.info(f"🔍 Executing SQL: {query}")
-                
-                result_df, error = self.sql_tool.execute_query(query)
-                
-                if error:
-                    responses.append(f"❌ {error}")
-                else:
-                    if len(result_df) == 0:
-                        responses.append("✅ Query OK but no results")
+                try:
+                    arguments = json.loads(tool_call.function.arguments)
+                    query = arguments.get("query", "")
+
+                    logger.info(f"🔍 Executing SQL: {query}")
+
+                    # Execute query
+                    result_df, error = self._execute_sql(query)
+
+                    if error:
+                        responses.append(f"❌ SQL Error: {error}")
+                        logger.warning(f"SQL execution failed: {error}")
                     else:
-                        display_df = result_df.head(10)
-                        result_text = f"✅ Results ({len(result_df)} rows):\n\n{display_df.to_string(index=False)}"
-                        if len(result_df) > 10:
-                            result_text += f"\n\n(Showing 10/{len(result_df)} rows)"
-                        responses.append(result_text)
-        
+                        if len(result_df) == 0:
+                            responses.append("✅ Query executed successfully but returned no results")
+                        else:
+                            # Format results
+                            display_df = result_df.head(10)
+                            result_text = f"✅ Query Results ({len(result_df)} rows returned):\n\n{display_df.to_string(index=False)}"
+                            if len(result_df) > 10:
+                                result_text += f"\n\n(Showing first 10 of {len(result_df)} rows)"
+                            responses.append(result_text)
+                            logger.info(f"SQL execution successful: {len(result_df)} rows")
+
+                except Exception as e:
+                    logger.error(f"Tool execution error: {str(e)}")
+                    responses.append(f"❌ Error executing query: {str(e)}")
+
+        # Combine all tool responses
         if responses:
             result_summary = "\n\n".join(responses)
-            
-            # Get interpretation
+            scenarios_instruction = self._format_scenarios_for_prompt()
             try:
                 interp_response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": "Interpret SQL results for the user."},
-                        {"role": "user", "content": f"Question: {original_question}\n\nResults:\n{result_summary}\n\nInterpret:"}
+                        {"role": "system", "content": "You are a data analyst. Interpret SQL query results and provide insights to answer the user's question."},
+                        {"role": "user", "content": f"**Original Question:** {original_question}\n\n**Query Results:**\n{result_summary}\n\n**Scenarios:**{scenarios_instruction}\n\nPlease interpret these results and answer the question:"}
                     ],
                     temperature=0.7,
                     max_tokens=500
                 )
                 interpretation = interp_response.choices[0].message.content
                 return f"{result_summary}\n\n**Analysis:**\n{interpretation}"
-            except:
+            except Exception as e:
+                logger.error(f"Interpretation error: {str(e)}")
                 return result_summary
-        
-        return "Query issue occurred."
-    
+
+        return "No results from query execution."
+
+    def _execute_sql(self, query: str) -> Tuple[pd.DataFrame, Optional[str]]:
+        """
+        Execute SQL query
+
+        Args:
+            query: SQL query string
+
+        Returns:
+            Tuple of (result DataFrame, error message)
+        """
+        if not self.sql_tool:
+            return pd.DataFrame(), "SQL capability not enabled"
+
+        try:
+            result_df, error = self.sql_tool.execute_query(query)
+            return result_df, error
+        except Exception as e:
+            logger.error(f"SQL execution failed: {str(e)}")
+            return pd.DataFrame(), str(e)
+
+    def _get_sample_rows(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Get sample rows from data
+
+        Args:
+            limit: Number of rows to return
+
+        Returns:
+            List of row dicts
+        """
+        if self.df_cleaned is None:
+            return []
+
+        try:
+            sample_df = self.df_cleaned.head(limit)
+            return sample_df.to_dict(orient='records')
+        except Exception as e:
+            logger.error(f"Failed to get sample rows: {str(e)}")
+            return []
+
+    def _get_distinct_values(self, column_name: str, limit: int = 50) -> List[Any]:
+        """
+        Get distinct values for a column
+
+        Args:
+            column_name: Column name
+            limit: Maximum number of values to return
+
+        Returns:
+            List of distinct values
+        """
+        if self.df_cleaned is None:
+            return []
+
+        try:
+            if column_name not in self.df_cleaned.columns:
+                logger.warning(f"Column '{column_name}' not found in data")
+                return []
+
+            distinct_values = self.df_cleaned[column_name].dropna().unique()[:limit]
+            return distinct_values.tolist()
+        except Exception as e:
+            logger.error(f"Failed to get distinct values: {str(e)}")
+            return []
+
+    def get_schema_info(self) -> Dict[str, Any]:
+        """
+        Get schema information
+
+        Returns:
+            Dict with schema information
+        """
+        schema_info = {
+            "table_name": "data",
+            "columns": [],
+            "row_count": 0
+        }
+
+        if self.session.schema:
+            for col_name, col_schema in self.session.schema.items():
+                schema_info["columns"].append({
+                    "name": col_name,
+                    "semantic_type": col_schema.semantic_type,
+                    "physical_type": col_schema.physical_type,
+                    "unit": col_schema.unit,
+                    "description": col_schema.description,
+                    "required": col_schema.is_required
+                })
+
+        if self.df_cleaned is not None:
+            schema_info["row_count"] = len(self.df_cleaned)
+
+        return schema_info
+
     def _get_tools(self) -> List[Dict[str, Any]]:
-        """Define SQL query tool"""
+        """
+        Define SQL query tool dynamically based on actual schema
+
+        Returns:
+            List of tool definitions for OpenAI function calling
+        """
         if not self.sql_tool:
             return []
-        
-        schema_info = self.sql_tool.get_schema_info()
-        cols_desc = ", ".join([f"{c['name']} ({c['type']})" for c in schema_info['columns']])
-        
+
+        # Get schema info
+        schema_info = self.get_schema_info()
+
+        # Build column descriptions from session schema
+        column_descriptions = []
+        if self.session.schema:
+            for col_name, col_schema in list(self.session.schema.items())[:20]:
+                desc = f"{col_name} ({col_schema.semantic_type}, {col_schema.physical_type})"
+                if col_schema.unit:
+                    desc += f" - Unit: {col_schema.unit}"
+                if col_schema.description:
+                    desc += f" - {col_schema.description}"
+                column_descriptions.append(desc)
+
+        columns_desc = "\n".join(column_descriptions) if column_descriptions else "Use PRAGMA table_info(data) to see columns"
+
         return [{
             "type": "function",
             "function": {
                 "name": "execute_sql_query",
-                "description": f"Execute SQL SELECT on table '{schema_info['table_name']}'. Columns: {cols_desc}. Rows: {schema_info['row_count']}. Use for analysis, aggregation, filtering.",
+                "description": f"""Execute SQL SELECT query on the data table.
+
+**Table:** {schema_info['table_name']}
+**Rows:** {schema_info['row_count']}
+
+**Available Columns:**
+{columns_desc}
+
+Use this tool to:
+- Analyze data (aggregations, statistics)
+- Filter and search records
+- Count, sum, average values
+- Group by categories
+- Find top/bottom records
+
+Only SELECT queries are allowed.""",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "SQL SELECT query. Examples: 'SELECT * FROM data LIMIT 5', 'SELECT AVG(price) FROM data', 'SELECT category, COUNT(*) FROM data GROUP BY category'"
+                            "description": "SQL SELECT query. Use standard SQL syntax. Examples: 'SELECT * FROM data LIMIT 5', 'SELECT AVG(column) FROM data', 'SELECT category, COUNT(*) FROM data GROUP BY category'"
                         }
                     },
                     "required": ["query"]
                 }
             }
         }]
-    
+    def _format_scenarios_for_prompt(self) -> str:
+        """
+        Format scenarios into instructions for the LLM.
+        Handles pattern matching and variable templating instructions.
+        """
+        if not self.session.scenarios:
+            return ""
+
+        prompt_parts = ["**🎯 DEFINED SCENARIOS & OUTPUT PATTERNS:**"]
+        prompt_parts.append("You MUST follow these patterns when the user's question matches the intent of a scenario.")
+        prompt_parts.append("IMPORTANT: These scenarios are EXAMPLES. Apply the same logic/formulas to ANY entity (e.g., if defined for Employee A, apply to Employee B).")
+
+        for idx, sc in enumerate(self.session.scenarios):
+            output_desc = sc.output_format.get("description", "") if sc.output_format else ""
+            
+            scenario_text = f"""
+    [Scenario {idx+1}: {sc.name}]
+    - Intent/Trigger: Questions like {json.dumps(sc.questions)}
+    - Relevant Fields: {', '.join(sc.selected_fields)}
+    - Output Template: "{output_desc}"
+    """
+            prompt_parts.append(scenario_text)
+
+        prompt_parts.append("""
+    **Instructions for Scenarios:**
+    1. **Pattern Matching**: If the user asks about a different person/item than in the scenario example, use the SAME formula and format.
+    2. **Placeholders**: When you see syntax like `{data.ColumnName}` in the Output Template:
+       - First, execute SQL to get the value of 'ColumnName' for the requested entity.
+       - Then, REPLACE `{data.ColumnName}` with the actual value in the response.
+    3. **Calculations**: If the template implies a calculation (e.g., "Salary * 0.9"), perform the calculation using the SQL values.
+    """)
+        
+        return "\n".join(prompt_parts)
+
     def _build_context(self) -> str:
-        """Build context"""
+        """Build context including Business Logic/Notes and Scenarios"""
         parts = []
-        
+
+        # 1. Data Source Info
         if self.session.sources:
-            parts.append(f"**Dataset:** {self.session.sources[0].source_id}")
-        
-        if self.df_cleaned is not None:
-            parts.append(f"**Shape:** {self.df_cleaned.shape[0]} rows × {self.df_cleaned.shape[1]} cols")
-        
+            parts.append(f"**Data Source:** {self.session.sources[0].file_path}")
+
+        # 2. Schema Summary
         if self.session.schema:
-            schema_lines = [
-                f"- **{col}**: {s.semantic_type} ({s.physical_type})" + 
-                (f", {s.unit}" if s.unit else "")
-                for col, s in list(self.session.schema.items())[:10]
-            ]
-            parts.append("**Schema:**\n" + "\n".join(schema_lines))
-        
-        if self.sql_tool:
-            info = self.sql_tool.get_schema_info()
-            parts.append(f"**SQL DB:** Table '{info['table_name']}' ({info['row_count']} rows)")
-        
+            schema_lines = []
+            for col, col_schema in list(self.session.schema.items())[:30]: # Limit to avoid context overflow
+                line = f"- {col}: {col_schema.semantic_type} ({col_schema.physical_type})"
+                if col_schema.description:
+                    line += f" | Desc: {col_schema.description}"
+                schema_lines.append(line)
+            
+            parts.append("**Schema Structure:**\n" + "\n".join(schema_lines))
+
+        # 3. Business Rules (General)
+        if self.session.question_set and self.session.question_set.additional_notes:
+            parts.append(f"**⚠️ GLOBAL BUSINESS RULES:**\n{self.session.question_set.additional_notes}")
+
+        # 4. SCENARIOS (New Section)
+        scenario_context = self._format_scenarios_for_prompt()
+        if scenario_context:
+            parts.append(scenario_context)
+
         return "\n\n".join(parts)
     
-    def _get_system_prompt(self) -> str:
-        """System prompt"""
-        if self.sql_tool:
-            return """You are a data analyst with SQL access.
+    def enable_sql(self, df_cleaned: pd.DataFrame, sql_tool: Optional['SQLQueryTool'] = None):
+        """
+        Enable SQL capability
 
-You can:
-- Answer questions about the schema
-- Execute SQL queries to analyze data
-- Provide insights and recommendations
+        Args:
+            df_cleaned: Cleaned DataFrame
+            sql_tool: Optional SQL tool to use (will create if not provided)
+        """
+        if sql_tool:
+            self.sql_tool = sql_tool
+            self.df_cleaned = df_cleaned
+            logger.info("✓ SQL capability enabled with provided tool")
+        elif self.sql_tool is None:
+            db_dir = Path("./agent_databases")
+            db_dir.mkdir(exist_ok=True)
 
-SQL Guidelines:
-- Only SELECT queries
-- Table name: 'data'
-- Use LIMIT for previews
-- Use aggregations: COUNT, SUM, AVG, etc.
-- Use GROUP BY for categories
-- Use WHERE for filtering
+            self.db_path = db_dir / f"data_{self.session.session_id}.db"
+            self.sql_tool = SQLQueryTool(str(self.db_path), df_cleaned)
+            self.df_cleaned = df_cleaned
+            logger.info("✓ SQL capability enabled for agent")
 
-Examples:
-- "SELECT * FROM data LIMIT 5"
-- "SELECT AVG(price) FROM data WHERE category='A'"
-- "SELECT district, COUNT(*) as count FROM data GROUP BY district ORDER BY count DESC"
-
-Always explain findings clearly."""
-        else:
-            return """You are a data schema assistant.
-
-Help users understand their data schema:
-- Explain column meanings
-- Suggest analyses
-- Recommend improvements
-
-Be concise and helpful."""
-    
     def close(self):
-        """Close database"""
+        """Close database connection"""
         if self.sql_tool:
-            self.sql_tool.close()
+            try:
+                self.sql_tool.close()
+                logger.info("SQL tool closed")
+            except Exception as e:
+                logger.error(f"Error closing SQL tool: {str(e)}")
 
-
-# ============================================================================
-# Refinement Engine (Enhanced)
-# ============================================================================
 
 class RefinementEngine:
     """Handle schema refinement based on user answers"""
@@ -1261,56 +2469,63 @@ class RefinementEngine:
     def __init__(self, session: 'Session'):
         self.session = session
     
+
     def apply_answer(self, answer: Answer) -> bool:
-        """Apply user answer to schema"""
+        """Apply user answer to schema with fallback for general notes"""
         try:
-            question = next(q for q in self.session.questions if q.id == answer.question_id)
+            question = next((q for q in self.session.questions if q.id == answer.question_id), None)
+            if not question:
+                return False
             
             parts = question.target.split(".")
-            if len(parts) != 2:
-                logger.warning(f"Invalid target: {question.target}")
-                return False
+            target_col = parts[0]
             
-            col_name, field = parts
+            if target_col.lower() == "global" or target_col not in self.session.schema:
+                if self.session.question_set:
+                    timestamp = datetime.now().strftime("%H:%M")
+
+                    new_logic = f"\n- [Business Logic] {question.question} -> Rule: {answer.answer}"
+                    self.session.question_set.additional_notes += new_logic
+                    
+                    logger.info(f"✓ Added business logic: {answer.answer}")
+                    answer.applied = True
+                    return True
             
-            if col_name not in self.session.schema:
-                logger.warning(f"Column not found: {col_name}")
-                return False
-            
-            schema_col = self.session.schema[col_name]
-            
-            if field == "unit":
-                schema_col.unit = answer.answer
-            elif field == "description":
-                schema_col.description = answer.answer
-            elif field == "semantic_type":
-                schema_col.semantic_type = answer.answer
-            elif field == "physical_type":
-                schema_col.physical_type = answer.answer
-            elif field == "is_required":
-                schema_col.is_required = answer.answer.lower() in ('true', 'yes', '1')
-            else:
-                logger.warning(f"Unknown field: {field}")
-                return False
-            
-            answer.applied = True
-            
-            self.session.history.append(HistoryEntry(
-                timestamp=datetime.now().isoformat(),
-                action="question_answered",
-                details={
-                    "question_id": answer.question_id,
-                    "question": question.question,
-                    "answer": answer.answer,
-                    "target": question.target
-                },
-                schema_version=self.session.schema_version
-            ))
-            
-            self.session.schema_version += 1
-            
-            logger.info(f"✓ Applied answer to {question.target}: {answer.answer}")
-            return True
+            if target_col in self.session.schema:
+                schema_col = self.session.schema[target_col]
+                field = parts[1] if len(parts) > 1 else "description"
+                
+                if field == "unit":
+                    schema_col.unit = answer.answer
+                elif field in ["description", "calculation", "formula"]:
+                    # Nếu là calculation, cộng dồn vào description
+                    schema_col.description += f" | Calculation: {answer.answer}"
+                elif field == "semantic_type":
+                    schema_col.semantic_type = answer.answer
+                elif field == "physical_type":
+                    schema_col.physical_type = answer.answer
+                elif field == "is_required":
+                    schema_col.is_required = answer.answer.lower() in ('true', 'yes', '1')
+                else:
+                    # Fallback cho trường hợp field lạ cũng đưa vào description
+                    schema_col.description += f" ({field}: {answer.answer})"
+                
+                answer.applied = True
+                
+                # Update history... (giữ nguyên code cũ)
+                self.session.history.append(HistoryEntry(
+                    timestamp=datetime.now().isoformat(),
+                    action="question_answered",
+                    details={
+                        "question_id": answer.question_id,
+                        "answer": answer.answer,
+                        "target": question.target
+                    },
+                    schema_version=self.session.schema_version
+                ))
+                
+                self.session.schema_version += 1
+                return True
             
         except Exception as e:
             logger.error(f"Failed to apply answer: {str(e)}")
@@ -1373,8 +2588,29 @@ class SessionManager:
         timestamp = datetime.now().isoformat()
         
         checkpoint_file = self.checkpoints_dir / f"{checkpoint_id}.parquet"
-        df.to_parquet(checkpoint_file, index=False)
-        
+
+        df_save = df.copy()
+        df_save.columns = df_save.columns.astype(str)
+        if not df_save.columns.is_unique:
+            new_columns = []
+            seen = {}
+            for col in df_save.columns:
+                if col in seen:
+                    seen[col] += 1
+                    new_columns.append(f"{col}.{seen[col]}")
+                else:
+                    seen[col] = 0
+                    new_columns.append(col)
+            df_save.columns = new_columns
+        for col in df_save.columns:
+            if df_save[col].dtype == 'object':
+                df_save[col] = df_save[col].astype(str)
+        try:
+            df.to_parquet(checkpoint_file, index=False)
+        except Exception as e:
+            logger.warning(f"Parquet save failed: {e}. Falling back to CSV")
+            checkpoint_file = self.checkpoints_dir / f"{checkpoint_id}.csv"
+            df.to_csv(checkpoint_file,index=False)
         checkpoint = DataFrameCheckpoint(
             checkpoint_id=checkpoint_id,
             stage=stage,
@@ -1393,8 +2629,14 @@ class SessionManager:
         """Load DataFrame from checkpoint"""
         if not checkpoint.file_path:
             raise ValueError("No file path")
+        path = Path(checkpoint.file_path)
         
-        df = pd.read_parquet(checkpoint.file_path)
+        if path.suffix == '.parquet':
+            df = pd.read_parquet(path)
+        elif path.suffix == '.csv':
+            df = pd.read_csv(path)
+        else:
+            raise ValueError(f"Unsupported checkpoint format: {path.suffix}")
         logger.info(f"✓ Loaded: {checkpoint.stage}")
         return df
     
@@ -1474,7 +2716,6 @@ class CLI:
             session, df_raw, "raw", f"Raw: {source.source_id}"
         )
         
-        # Structure analysis
         logger.info("\nAnalyzing structure...")
         analyzer = StructureAnalyzer(api_key=self.args.api_key, model=self.args.model)
         
@@ -1486,7 +2727,6 @@ class CLI:
         df_clean = df_raw.copy()
         applied_trans = []
         
-        # Handle transformations
         if transformations and not self.args.skip_interactive:
             df_clean, applied_trans = self._handle_transformations(df_clean, transformations, session)
         elif transformations and self.args.auto_transform:
