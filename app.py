@@ -8,9 +8,10 @@ from typing import List, Dict, Any, Optional
 import plotly.express as px
 import plotly.graph_objects as go
 import sqlite3
+import logging
 
 # Import from pipeline
-from schema_pipeline import (
+from hst_agent import (
     DataIngestor, StructureAnalyzer, ProfileGenerator, SchemaGenerator,
     SessionManager, RefinementEngine, DataSource, Session, Transformation,
     Question, Answer, ColumnProfile, ColumnSchema, DataFrameCheckpoint,
@@ -18,9 +19,11 @@ from schema_pipeline import (
     UserQuestion, OutputField, QuestionSet, SchemaValidator, Scenario
 )
 
+logging.basicConfig(level=os.getenv("LOGLEVEL","INFO").upper())
+logger = logging.getLogger(__name__)
 # Page config
 st.set_page_config(
-    page_title="Data Schema Pipeline V4",
+    page_title="Text2SQL Agent",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -226,7 +229,7 @@ def tab_ingestion():
                 "Columns": len(df.columns) if df is not None else 0
             })
         
-        safe_display_dataframe(pd.DataFrame(source_data), use_container_width=True)
+        safe_display_dataframe(pd.DataFrame(source_data), width='stretch')
         
         # Preview
         st.subheader("👁️ Data Preview")
@@ -237,7 +240,7 @@ def tab_ingestion():
         
         if selected_source and selected_source in st.session_state.raw_dfs:
             df = st.session_state.raw_dfs[selected_source]
-            safe_display_dataframe(df.head(20), use_container_width=True)
+            safe_display_dataframe(df.head(20), width='stretch')
 
 
 # ============================================================================
@@ -273,7 +276,7 @@ def tab_structure_analysis():
             
             df_raw = st.session_state.raw_dfs[selected_source_id]
             
-            structure_info, transformations, questions, is_clean = analyzer.analyze_structure(df_raw)
+            structure_info, transformations, questions, is_clean,issues = analyzer.analyze_structure(df_raw)
             
             # Store results
             if 'structure_results' not in st.session_state:
@@ -289,9 +292,7 @@ def tab_structure_analysis():
             session.raw_structure_info[selected_source_id] = structure_info
             session.is_clean_structure = is_clean
             
-            if not is_clean:
-                _, issues = analyzer._heuristic_structure_check(df_raw)
-                session.structure_issues = issues
+            session.structure_issues = issues
             
             st.rerun()
     
@@ -338,23 +339,246 @@ def tab_structure_analysis():
                     
                     with col3:
                         if st.button(f"✅ Apply", key=f"apply_{trans.id}"):
-                            df_raw = st.session_state.raw_dfs[selected_source_id]
-                            df_transformed = StructureAnalyzer.apply_transformation(df_raw, trans)
-                            
-                            # Save checkpoint
-                            st.session_state.session_manager.save_checkpoint(
-                                session, df_transformed, f"transform_{trans.id}",
-                                f"After: {trans.description}"
+                            try:
+                                df_raw = st.session_state.raw_dfs[selected_source_id]
+                                df_current = st.session_state.clean_dfs.get(
+                                    selected_source_id, 
+                                    st.session_state.raw_dfs[selected_source_id]
+                                )
+                                df_transformed = StructureAnalyzer.apply_transformation(df_raw, trans)
+                                
+                                # ✅ VALIDATION
+                                validation_passed = True
+                                error_messages = []
+                                
+                                if df_transformed.columns.duplicated().any():
+                                    duplicates = df_transformed.columns[df_transformed.columns.duplicated()].tolist()
+                                    error_messages.append(f"🔴 Duplicate columns: {duplicates}")
+                                    validation_passed = False
+                                
+                                empty_cols = [col for col in df_transformed.columns if not str(col).strip()]
+                                if empty_cols:
+                                    error_messages.append(f"🔴 Empty column names detected")
+                                    validation_passed = False
+                                
+                                if not validation_passed:
+                                    st.error("❌ Transformation validation failed:")
+                                    for msg in error_messages:
+                                        st.write(msg)
+                                else:
+                                    # Save và update như cũ
+                                    st.session_state.session_manager.save_checkpoint(
+                                        session, df_transformed, f"transform_{trans.id}",
+                                        f"After: {trans.description}"
+                                    )
+                                    st.session_state.clean_dfs[selected_source_id] = df_transformed
+                                    trans.applied = True
+                                    session.applied_transformations.append(trans.id)
+                                    st.success(f"✅ Applied: {trans.description}")
+                                    st.rerun()
+                                    
+                            except ValueError as e:
+                                st.error(f"❌ Validation Error: {str(e)}")
+                                if "duplicate" in str(e).lower():
+                                    st.warning("💡 Try selecting a different row as header or manually rename columns")
+                            except Exception as e:
+                                st.error(f"❌ Error: {str(e)}")
+        st.divider()
+        st.subheader("🛠️ Custom Transformations")
+        st.info("💡 Describe any transformation you want in natural language - filtering, aggregation, calculations, etc.")
+
+        with st.expander("➕ Add Custom Transformation", expanded=False):
+            custom_trans_text = st.text_area(
+                "Describe the transformation",
+                placeholder="""Examples:
+        - Use row 2 as header and skip first row
+        - Drop column 'Unnamed: 0'
+        - Rename column 'old_name' to 'new_name'
+        - Filter rows where sales > 1000
+        - Group by category and calculate sum of revenue
+        - Create new column 'profit' = 'revenue' - 'cost'
+        - Sort by date descending
+        - Keep only rows where status is 'active'""",
+                height=150,
+                key="custom_trans_nl"
+            )
+
+            if st.button("🔄 Apply Custom Transformation", key="apply_custom_trans_nl", type="primary"):
+                if not custom_trans_text.strip():
+                    st.error("Please enter a transformation description")
+                else:
+                    with st.spinner("Processing transformation..."):
+                        try:
+                            # Initialize analyzer
+                            analyzer = StructureAnalyzer(
+                                api_key=st.session_state.api_key,
+                                model=st.session_state.model
                             )
                             
-                            # Update current df
-                            st.session_state.clean_dfs[selected_source_id] = df_transformed
-                            trans.applied = True
-                            session.applied_transformations.append(trans.id)
+                            # Get current dataframe
+                            df_current = st.session_state.clean_dfs.get(
+                                selected_source_id,
+                                st.session_state.raw_dfs.get(selected_source_id)
+                            )
                             
-                            st.success(f"✅ Applied: {trans.description}")
+                            # Save checkpoint BEFORE transformation for undo
+                            if 'transformation_history' not in st.session_state:
+                                st.session_state.transformation_history = {}
+                            
+                            if selected_source_id not in st.session_state.transformation_history:
+                                st.session_state.transformation_history[selected_source_id] = []
+                            
+                            # Store current state
+                            checkpoint = {
+                                'df': df_current.copy(),
+                                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                'description': custom_trans_text[:100]  # First 100 chars
+                            }
+                            st.session_state.transformation_history[selected_source_id].append(checkpoint)
+                            
+                            # Apply custom transformation using LLM
+                            df_transformed = analyzer.custom_free_transform(
+                                user_input=custom_trans_text,
+                                df=df_current
+                            )
+                            
+                            # Validation
+                            validation_passed = True
+                            error_messages = []
+                            
+                            if df_transformed.columns.duplicated().any():
+                                duplicates = df_transformed.columns[df_transformed.columns.duplicated()].tolist()
+                                error_messages.append(f"🔴 Duplicate columns: {duplicates}")
+                                validation_passed = False
+                            
+                            empty_cols = [col for col in df_transformed.columns if not str(col).strip()]
+                            if empty_cols:
+                                error_messages.append(f"🔴 Empty column names detected")
+                                validation_passed = False
+                            
+                            if df_transformed.empty:
+                                error_messages.append(f"🔴 Transformation resulted in empty DataFrame")
+                                validation_passed = False
+                            
+                            if not validation_passed:
+                                st.error("❌ Transformation validation failed:")
+                                for msg in error_messages:
+                                    st.write(msg)
+                                # Remove the checkpoint since transformation failed
+                                st.session_state.transformation_history[selected_source_id].pop()
+                            else:
+                                # Save successful transformation
+                                trans_id = f"custom_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                                
+                                st.session_state.session_manager.save_checkpoint(
+                                    session, 
+                                    df_transformed, 
+                                    trans_id,
+                                    f"Custom: {custom_trans_text[:50]}..."
+                                )
+                                
+                                # Update clean dataframe
+                                st.session_state.clean_dfs[selected_source_id] = df_transformed
+                                
+                                # Create transformation record
+                                trans = Transformation(
+                                    id=trans_id,
+                                    type="custom",
+                                    description=custom_trans_text,
+                                    params={},
+                                    confidence=1.0,
+                                    applied=True
+                                )
+                                session.transformations.append(trans)
+                                session.applied_transformations.append(trans_id)
+                                
+                                st.success(f"✅ Applied: {custom_trans_text[:100]}...")
+                                st.info(f"📊 Result: {df_current.shape} → {df_transformed.shape}")
+                                st.rerun()
+                                
+                        except Exception as e:
+                            st.error(f"❌ Transformation failed: {str(e)}")
+                            st.write("Please try rephrasing your request or check the data.")
+                            # Remove the checkpoint since transformation failed
+                            if selected_source_id in st.session_state.transformation_history:
+                                if st.session_state.transformation_history[selected_source_id]:
+                                    st.session_state.transformation_history[selected_source_id].pop()
+
+        # Undo Section
+        if 'transformation_history' in st.session_state and selected_source_id in st.session_state.transformation_history:
+            history = st.session_state.transformation_history[selected_source_id]
+            
+            if history:
+                st.divider()
+                st.subheader("⏮️ Transformation History")
+                
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    st.info(f"📝 {len(history)} transformation(s) applied. You can undo to any previous state.")
+                
+                with col2:
+                    if st.button("🔄 Undo Last", key="undo_last_trans", type="secondary"):
+                        if history:
+                            # Get the last checkpoint (before last transformation)
+                            last_checkpoint = history.pop()
+                            
+                            # Restore the dataframe
+                            st.session_state.clean_dfs[selected_source_id] = last_checkpoint['df']
+                            
+                            # Save this undo as a checkpoint
+                            st.session_state.session_manager.save_checkpoint(
+                                session,
+                                last_checkpoint['df'],
+                                f"undo_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                                f"Undo: {last_checkpoint['description']}"
+                            )
+                            
+                            st.success(f"✅ Undone: {last_checkpoint['description']}")
                             st.rerun()
-        
+                
+                # Show history
+                with st.expander(f"📜 View History ({len(history)} items)", expanded=False):
+                    for i, checkpoint in enumerate(reversed(history)):
+                        col1, col2, col3 = st.columns([3, 2, 1])
+                        
+                        with col1:
+                            st.write(f"**{len(history) - i}.** {checkpoint['description']}")
+                        
+                        with col2:
+                            st.caption(f"🕒 {checkpoint['timestamp']}")
+                        
+                        with col3:
+                            if st.button(f"⏮️ Restore", key=f"restore_{i}"):
+                                # Get index in original list
+                                original_idx = len(history) - 1 - i
+                                
+                                # Restore to this checkpoint
+                                restored_df = history[original_idx]['df']
+                                st.session_state.clean_dfs[selected_source_id] = restored_df
+                                
+                                # Remove all checkpoints after this one
+                                st.session_state.transformation_history[selected_source_id] = history[:original_idx]
+                                
+                                # Save restore as checkpoint
+                                st.session_state.session_manager.save_checkpoint(
+                                    session,
+                                    restored_df,
+                                    f"restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                                    f"Restored to: {checkpoint['description']}"
+                                )
+                                
+                                st.success(f"✅ Restored to checkpoint {original_idx + 1}")
+                                st.rerun()
+                    
+                    # Clear all history option
+                    st.divider()
+                    if st.button("🗑️ Clear History", key="clear_history"):
+                        st.session_state.transformation_history[selected_source_id] = []
+                        st.success("✅ History cleared")
+                        st.rerun()
+
+        st.divider()
         # Show before/after comparison
         if selected_source_id in st.session_state.clean_dfs:
             st.divider()
@@ -365,174 +589,17 @@ def tab_structure_analysis():
             with col1:
                 st.write("**Before (Raw)**")
                 df_raw = st.session_state.raw_dfs[selected_source_id]
-                safe_display_dataframe(df_raw.head(10), use_container_width=True)
+                safe_display_dataframe(df_raw.head(10), width='stretch')
                 st.caption(f"Shape: {df_raw.shape[0]} rows × {df_raw.shape[1]} columns")
             
             with col2:
                 st.write("**After (Transformed)**")
                 df_clean = st.session_state.clean_dfs[selected_source_id]
-                safe_display_dataframe(df_clean.head(10), use_container_width=True)
+                safe_display_dataframe(df_clean.head(10), width='stretch')
                 st.caption(f"Shape: {df_clean.shape[0]} rows × {df_clean.shape[1]} columns")
 
         # Custom Transformations Section
         st.divider()
-        st.subheader("🛠️ Custom Transformations")
-        st.info("💡 You can define your own transformations using natural language or JSON format")
-
-        with st.expander("➕ Add Custom Transformation", expanded=False):
-            custom_trans_method = st.radio(
-                "Input Method",
-                ["Natural Language", "JSON"],
-                key="custom_trans_method",
-                horizontal=True
-            )
-
-            if custom_trans_method == "Natural Language":
-                custom_trans_text = st.text_area(
-                    "Describe the transformation",
-                    placeholder="""Examples:
-- Use row 2 as header and skip first row
-- Drop column 'Unnamed: 0'
-- Rename column 'old_name' to 'new_name'
-- Skip first 3 rows""",
-                    height=150,
-                    key="custom_trans_nl"
-                )
-
-                if st.button("🔄 Parse & Apply", key="apply_custom_trans_nl"):
-                    if not custom_trans_text.strip():
-                        st.error("Please enter a transformation description")
-                    else:
-                        with st.spinner("Parsing transformation request..."):
-                            # Use LLM to parse natural language into Transformation
-                            from openai import OpenAI
-                            client = OpenAI(api_key=st.session_state.api_key)
-
-                            parse_prompt = f"""Parse this transformation request into a structured transformation.
-
-Request: {custom_trans_text}
-
-Provide a JSON response with this format:
-{{
-  "type": "use_row_as_header" | "skip_rows" | "drop_columns" | "rename_columns" | "drop_rows",
-  "params": {{...appropriate params...}},
-  "description": "Human-readable description"
-}}
-
-Examples:
-- "Use row 2 as header" → {{"type": "use_row_as_header", "params": {{"row_index": 2}}, "description": "Use row 2 as header"}}
-- "Skip first 3 rows" → {{"type": "skip_rows", "params": {{"rows_to_skip": 3}}, "description": "Skip first 3 rows"}}
-- "Drop column X" → {{"type": "drop_columns", "params": {{"columns": ["X"]}}, "description": "Drop column X"}}
-- "Rename A to B" → {{"type": "rename_columns", "params": {{"mapping": {{"A": "B"}}}}, "description": "Rename A to B"}}
-
-Respond with ONLY the JSON object, no explanation."""
-
-                            try:
-                                response = client.chat.completions.create(
-                                    model=st.session_state.model,
-                                    messages=[
-                                        {"role": "system", "content": "You are a data transformation parser. Convert natural language requests into structured transformation objects."},
-                                        {"role": "user", "content": parse_prompt}
-                                    ],
-                                    response_format={"type": "json_object"},
-                                    temperature=0.3
-                                )
-
-                                parsed = json.loads(response.choices[0].message.content)
-
-                                # Create Transformation object
-                                trans = Transformation(
-                                    id=f"custom_{datetime.now().strftime('%H%M%S')}",
-                                    type=parsed["type"],
-                                    description=parsed["description"],
-                                    params=parsed["params"],
-                                    confidence=1.0,
-                                    applied=False
-                                )
-
-                                # Apply transformation
-                                df_current = st.session_state.clean_dfs.get(
-                                    selected_source_id,
-                                    st.session_state.raw_dfs.get(selected_source_id)
-                                )
-
-                                df_transformed = StructureAnalyzer.apply_transformation(df_current, trans)
-
-                                # Save
-                                st.session_state.session_manager.save_checkpoint(
-                                    session, df_transformed, f"custom_trans_{trans.id}",
-                                    f"Custom: {trans.description}"
-                                )
-
-                                st.session_state.clean_dfs[selected_source_id] = df_transformed
-                                trans.applied = True
-                                session.transformations.append(trans)
-                                session.applied_transformations.append(trans.id)
-
-                                st.success(f"✅ Applied: {trans.description}")
-                                st.rerun()
-
-                            except Exception as e:
-                                st.error(f"Failed to parse transformation: {str(e)}")
-                                st.write("Please try rephrasing or use JSON format instead.")
-
-            else:  # JSON mode
-                custom_trans_json = st.text_area(
-                    "Transformation JSON",
-                    placeholder="""{
-  "type": "drop_columns",
-  "params": {
-    "columns": ["Unnamed: 0", "Unnamed: 1"]
-  },
-  "description": "Drop unnamed columns"
-}""",
-                    height=200,
-                    key="custom_trans_json"
-                )
-
-                if st.button("🔄 Parse & Apply", key="apply_custom_trans_json"):
-                    if not custom_trans_json.strip():
-                        st.error("Please enter transformation JSON")
-                    else:
-                        try:
-                            parsed = json.loads(custom_trans_json)
-
-                            # Create Transformation object
-                            trans = Transformation(
-                                id=f"custom_{datetime.now().strftime('%H%M%S')}",
-                                type=parsed["type"],
-                                description=parsed.get("description", "Custom transformation"),
-                                params=parsed["params"],
-                                confidence=1.0,
-                                applied=False
-                            )
-
-                            # Apply transformation
-                            df_current = st.session_state.clean_dfs.get(
-                                selected_source_id,
-                                st.session_state.raw_dfs.get(selected_source_id)
-                            )
-
-                            df_transformed = StructureAnalyzer.apply_transformation(df_current, trans)
-
-                            # Save
-                            st.session_state.session_manager.save_checkpoint(
-                                session, df_transformed, f"custom_trans_{trans.id}",
-                                f"Custom: {trans.description}"
-                            )
-
-                            st.session_state.clean_dfs[selected_source_id] = df_transformed
-                            trans.applied = True
-                            session.transformations.append(trans)
-                            session.applied_transformations.append(trans.id)
-
-                            st.success(f"✅ Applied: {trans.description}")
-                            st.rerun()
-
-                        except json.JSONDecodeError as e:
-                            st.error(f"Invalid JSON: {str(e)}")
-                        except Exception as e:
-                            st.error(f"Failed to apply transformation: {str(e)}")
 
 
 # ============================================================================
@@ -615,7 +682,7 @@ def tab_type_cleaning():
                 "Example Value": profile.sample_raw_values[0] if profile.sample_raw_values else ""
             })
 
-        safe_display_dataframe(pd.DataFrame(type_data), use_container_width=True)
+        safe_display_dataframe(pd.DataFrame(type_data), width='stretch')
 
         # Show detailed issues breakdown
         if any(profile.data_issues for profile in results['profiles'].values()):
@@ -691,7 +758,7 @@ def tab_type_cleaning():
             with col2:
                 st.metric("Columns", df_cleaned.shape[1])
             
-            safe_display_dataframe(df_cleaned.head(20), use_container_width=True)
+            safe_display_dataframe(df_cleaned.head(20), width='stretch')
             
             # Show dtype changes
             st.write("**Data Types After Cleaning:**")
@@ -699,7 +766,7 @@ def tab_type_cleaning():
                 "Column": df_cleaned.columns,
                 "Type": [str(dtype) for dtype in df_cleaned.dtypes]
             })
-            safe_display_dataframe(dtype_df, use_container_width=True)
+            safe_display_dataframe(dtype_df, width='stretch')
 
     # Custom Cleaning Rules Section
     st.divider()
@@ -945,14 +1012,11 @@ def tab_question_collection():
                 # Prepare data for validation
                 selected_source_id = session.current_source_id
                 
-                # --- [FIX LỖI QUAN TRỌNG] ---
-                # Sử dụng tham số default của hàm get() thay vì toán tử 'or'
-                # Nếu không tìm thấy trong cleaned_dfs, nó sẽ trả về kết quả của raw_dfs
                 df = st.session_state.cleaned_dfs.get(
                     selected_source_id, 
                     st.session_state.raw_dfs.get(selected_source_id)
                 )
-                # -----------------------------
+                
                 
                 if df is None:
                     st.error(f"Could not find data for source: {selected_source_id}")
@@ -967,7 +1031,6 @@ def tab_question_collection():
                     sample_rows=sample_rows
                 )
                 
-                # Store validation results
                 st.session_state.validation_result = {
                     "is_sufficient": is_sufficient,
                     "additional_questions": add_questions,
@@ -1045,14 +1108,14 @@ def tab_question_collection():
                                         break
                                 if not q_exists:
                                     session.questions.append(q)
-                                # --------------------------
                                 
                                 if engine.apply_answer(answer):
                                     session.answers.append(answer)
+                                    new_logic = f"\n- [Business Logic] {questions_text} -> Rule: {answer.answer}"
+                                    session.question_set.additional_notes += new_logic
                                     count += 1
-                        
                         if count > 0:
-                            st.success(f"✅ Updated schema with {count} new details!")
+                            st.success(f"Updated schema with {count} new details!")
                             if "validation_result" in st.session_state:
                                 del st.session_state.validation_result
                             if "refinement_answers" in st.session_state:
@@ -1064,7 +1127,6 @@ def tab_question_collection():
         else:
             st.info("Enter questions and click Validate to see the report.")
 
-    # Show Current Schema Summary for Reference
     st.divider()
     with st.expander("👀 View Current Schema Summary"):
         if session.schema:
@@ -1076,7 +1138,7 @@ def tab_question_collection():
                     "Description": schema_col.description,
                     "Unit": schema_col.unit or ""
                 })
-            safe_display_dataframe(pd.DataFrame(schema_data), use_container_width=True)
+            safe_display_dataframe(pd.DataFrame(schema_data), width='stretch')
 
 # ============================================================================
 # Tab 5: Schema Generation
@@ -1106,7 +1168,6 @@ def tab_schema_generation():
             st.session_state.raw_dfs.get(selected_source_id)
         )
     )
-    
     if df is None:
         st.error("No data available")
         return
@@ -1377,19 +1438,38 @@ def tab_schema_generation():
     # ============================================================================
     if hasattr(st.session_state, 'schema_results') and selected_source_id in st.session_state.schema_results:
         results = st.session_state.schema_results[selected_source_id]
-
+        # logger.info(f'SCHEMA: {st.session_state.schema_results[selected_source_id]}')
         st.divider()
         st.subheader("📊 Generated Schema")
-
+        def normalize_key(s):
+            import unicodedata
+            # Chuyển về dạng Unicode chuẩn, bỏ khoảng trắng lạ, lowercase
+            s = unicodedata.normalize('NFC', str(s))
+            return s.replace('\xa0', ' ').replace(' ', '').lower()
         # Create tabs for each column
         column_names = list(results['schema'].keys())
-
+        logger.info(f'AVAILIBLE COL NAME IN PROFILES: {results["profiles"].keys()}')
         if column_names:
-            tabs = st.tabs(column_names[:10])  # Limit to first 10 for UI
-
-            for tab, col_name in zip(tabs, column_names[:10]):
+            tabs = st.tabs(column_names)
+            for tab, col_name in zip(tabs, column_names):
                 with tab:
-                    profile = results['profiles'][col_name]
+                    profile = results['profiles'].get(col_name)
+                    if profile is None:
+                        target_key = normalize_key(col_name)
+                        for raw_key, raw_profile in results['profiles'].items():
+                            if normalize_key(raw_key) == target_key:
+                                profile = raw_profile
+                                break
+                    
+                    if profile is None:
+                        from schema_pipeline import ColumnProfile
+                        profile = ColumnProfile(
+                            name=col_name, pandas_dtype="unknown", inferred_type="unknown",
+                            non_null_count=0, null_count=0, null_ratio=0.0, n_unique=0,
+                            sample_values=[], sample_raw_values=[]
+                        )
+                        st.warning(f"⚠️ Không tìm thấy profile gốc cho cột: '{col_name}'. Dữ liệu hiển thị có thể không đầy đủ.")
+
                     schema_col = results['schema'][col_name]
 
                     # Metrics
@@ -1535,7 +1615,6 @@ def tab_agent_qa():
         return
     
     session = st.session_state.session
-    
     # Get cleaned DataFrame
     selected_source_id = session.current_source_id
     df_cleaned = st.session_state.cleaned_dfs.get(
@@ -1647,7 +1726,6 @@ def tab_agent_qa():
         with col2:
             if sql_tool:
                 show_sql = st.form_submit_button("🔍 View SQL")
-        
         if submitted and user_input:
             with st.spinner("Agent is thinking..."):
                 # Call agent with SQL capability
@@ -1698,7 +1776,7 @@ def tab_agent_qa():
     cols = st.columns(3)
     for i, (label, question) in enumerate(quick_questions):
         with cols[i % 3]:
-            if st.button(label, key=f"qq_{i}", use_container_width=True):
+            if st.button(label, key=f"qq_{i}", width='stretch'):
                 with st.spinner("Thinking..."):
                     agent = st.session_state.get('agent')
                     if not agent:
@@ -1738,7 +1816,7 @@ def tab_agent_qa():
                     st.error(error)
                 else:
                     st.success(f"✅ Query returned {len(result_df)} rows")
-                    safe_display_dataframe(result_df, use_container_width=True)
+                    safe_display_dataframe(result_df, width='stretch')
 
 # ============================================================================
 # Tab 6: Checkpoints & History
@@ -1770,7 +1848,7 @@ def tab_checkpoints():
             })
         
         df_checkpoints = pd.DataFrame(checkpoint_data)
-        safe_display_dataframe(df_checkpoints, use_container_width=True)
+        safe_display_dataframe(df_checkpoints, width='stretch')
         
         # Load checkpoint
         st.divider()
@@ -1792,7 +1870,7 @@ def tab_checkpoints():
                 with col2:
                     st.metric("Columns", df_checkpoint.shape[1])
                 
-                safe_display_dataframe(df_checkpoint.head(20), use_container_width=True)
+                safe_display_dataframe(df_checkpoint.head(20), width='stretch')
                 
                 # Download option
                 csv = df_checkpoint.to_csv(index=False).encode('utf-8')
@@ -1838,12 +1916,7 @@ def tab_scenario_definition():
 
     st.markdown("""
     **Define Scenarios (Use Cases):**
-
-    A scenario represents a specific use case for your data. Each scenario includes:
-    - **Selected Fields**: Which columns are relevant for this use case
-    - **Questions**: What questions you'll ask about the data
-    - **Output Format**: Expected structure of the answers
-    - **Examples**: Sample input/output (optional)
+    A scenario represents a specific use case for your data.
     """)
 
     st.divider()
@@ -1867,32 +1940,33 @@ def tab_scenario_definition():
     if "current_scenario" not in st.session_state:
         st.session_state.current_scenario = None
 
-    # Scenario Form
+    # --- SCENARIO FORM (ĐÃ BỎ ST.FORM ĐỂ FIX LỖI UI DYNAMIC) ---
     if st.session_state.editing_scenario or st.session_state.current_scenario:
         current_scen = st.session_state.current_scenario
-
-        with st.form("scenario_form", clear_on_submit=False):
+        
+        st.info("💡 Đang chỉnh sửa kịch bản. Thay đổi sẽ cập nhật giao diện ngay lập tức.")
+        
+        # Container cho form để nhìn gọn gàng hơn
+        with st.container():
             st.subheader("Scenario Details")
 
             # Basic info
             scenario_name = st.text_input(
                 "Scenario Name *",
                 value=current_scen.name if current_scen else "",
-                placeholder="e.g., Sales Analysis, Customer Segmentation",
+                placeholder="e.g., Sales Analysis",
                 key="scenario_name_input"
             )
 
             scenario_desc = st.text_area(
                 "Description",
                 value=current_scen.description if current_scen else "",
-                placeholder="Describe what this scenario is for...",
                 height=100,
                 key="scenario_desc_input"
             )
 
             # Select fields
             st.subheader("📊 Select Relevant Fields")
-
             available_columns = list(session.schema.keys())
             default_selected = current_scen.selected_fields if current_scen else []
 
@@ -1900,36 +1974,32 @@ def tab_scenario_definition():
                 "Choose columns needed for this scenario",
                 options=available_columns,
                 default=default_selected,
-                help="Select the columns that are relevant to this use case",
                 key="scenario_fields_input"
             )
 
             # Questions
             st.subheader("❓ Questions")
-
             current_questions = "\n".join(current_scen.questions) if current_scen else ""
-
             questions_text = st.text_area(
                 "Questions (one per line)",
                 value=current_questions,
-                placeholder="""e.g.,
-What is the total revenue this month?
-Which product sells best?
-Show sales trend over time""",
                 height=150,
                 key="scenario_questions_input"
             )
 
-            # Output Format
+            # Output Format - PHẦN QUAN TRỌNG
             st.subheader("📤 Output Format")
 
-            # Detect output format method from existing scenario
-            default_method_index = 0  # Default to JSON Schema
+            # Detect default method
+            default_method_index = 0
             if current_scen and current_scen.output_format:
-                # If output_format only has "description" key, it was created with Free Text mode
-                if list(current_scen.output_format.keys()) == ["description"]:
-                    default_method_index = 1  # Free Text Description
+                if isinstance(current_scen.output_format, dict):
+                    # Check if it looks like the text format wrapper
+                    if current_scen.output_format.get("type") == "text_description" or \
+                       (len(current_scen.output_format) == 1 and "description" in current_scen.output_format):
+                        default_method_index = 1
 
+            # Radio button (Giờ đây khi bấm nó sẽ reload lại trang ngay để hiện đúng ô nhập)
             output_format_method = st.radio(
                 "Define output format as",
                 ["JSON Schema", "Free Text Description"],
@@ -1939,116 +2009,102 @@ Show sales trend over time""",
             )
 
             if output_format_method == "JSON Schema":
-                current_output = json.dumps(current_scen.output_format, indent=2) if current_scen and current_scen.output_format else ""
-
+                current_output = ""
+                if current_scen and current_scen.output_format and default_method_index == 0:
+                    current_output = json.dumps(current_scen.output_format, indent=2)
+                
                 output_format_json = st.text_area(
                     "Output Format (JSON Schema)",
                     value=current_output,
-                    placeholder="""{
-  "total_revenue": {"type": "number", "description": "Total revenue"},
-  "top_products": {
-    "type": "array",
-    "items": {
-      "product_name": "string",
-      "quantity": "number"
-    }
-  },
-  "trend": {"type": "object"}
-}""",
+                    placeholder="{\n  \"total\": \"number\"\n}",
                     height=200,
                     key="scenario_output_json"
                 )
             else:
-                current_output_text = current_scen.output_format.get("description", "") if current_scen and current_scen.output_format else ""
-
+                current_output_text = ""
+                if current_scen and current_scen.output_format:
+                    current_output_text = current_scen.output_format.get("description", "")
+                
                 output_format_text = st.text_area(
                     "Output Format Description",
                     value=current_output_text,
-                    placeholder="Describe the expected output format in plain text...",
+                    placeholder="Mô tả định dạng đầu ra mong muốn...",
                     height=150,
                     key="scenario_output_text"
                 )
 
-            # Examples (optional)
+            # Examples
             st.subheader("💡 Examples (Optional)")
-
             col_ex1, col_ex2 = st.columns(2)
-
             with col_ex1:
                 current_ex_input = json.dumps(current_scen.example_input, indent=2) if current_scen and current_scen.example_input else ""
-
-                example_input = st.text_area(
-                    "Example Input Data",
-                    value=current_ex_input,
-                    placeholder='{"field1": "value1", "field2": "value2"}',
-                    height=150,
-                    key="scenario_ex_input"
-                )
-
+                example_input = st.text_area("Example Input Data", value=current_ex_input, key="scenario_ex_input", height=150)
             with col_ex2:
                 current_ex_output = json.dumps(current_scen.example_output, indent=2) if current_scen and current_scen.example_output else ""
+                example_output = st.text_area("Example Expected Output", value=current_ex_output, key="scenario_ex_output", height=150)
 
-                example_output = st.text_area(
-                    "Example Expected Output",
-                    value=current_ex_output,
-                    placeholder='{"result": "..."}',
-                    height=150,
-                    key="scenario_ex_output"
-                )
-
-            # Form buttons
+            # Buttons
+            st.divider()
             col_submit, col_cancel = st.columns([1, 1])
 
             with col_submit:
-                submitted = st.form_submit_button("💾 Save Scenario", type="primary")
+                # Dùng st.button thường (không phải form_submit)
+                submitted = st.button("💾 Save Scenario", type="primary", key="btn_save_scenario")
 
             with col_cancel:
-                cancelled = st.form_submit_button("❌ Cancel")
+                cancelled = st.button("❌ Cancel", key="btn_cancel_scenario")
 
+            # --- LOGIC XỬ LÝ LƯU ---
             if submitted:
                 if not scenario_name.strip():
-                    st.error("Please enter a scenario name")
+                    st.error("⚠️ Vui lòng nhập tên kịch bản")
                 elif not selected_fields:
-                    st.error("Please select at least one field")
+                    st.error("⚠️ Vui lòng chọn ít nhất một trường dữ liệu")
                 elif not questions_text.strip():
-                    st.error("Please enter at least one question")
+                    st.error("⚠️ Vui lòng nhập ít nhất một câu hỏi")
                 else:
-                    # Parse questions
+                    # Parse Questions
                     questions_list = [q.strip() for q in questions_text.split('\n') if q.strip()]
 
-                    # Parse output format
-                    if output_format_method == "JSON Schema":
-                        if output_format_json.strip():
+                    # Parse Output Format (Lấy trực tiếp từ session_state cho an toàn)
+                    output_format = {}
+                    current_method = st.session_state.get("output_format_method", "JSON Schema")
+
+                    if current_method == "JSON Schema":
+                        raw_json = st.session_state.get("scenario_output_json", "").strip()
+                        if raw_json:
                             try:
-                                output_format = json.loads(output_format_json)
+                                output_format = json.loads(raw_json)
                             except json.JSONDecodeError as e:
-                                st.error(f"Invalid JSON in output format: {str(e)}")
-                                st.stop()  # Stop execution to prevent saving with empty dict
-                        else:
-                            output_format = {}
+                                st.error("❌ Lỗi cú pháp JSON!")
+                                st.stop()
                     else:
-                        # Always save description, even if empty - this preserves the free text mode
-                        output_format = {"description": output_format_text}
+                        # Free Text
+                        raw_text = st.session_state.get("scenario_output_text", "").strip()
+                        if raw_text:
+                            output_format = {
+                                "type": "text_description",
+                                "description": raw_text
+                            }
+                        else:
+                            output_format = {"description": "No description provided"}
 
-                    # Parse examples
-                    try:
-                        ex_input = json.loads(example_input) if example_input.strip() else None
-                    except json.JSONDecodeError:
-                        ex_input = None
+                    # Parse Examples
+                    ex_input = None
+                    if example_input.strip():
+                        try: ex_input = json.loads(example_input)
+                        except: pass
+                    
+                    ex_output = None
+                    if example_output.strip():
+                        try: ex_output = json.loads(example_output)
+                        except: pass
 
-                    try:
-                        ex_output = json.loads(example_output) if example_output.strip() else None
-                    except json.JSONDecodeError:
-                        ex_output = None
-
-                    # Create or update scenario
+                    # Save Logic
                     if current_scen:
-                        # Update existing
                         scenario_id = current_scen.id
-                        # Remove old scenario
                         session.scenarios = [s for s in session.scenarios if s.id != scenario_id]
                     else:
-                        # Create new
                         scenario_id = f"scenario_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
                     new_scenario = Scenario(
@@ -2063,14 +2119,10 @@ Show sales trend over time""",
                         created_at=datetime.now().isoformat()
                     )
 
-                    # Add to session
                     session.scenarios.append(new_scenario)
-
-                    # Reset state
                     st.session_state.editing_scenario = False
                     st.session_state.current_scenario = None
-
-                    st.success(f"✅ Saved scenario: {scenario_name}")
+                    st.success(f"✅ Đã lưu: {scenario_name}")
                     st.rerun()
 
             if cancelled:
@@ -2083,64 +2135,44 @@ Show sales trend over time""",
     st.subheader("📚 Saved Scenarios")
 
     if not session.scenarios:
-        st.info("No scenarios defined yet. Click 'New Scenario' to create one.")
+        st.info("No scenarios defined yet.")
     else:
         for i, scenario in enumerate(session.scenarios):
             with st.expander(f"**{scenario.name}**", expanded=False):
                 col_info, col_actions = st.columns([3, 1])
-
                 with col_info:
                     st.write(f"**Description:** {scenario.description or 'N/A'}")
-                    st.write(f"**Created:** {scenario.created_at[:19] if scenario.created_at else 'N/A'}")
-
-                    st.write(f"**Selected Fields ({len(scenario.selected_fields)}):**")
-                    st.code(", ".join(scenario.selected_fields))
-
-                    st.write(f"**Questions ({len(scenario.questions)}):**")
-                    for j, q in enumerate(scenario.questions, 1):
-                        st.write(f"  {j}. {q}")
-
+                    st.write(f"**Selected Fields:** `{', '.join(scenario.selected_fields)}`")
+                    
+                    st.write("**Questions:**")
+                    for q in scenario.questions:
+                        st.write(f"- {q}")
+                    
                     st.write("**Output Format:**")
-                    st.json(scenario.output_format)
-
-                    if scenario.example_input or scenario.example_output:
-                        col_ex1, col_ex2 = st.columns(2)
-                        if scenario.example_input:
-                            with col_ex1:
-                                st.write("**Example Input:**")
-                                st.json(scenario.example_input)
-                        if scenario.example_output:
-                            with col_ex2:
-                                st.write("**Example Output:**")
-                                st.json(scenario.example_output)
+                    # Hiển thị thông minh
+                    fmt = scenario.output_format
+                    if not fmt:
+                        st.caption("Empty")
+                    elif fmt.get("type") == "text_description" or (len(fmt)==1 and "description" in fmt):
+                        st.info(fmt.get("description"))
+                    else:
+                        st.json(fmt)
 
                 with col_actions:
-                    if st.button("✏️ Edit", key=f"edit_scenario_{i}"):
+                    if st.button("✏️ Edit", key=f"edit_scen_{i}"):
                         st.session_state.current_scenario = scenario
                         st.session_state.editing_scenario = True
                         st.rerun()
-
-                    if st.button("🗑️ Delete", key=f"delete_scenario_{i}"):
+                    if st.button("🗑️ Delete", key=f"del_scen_{i}"):
                         session.scenarios = [s for s in session.scenarios if s.id != scenario.id]
-                        st.success(f"✅ Deleted scenario: {scenario.name}")
+                        st.success("Deleted")
                         st.rerun()
 
-    # Export scenarios
+    # Export
     if session.scenarios:
         st.divider()
-        st.subheader("📤 Export Scenarios")
-
-        scenarios_json = {
-            "scenarios": [s.to_dict() for s in session.scenarios],
-            "exported_at": datetime.now().isoformat()
-        }
-
-        st.download_button(
-            label="⬇️ Download Scenarios (JSON)",
-            data=json.dumps(scenarios_json, indent=2, ensure_ascii=False),
-            file_name=f"scenarios_{session.session_id}.json",
-            mime="application/json"
-        )
+        scenarios_json = {"scenarios": [s.to_dict() for s in session.scenarios]}
+        st.download_button("⬇️ Download Scenarios", data=json.dumps(scenarios_json, indent=2), file_name="scenarios.json", mime="application/json")
 
 
 # ============================================================================
@@ -2174,7 +2206,7 @@ def tab_export():
             })
         
         df_schema = pd.DataFrame(schema_data)
-        safe_display_dataframe(df_schema, use_container_width=True)
+        safe_display_dataframe(df_schema, width='stretch')
         
         # Summary stats
         st.divider()
@@ -2230,50 +2262,6 @@ def tab_export():
 def main():
     initialize_session_state()
     
-    # Sidebar
-    with st.sidebar:
-        st.title("📊 Data Schema Pipeline V5")
-        st.write("Complete workflow + Question-Driven Schema Generation")
-
-        st.divider()
-        
-        # Session info
-        if st.session_state.session:
-            st.success("✅ Session Active")
-            st.write(f"**Session ID:** {st.session_state.session.session_id}")
-            st.write(f"**Sources:** {len(st.session_state.session.sources)}")
-            st.write(f"**Schema Version:** {st.session_state.session.schema_version}")
-            
-            st.divider()
-            
-            # Quick stats
-            st.metric("Transformations", len(st.session_state.session.applied_transformations))
-            st.metric("Cleaning Rules", len(st.session_state.session.applied_cleaning_rules))
-            st.metric("Questions Answered", len(st.session_state.session.answers))
-            st.metric("Checkpoints", len(st.session_state.session.checkpoints))
-            st.metric("Agent Messages", len(st.session_state.session.agent_conversations))
-        else:
-            st.info("No active session")
-        
-        st.divider()
-        
-        # Help
-        with st.expander("❓ Help"):
-            st.markdown("""
-            **Workflow:**
-            1. **Ingestion**: Upload files
-            2. **Structure**: Fix structure issues
-            3. **Type Cleaning**: Convert formatted numbers
-            4. **Question Collection**: Define expected usage (optional)
-            5. **Schema Generation**:
-               - Step 1: Analyze data → Generate clarification questions
-               - Step 2: Answer questions → Generate final schema
-            6. **Agent Q&A**: Chat & query your data with SQL
-            7. **Checkpoints**: Review transformations
-            8. **Export**: Download results
-            """)
-    
-    # Main content - tabs
     tabs = st.tabs([
         "📁 Ingestion",
         "🔍 Structure Analysis",
