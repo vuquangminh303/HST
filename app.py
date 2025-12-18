@@ -5,8 +5,6 @@ import json
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-import plotly.express as px
-import plotly.graph_objects as go
 import sqlite3
 import logging
 
@@ -1154,7 +1152,6 @@ def tab_schema_generation():
 
     session = st.session_state.session
     
-    # ... (Giữ nguyên phần chọn Source và lấy DF) ...
     selected_source_id = st.selectbox(
         "Select Source",
         options=[s.source_id for s in session.sources],
@@ -1272,10 +1269,8 @@ def tab_schema_generation():
     if not clarif_questions:
         if st.button("🔍 Analyze Data & Generate Questions", type="primary"):
             with st.spinner("Analyzing data and generating clarification questions..."):
-                # Generate profiles
                 profiles = ProfileGenerator.generate_profiles(df)
                 sample_rows = ProfileGenerator.get_sample_rows(df)
-
                 # Store profiles
                 if 'profiles' not in st.session_state:
                     st.session_state.profiles = {}
@@ -1818,87 +1813,6 @@ def tab_agent_qa():
                     st.success(f"✅ Query returned {len(result_df)} rows")
                     safe_display_dataframe(result_df, width='stretch')
 
-# ============================================================================
-# Tab 6: Checkpoints & History
-# ============================================================================
-
-def tab_checkpoints():
-    """Checkpoints and history tab"""
-    st.header("💾 Checkpoints & History")
-    
-    if not st.session_state.session:
-        st.warning("⚠️ No active session")
-        return
-    
-    session = st.session_state.session
-    
-    # Checkpoints
-    if session.checkpoints:
-        st.subheader("📸 Data Checkpoints")
-        
-        checkpoint_data = []
-        for cp in session.checkpoints:
-            checkpoint_data.append({
-                "Checkpoint ID": cp.checkpoint_id,
-                "Stage": cp.stage,
-                "Timestamp": cp.timestamp[:19],
-                "Rows": cp.shape[0],
-                "Columns": cp.shape[1],
-                "Description": cp.description
-            })
-        
-        df_checkpoints = pd.DataFrame(checkpoint_data)
-        safe_display_dataframe(df_checkpoints, width='stretch')
-        
-        # Load checkpoint
-        st.divider()
-        selected_cp = st.selectbox(
-            "Select checkpoint to view",
-            options=[cp.checkpoint_id for cp in session.checkpoints]
-        )
-        
-        if selected_cp and st.button("📂 Load Checkpoint"):
-            checkpoint = next(cp for cp in session.checkpoints if cp.checkpoint_id == selected_cp)
-            
-            with st.spinner("Loading checkpoint..."):
-                df_checkpoint = st.session_state.session_manager.load_checkpoint(checkpoint)
-                st.success(f"✅ Loaded: {checkpoint.description}")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.metric("Rows", df_checkpoint.shape[0])
-                with col2:
-                    st.metric("Columns", df_checkpoint.shape[1])
-                
-                safe_display_dataframe(df_checkpoint.head(20), width='stretch')
-                
-                # Download option
-                csv = df_checkpoint.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="⬇️ Download as CSV",
-                    data=csv,
-                    file_name=f"{selected_cp}.csv",
-                    mime="text/csv"
-                )
-    else:
-        st.info("No checkpoints yet")
-    
-    # History
-    st.divider()
-    st.subheader("📜 Refinement History")
-    
-    if session.history:
-        for entry in reversed(session.history[-20:]):  # Show last 20
-            with st.expander(f"**{entry.action}** - {entry.timestamp[:19]}"):
-                st.write(f"**Schema Version:** {entry.schema_version}")
-                st.json(entry.details)
-    else:
-        st.info("No history yet")
-
-
-# ============================================================================
-# Tab 7: Scenario Definition
-# ============================================================================
 
 def tab_scenario_definition():
     """Scenario definition tab - define use cases with questions and output formats"""
@@ -2179,81 +2093,6 @@ def tab_scenario_definition():
 # Tab 8: Export
 # ============================================================================
 
-def tab_export():
-    """Export tab"""
-    st.header("📤 Export Results")
-    
-    if not st.session_state.session:
-        st.warning("⚠️ No active session")
-        return
-    
-    session = st.session_state.session
-    
-    st.subheader("📋 Final Schema")
-    
-    if session.schema:
-        # Schema as table
-        schema_data = []
-        for col_name, schema_col in session.schema.items():
-            schema_data.append({
-                "Column": col_name,
-                "Description": schema_col.description,
-                "Semantic Type": schema_col.semantic_type,
-                "Physical Type": schema_col.physical_type,
-                "Original Type": schema_col.original_type,
-                "Unit": schema_col.unit or "N/A",
-                "Required": schema_col.is_required
-            })
-        
-        df_schema = pd.DataFrame(schema_data)
-        safe_display_dataframe(df_schema, width='stretch')
-        
-        # Summary stats
-        st.divider()
-        st.subheader("📊 Summary Statistics")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Total Columns", len(session.schema))
-        with col2:
-            st.metric("Transformations Applied", len(session.applied_transformations))
-        with col3:
-            st.metric("Cleaning Rules Applied", len(session.applied_cleaning_rules))
-        with col4:
-            st.metric("Schema Version", session.schema_version)
-        
-        # Download schema JSON
-        st.divider()
-        schema_json = {
-            "session_id": session.session_id,
-            "created_at": session.created_at,
-            "schema_version": session.schema_version,
-            "applied_transformations": session.applied_transformations,
-            "applied_cleaning_rules": session.applied_cleaning_rules,
-            "columns": {k: v.to_dict() for k, v in session.schema.items()}
-        }
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.download_button(
-                label="⬇️ Download Schema (JSON)",
-                data=json.dumps(schema_json, indent=2, ensure_ascii=False),
-                file_name=f"schema_{session.session_id}.json",
-                mime="application/json"
-            )
-        
-        # Download full session
-        with col2:
-            st.download_button(
-                label="⬇️ Download Full Session (JSON)",
-                data=json.dumps(session.to_dict(), indent=2, ensure_ascii=False, default=str),
-                file_name=f"session_{session.session_id}.json",
-                mime="application/json"
-            )
-    else:
-        st.info("No schema generated yet")
-
 
 # ============================================================================
 # Main App
@@ -2269,9 +2108,7 @@ def main():
         "📋 Schema Generation",
         "❓ Question Collection",
         "🎯 Scenarios",
-        "🤖 Agent Q&A",
-        "💾 Checkpoints",
-        "📤 Export"
+        "🤖 Agent Q&A"
     ])
 
     with tabs[0]:
@@ -2294,13 +2131,5 @@ def main():
 
     with tabs[6]:
         tab_agent_qa()
-
-    with tabs[7]:
-        tab_checkpoints()
-
-    with tabs[8]:
-        tab_export()
-
-
 if __name__ == "__main__":
     main()

@@ -976,7 +976,9 @@ class StructureAnalyzer:
             
         except Exception as e:
             raise RuntimeError(f"Structure analysis failed: {str(e)}")
-    def custom_free_transform(self, user_input: str, df: pd.DataFrame) -> pd.DataFrame:
+    def custom_free_transform(self, user_input: str, 
+                              df: pd.DataFrame, 
+                              max_preview_rows: int = 10) -> pd.DataFrame:
         """
         Execute custom transformation based on free-form user input.
         Uses LLM to generate and execute Python code for transformations outside predefined cases.
@@ -985,13 +987,17 @@ class StructureAnalyzer:
         :param df: Input DataFrame to transform
         :return: Transformed DataFrame
         """
+        structure_info = self._extract_structure_info(df, max_preview_rows)
+        
+        # Use LLM to check if data is clean and propose transformations
+        prompt = self._build_custom_prompt(user_input,structure_info)
         try:
-            # First, try to parse as structured transformation
+
             parse_response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are a data transformation parser. Return valid JSON only."},
-                    {"role": "user", "content": self._build_custom_prompt(user_input)}
+                    {"role": "system", "content": self._get_structure_system_prompt()},
+                    {"role": "user", "content": prompt}
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.3
@@ -1000,7 +1006,6 @@ class StructureAnalyzer:
             parsed = json.loads(parse_response.choices[0].message.content)
             transform_type = parsed.get("type")
             
-            # If it matches a known type, use existing apply_transformation
             known_types = ["use_row_as_header", "skip_rows", "drop_columns", "rename_columns", "drop_rows"]
             if transform_type in known_types:
                 transformation = Transformation(
@@ -1018,19 +1023,13 @@ class StructureAnalyzer:
             logger.info(f"⚡ Generating custom code for: {user_input}")
             
             # Get DataFrame info for context
-            df_info = {
-                "columns": df.columns.tolist(),
-                "dtypes": df.dtypes.astype(str).to_dict(),
-                "shape": df.shape,
-                "preview": df.head(3).to_dict(orient='records')
-            }
             
             code_response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": self._get_custom_system_prompt()},
                     {"role": "user", "content": f"""DataFrame info:
-    {json.dumps(df_info, indent=2, default=str)}
+    {json.dumps(structure_info, indent=2, default=str)}
 
     User request: {user_input}
 
@@ -1111,12 +1110,29 @@ class StructureAnalyzer:
     Remember: Output ONLY executable Python code, nothing else."""
 
 
-    def _build_custom_prompt(self, user_input: str) -> str:
+    def _build_custom_prompt(self, user_input: str,info: Dict[str,Any]) -> str:
         """Build prompt to parse custom transformation request"""
         return f"""Parse this transformation request into a structured format.
 
     Request: "{user_input}"
+    **DataFrame Info:**
+        - Shape: {info['shape']['rows']} rows × {info['shape']['columns']} columns
+        - Current column names: {info['column_names']}
+        - Data types: {json.dumps(info['dtypes'], indent=2)}
+        - Null counts: {json.dumps(info['null_counts'], indent=2)}
 
+        **First row values:**
+        {json.dumps(info['first_row_values'], indent=2, default=str)}
+
+        **Preview (first few rows):**
+        ```json
+        {json.dumps(info['preview_data'], indent=2, default=str)}
+        ```
+
+        **Last few rows (for context):**
+        ```json
+        {json.dumps(info.get('last_few_rows', []), indent=2, default=str)}
+        ```
     Analyze if this matches any standard transformation pattern:
     - "Use row X as header" → use_row_as_header
     - "Skip first N rows" → skip_rows  
