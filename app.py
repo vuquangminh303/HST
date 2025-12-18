@@ -9,7 +9,7 @@ import sqlite3
 import logging
 
 # Import from pipeline
-from hst_agent import (
+from schema_pipeline import (
     DataIngestor, StructureAnalyzer, ProfileGenerator, SchemaGenerator,
     SessionManager, RefinementEngine, DataSource, Session, Transformation,
     Question, Answer, ColumnProfile, ColumnSchema, DataFrameCheckpoint,
