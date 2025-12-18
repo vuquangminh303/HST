@@ -600,21 +600,6 @@ class TypeInferenceEngine:
                 'examples': sample[sample.str.match(unit_pattern, na=False)].head(3).tolist()
             })
 
-        # 5. Excel serial dates
-        try:
-            numeric_values = pd.to_numeric(sample, errors='coerce')
-            if numeric_values.notna().sum() > 0:
-                # Excel serial dates typically range from 1 to 50000+
-                in_date_range = (numeric_values >= 1) & (numeric_values <= 100000)
-                if in_date_range.sum() / len(numeric_values) > 0.5:
-                    issues.append({
-                        'type': 'excel_serial_date',
-                        'action': DataCleaningAction.CONVERT_EXCEL_SERIAL_DATE,
-                        'description': 'Looks like Excel serial date numbers',
-                        'examples': sample.head(3).tolist()
-                    })
-        except:
-            pass
 
         # 6. Boolean-like values
         unique_lower = set(sample.str.lower().str.strip())
@@ -789,12 +774,6 @@ class TypeInferenceEngine:
                 logger.info(f"✓ Extracted numbers from strings in '{col}'")
 
             # Advanced datetime cleaning
-            elif rule.action == DataCleaningAction.CONVERT_EXCEL_SERIAL_DATE:
-                # Convert Excel serial dates to datetime
-                numeric = pd.to_numeric(df_result[col], errors='coerce')
-                df_result[col] = pd.to_datetime(numeric, unit='D', origin='1899-12-30', errors='coerce')
-                logger.info(f"✓ Converted Excel serial dates in '{col}'")
-
             elif rule.action == DataCleaningAction.PARSE_TEXT_DATE:
                 # Parse textual dates with flexible format
                 df_result[col] = pd.to_datetime(df_result[col], errors='coerce', infer_datetime_format=True)
@@ -1249,9 +1228,9 @@ class StructureAnalyzer:
   "transformations": [
     {{
       "id": "unique_id",
-      "type": "use_row_as_header" | "skip_rows" | "drop_columns" | "rename_columns" | "drop_rows",
+      "type": "use_row_as_header",
       "description": "Human-readable description",
-      "params": {{"row_index": 0}} or {{"rows_to_skip": 2}} or {{"columns": [...]}} or {{"mapping": {{"col_name_pre":"col_name_post"}}}} or {{"indices": 1}} etc,
+      "params": {{"row_index": 0}},
       "confidence": 0.95
     }}
   ],
@@ -1320,7 +1299,7 @@ Be precise and confident in your assessment. Always respond in valid JSON format
         try:
             if trans.type == TransformationType.USE_ROW_AS_HEADER:
                 row_idx = trans.params["row_index"]
-                df_result.columns = df_result.iloc[row_idx].astype(str).tolist()
+                df_result.columns = df_result.iloc[row_idx].astype(str).togilist()
                 df_result = df_result.iloc[row_idx + 1:].reset_index(drop=True)
                 df_result = StructureAnalyzer.validate_and_fix_columns(df_result, f"[{trans.id}] ")
                 
