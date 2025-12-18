@@ -43,6 +43,18 @@ class DataCleaningAction(str, Enum):
     STRIP_WHITESPACE = "strip_whitespace"
     NORMALIZE_CASE = "normalize_case"
     REPLACE_VALUES = "replace_values"
+    # Advanced numeric cleaning
+    REMOVE_CURRENCY_SYMBOL = "remove_currency_symbol"
+    CONVERT_PERCENT_TO_FLOAT = "convert_percent_to_float"
+    CONVERT_PARENTHESES_TO_NEGATIVE = "convert_parentheses_to_negative"
+    EXTRACT_NUMBER_FROM_STRING = "extract_number_from_string"
+    # Advanced datetime cleaning
+    CONVERT_EXCEL_SERIAL_DATE = "convert_excel_serial_date"
+    PARSE_TEXT_DATE = "parse_text_date"
+    # Boolean cleaning
+    MAP_TO_BOOLEAN = "map_to_boolean"
+    # Null handling
+    REPLACE_PLACEHOLDERS_WITH_NAN = "replace_placeholders_with_nan"
 
 
 class CleaningRule(BaseModel):
@@ -84,7 +96,8 @@ class ColumnProfile(BaseModel):
     sample_raw_values: List[str]  # Original string values
     has_thousand_separator: bool = False
     decimal_separator: Optional[str] = None
-    
+    data_issues: List[Dict[str, Any]] = Field(default_factory=list)  # Detected data quality issues
+
     def to_dict(self) -> Dict[str, Any]:
         return self.model_dump()
 
@@ -407,8 +420,25 @@ class SQLQueryTool:
 # ============================================================================
 
 class TypeInferenceEngine:
-    """Smart type inference that handles formatted numbers"""
-    
+    """Smart type inference that handles formatted numbers and various data issues"""
+
+    # Common null placeholders
+    NULL_PLACEHOLDERS = {'N/A', 'n/a', 'NA', 'null', 'NULL', 'None', 'NONE', '-', '?', 'Unknown', 'unknown', '', ' '}
+
+    # Currency symbols
+    CURRENCY_SYMBOLS = {'$', '€', '£', '¥', 'USD', 'EUR', 'GBP', 'JPY', 'VND', 'VNĐ', '₫'}
+
+    # Boolean mappings
+    BOOLEAN_MAPPINGS = {
+        'yes': True, 'no': False,
+        'y': True, 'n': False,
+        'true': True, 'false': False,
+        'có': True, 'không': False,
+        'enabled': True, 'disabled': False,
+        '1': True, '0': False,
+        'on': True, 'off': False
+    }
+
     @staticmethod
     def detect_thousand_separator(series: pd.Series) -> Optional[str]:
         """Detect thousand separator (. or ,)"""
@@ -513,13 +543,121 @@ class TypeInferenceEngine:
                 pass
         
         return 'string', {}
-    
+
+    @staticmethod
+    def detect_data_issues(series: pd.Series) -> List[Dict[str, Any]]:
+        """
+        Detect various data quality issues in a series.
+        Returns list of issues with type and details.
+        """
+        issues = []
+        sample = series.dropna().astype(str).head(100)
+
+        if len(sample) == 0:
+            return issues
+
+        # 1. Currency symbols
+        currency_pattern = r'[$€£¥₫]|USD|EUR|GBP|JPY|VND|VNĐ'
+        has_currency = sample.str.contains(currency_pattern, regex=True, na=False).any()
+        if has_currency:
+            issues.append({
+                'type': 'currency',
+                'action': DataCleaningAction.REMOVE_CURRENCY_SYMBOL,
+                'description': 'Contains currency symbols',
+                'examples': sample[sample.str.contains(currency_pattern, regex=True, na=False)].head(3).tolist()
+            })
+
+        # 2. Percentages
+        percent_pattern = r'^\s*-?\d+(?:[.,]\d+)?\s*%\s*$'
+        has_percent = sample.str.match(percent_pattern, na=False).any()
+        if has_percent:
+            issues.append({
+                'type': 'percentage',
+                'action': DataCleaningAction.CONVERT_PERCENT_TO_FLOAT,
+                'description': 'Contains percentage values',
+                'examples': sample[sample.str.match(percent_pattern, na=False)].head(3).tolist()
+            })
+
+        # 3. Accounting negatives (parentheses)
+        paren_pattern = r'^\(\s*\d+(?:[.,]\d+)?\s*\)$'
+        has_parentheses = sample.str.match(paren_pattern, na=False).any()
+        if has_parentheses:
+            issues.append({
+                'type': 'accounting_negative',
+                'action': DataCleaningAction.CONVERT_PARENTHESES_TO_NEGATIVE,
+                'description': 'Contains accounting-style negative numbers (parentheses)',
+                'examples': sample[sample.str.match(paren_pattern, na=False)].head(3).tolist()
+            })
+
+        # 4. Units (numbers with text suffix)
+        unit_pattern = r'^\s*\d+(?:[.,]\d+)?\s+[a-zA-Z]+\d*\s*$'
+        has_units = sample.str.match(unit_pattern, na=False).any()
+        if has_units:
+            issues.append({
+                'type': 'units_suffix',
+                'action': DataCleaningAction.EXTRACT_NUMBER_FROM_STRING,
+                'description': 'Contains numbers with unit suffixes (kg, cm, m2, etc.)',
+                'examples': sample[sample.str.match(unit_pattern, na=False)].head(3).tolist()
+            })
+
+        # 5. Excel serial dates
+        try:
+            numeric_values = pd.to_numeric(sample, errors='coerce')
+            if numeric_values.notna().sum() > 0:
+                # Excel serial dates typically range from 1 to 50000+
+                in_date_range = (numeric_values >= 1) & (numeric_values <= 100000)
+                if in_date_range.sum() / len(numeric_values) > 0.5:
+                    issues.append({
+                        'type': 'excel_serial_date',
+                        'action': DataCleaningAction.CONVERT_EXCEL_SERIAL_DATE,
+                        'description': 'Looks like Excel serial date numbers',
+                        'examples': sample.head(3).tolist()
+                    })
+        except:
+            pass
+
+        # 6. Boolean-like values
+        unique_lower = set(sample.str.lower().str.strip())
+        boolean_keys = set(TypeInferenceEngine.BOOLEAN_MAPPINGS.keys())
+        if unique_lower.issubset(boolean_keys | {'nan', 'none'}):
+            issues.append({
+                'type': 'boolean_text',
+                'action': DataCleaningAction.MAP_TO_BOOLEAN,
+                'description': 'Contains boolean-like text values',
+                'examples': list(unique_lower)[:5]
+            })
+
+        # 7. Null placeholders
+        null_placeholders_found = unique_lower & TypeInferenceEngine.NULL_PLACEHOLDERS
+        if null_placeholders_found:
+            issues.append({
+                'type': 'null_placeholders',
+                'action': DataCleaningAction.REPLACE_PLACEHOLDERS_WITH_NAN,
+                'description': 'Contains text representing null values',
+                'examples': list(null_placeholders_found)
+            })
+
+        return issues
+
     @staticmethod
     def generate_cleaning_rules(df: pd.DataFrame, profiles: Dict[str, ColumnProfile]) -> List[CleaningRule]:
-        """Generate cleaning rules based on inferred types"""
+        """Generate cleaning rules based on inferred types and detected issues"""
         rules = []
-        
+
         for col_name, profile in profiles.items():
+            # First, generate rules from detected data issues
+            for issue in profile.data_issues:
+                rule_id = f"clean_{col_name}_{issue['type']}"
+                rules.append(CleaningRule(
+                    id=rule_id,
+                    column=col_name,
+                    action=issue['action'],
+                    description=f"{col_name}: {issue['description']} (e.g., {issue['examples'][:2]})",
+                    params=issue.get('params', {}),
+                    applied=False
+                ))
+
+            # Then, existing logic for type conversions
             # Skip if inferred type matches pandas type
             if profile.inferred_type == 'int' and df[col_name].dtype in ['int64', 'int32']:
                 continue
@@ -629,11 +767,69 @@ class TypeInferenceEngine:
                 elif case_type == 'upper':
                     df_result[col] = df_result[col].astype(str).str.upper()
                 logger.info(f"✓ Normalized case for '{col}'")
-            
+
+            # Advanced numeric cleaning
+            elif rule.action == DataCleaningAction.REMOVE_CURRENCY_SYMBOL:
+                # Remove currency symbols and convert to numeric
+                currency_pattern = r'[$€£¥₫]|USD|EUR|GBP|JPY|VND|VNĐ'
+                series = df_result[col].astype(str).str.replace(currency_pattern, '', regex=True)
+                series = series.str.replace(',', '').str.strip()
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Removed currency symbols from '{col}'")
+
+            elif rule.action == DataCleaningAction.CONVERT_PERCENT_TO_FLOAT:
+                # Remove % and convert to float (optionally divide by 100)
+                series = df_result[col].astype(str).str.replace('%', '').str.strip()
+                df_result[col] = pd.to_numeric(series, errors='coerce') / 100
+                logger.info(f"✓ Converted percentages to floats in '{col}'")
+
+            elif rule.action == DataCleaningAction.CONVERT_PARENTHESES_TO_NEGATIVE:
+                # Convert (500) to -500
+                def convert_paren(x):
+                    s = str(x).strip()
+                    if s.startswith('(') and s.endswith(')'):
+                        return '-' + s[1:-1]
+                    return s
+                series = df_result[col].apply(convert_paren)
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Converted parentheses to negatives in '{col}'")
+
+            elif rule.action == DataCleaningAction.EXTRACT_NUMBER_FROM_STRING:
+                # Extract numeric part from strings like "50 kg", "175 cm"
+                series = df_result[col].astype(str).str.extract(r'([-+]?\d+(?:[.,]\d+)?)', expand=False)
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Extracted numbers from strings in '{col}'")
+
+            # Advanced datetime cleaning
+            elif rule.action == DataCleaningAction.CONVERT_EXCEL_SERIAL_DATE:
+                # Convert Excel serial dates to datetime
+                numeric = pd.to_numeric(df_result[col], errors='coerce')
+                df_result[col] = pd.to_datetime(numeric, unit='D', origin='1899-12-30', errors='coerce')
+                logger.info(f"✓ Converted Excel serial dates in '{col}'")
+
+            elif rule.action == DataCleaningAction.PARSE_TEXT_DATE:
+                # Parse textual dates with flexible format
+                df_result[col] = pd.to_datetime(df_result[col], errors='coerce', infer_datetime_format=True)
+                logger.info(f"✓ Parsed text dates in '{col}'")
+
+            # Boolean mapping
+            elif rule.action == DataCleaningAction.MAP_TO_BOOLEAN:
+                # Map various text values to boolean
+                df_result[col] = df_result[col].astype(str).str.lower().str.strip().map(
+                    TypeInferenceEngine.BOOLEAN_MAPPINGS
+                )
+                logger.info(f"✓ Mapped to boolean in '{col}'")
+
+            # Null handling
+            elif rule.action == DataCleaningAction.REPLACE_PLACEHOLDERS_WITH_NAN:
+                # Replace null placeholders with actual NaN
+                df_result[col] = df_result[col].replace(list(TypeInferenceEngine.NULL_PLACEHOLDERS), pd.NA)
+                logger.info(f"✓ Replaced null placeholders in '{col}'")
+
         except Exception as e:
             logger.error(f"✗ Failed to apply cleaning rule {rule.id}: {str(e)}")
             raise
-        
+
         return df_result
 
 
@@ -687,7 +883,7 @@ class DataIngestor:
         return sources
     
     @classmethod
-    def load_source(cls, source: DataSource, header: Optional[int] = None) -> pd.DataFrame:
+    def load_source(cls, source: DataSource, header: Optional[int] = 0) -> pd.DataFrame:
         """Load a specific data source"""
         try:
             if source.source_type == "csv":
@@ -710,8 +906,31 @@ class DataIngestor:
     
     @classmethod
     def load_raw(cls, source: DataSource) -> pd.DataFrame:
-        """Load raw data without headers"""
-        return cls.load_source(source, header=None)
+        """
+        Load raw data strictly as strings with NO header assumptions.
+        This prevents PyArrow errors with mixed types and allows correct structure analysis.
+        """
+        try:
+            # Luôn đọc tất cả là string để tránh lỗi mixed types của PyArrow
+            # Luôn để header=None để LLM nhìn thấy dòng đầu tiên thực tế
+            if source.source_type == "csv":
+                df = pd.read_csv(source.file_path, header=None, dtype=str)
+            else:
+                df = pd.read_excel(
+                    source.file_path, 
+                    sheet_name=source.sheet_name,
+                    header=None,
+                    dtype=str
+                )
+            
+            # Thay thế NaN bằng chuỗi rỗng để clean hơn khi hiển thị
+            df = df.fillna("")
+            
+            logger.info(f"✓ Loaded RAW {source.source_id}: {len(df)} rows (treated as string grid)")
+            return df
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load raw source {source.source_id}: {str(e)}")
 
 
 # ============================================================================
@@ -719,7 +938,7 @@ class DataIngestor:
 # ============================================================================
 
 class StructureAnalyzer:
-    """Analyzes raw DataFrame structure with improved clean data detection"""
+    """Analyzes raw DataFrame structure using LLM for clean data detection"""
     
     def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
         self.client = OpenAI(api_key=api_key)
@@ -731,23 +950,15 @@ class StructureAnalyzer:
         max_preview_rows: int = 10
     ) -> Tuple[Dict[str, Any], List[Transformation], List[Question], bool]:
         """
-        Analyze raw structure and propose transformations.
+        Analyze raw structure using LLM to check if data is clean.
         Returns: (structure_info, transformations, questions, is_clean)
         """
         
-        # First, perform heuristic check
-        is_clean, issues = self._heuristic_structure_check(df)
-        
-        if is_clean:
-            logger.info("✓ Data structure appears clean - no transformations needed")
-            structure_info = self._extract_structure_info(df, max_preview_rows)
-            return structure_info, [], [], True
-        
-        logger.info(f"⚠ Detected structure issues: {', '.join(issues)}")
-        
-        # Perform LLM analysis
+        # Extract structure info for LLM analysis
         structure_info = self._extract_structure_info(df, max_preview_rows)
-        prompt = self._build_structure_prompt(structure_info, issues)
+        
+        # Use LLM to check if data is clean and propose transformations
+        prompt = self._build_structure_prompt(structure_info)
         
         try:
             response = self.client.chat.completions.create(
@@ -762,56 +973,21 @@ class StructureAnalyzer:
             
             result = json.loads(response.choices[0].message.content)
             
+            is_clean = result.get("is_clean", False)
             transformations = [Transformation(**t) for t in result.get("transformations", [])]
             questions = [Question(**q) for q in result.get("questions", [])]
             
-            logger.info(f"✓ Analyzed structure: {len(transformations)} transformations proposed, {len(questions)} questions")
-            return structure_info, transformations, questions, False
+            if is_clean:
+                logger.info("✓ Data structure is clean - no transformations needed")
+                return structure_info, [], [], True, []
+            else:
+                issues = result.get("detected_issues", [])
+                logger.info(f"⚠ Detected structure issues: {', '.join(issues)}")
+                logger.info(f"✓ Analyzed structure: {len(transformations)} transformations proposed, {len(questions)} questions")
+                return structure_info, transformations, questions, False,issues
             
         except Exception as e:
             raise RuntimeError(f"Structure analysis failed: {str(e)}")
-    
-    def _heuristic_structure_check(self, df: pd.DataFrame) -> Tuple[bool, List[str]]:
-        """
-        Fast heuristic check for common structure issues.
-        Returns: (is_clean, list_of_issues)
-        """
-        issues = []
-        
-        first_row = df.iloc[0]
-        potential_headers = first_row.astype(str).tolist()
-        
-        numeric_headers = sum(1 for val in potential_headers if str(val).replace('.', '').replace('-', '').isdigit())
-        if numeric_headers > len(potential_headers) * 0.5:
-            issues.append("First row contains mostly numeric values (should be headers)")
-        
-        if all(str(col).isdigit() for col in df.columns):
-            issues.append("Column names are numeric indices (no header row detected)")
-        
-        empty_cols = sum(1 for col in df.columns if pd.isna(col) or str(col).strip() == '')
-        if empty_cols > 0:
-            issues.append(f"{empty_cols} empty column name(s)")
-        
-        # Check 4: Duplicate column names
-        if len(df.columns) != len(set(df.columns)):
-            issues.append("Duplicate column names detected")
-        
-        # Check 5: Excessive nulls in first few rows (might need to skip)
-        if len(df) > 3:
-            first_rows_null_ratio = df.head(3).isna().sum().sum() / (3 * len(df.columns))
-            if first_rows_null_ratio > 0.7:
-                issues.append("First 3 rows are mostly empty (might need to skip)")
-        
-        # Check 6: Are column names actually descriptive?
-        if not all(str(col).isdigit() for col in df.columns):
-            # We have string column names - check if they're descriptive
-            avg_length = sum(len(str(col)) for col in df.columns) / len(df.columns)
-            if avg_length < 3:
-                issues.append("Column names are too short (less than 3 characters on average)")
-        
-        is_clean = len(issues) == 0
-        
-        return is_clean, issues
     
     def _extract_structure_info(self, df: pd.DataFrame, max_rows: int = 10) -> Dict[str, Any]:
         """Extract structure information for LLM analysis"""
@@ -823,52 +999,82 @@ class StructureAnalyzer:
             "dtypes": df.dtypes.astype(str).to_dict(),
             "preview_data": df.head(preview_rows).to_dict(orient='records'),
             "null_counts": df.isna().sum().to_dict(),
-            "first_row_values": df.iloc[0].tolist() if len(df) > 0 else []
+            "first_row_values": df.iloc[0].tolist() if len(df) > 0 else [],
+            "last_few_rows": df.tail(3).to_dict(orient='records') if len(df) > 3 else []
         }
     
-    def _build_structure_prompt(self, info: Dict[str, Any], detected_issues: List[str]) -> str:
+    def _build_structure_prompt(self, info: Dict[str, Any]) -> str:
         """Build prompt for structure analysis"""
-        return f"""Analyze this raw DataFrame structure and propose transformations.
-
-**Detected Issues (from heuristics):**
-{chr(10).join('- ' + issue for issue in detected_issues)}
+        return f"""Analyze this raw DataFrame structure to determine if it's clean or needs transformations.
 
 **DataFrame Info:**
 - Shape: {info['shape']['rows']} rows × {info['shape']['columns']} columns
 - Current column names: {info['column_names']}
-- First row values: {info['first_row_values'][:10]}
+- Data types: {json.dumps(info['dtypes'], indent=2)}
+- Null counts: {json.dumps(info['null_counts'], indent=2)}
+
+**First row values:**
+{json.dumps(info['first_row_values'], indent=2, default=str)}
 
 **Preview (first few rows):**
 ```json
-{json.dumps(info['preview_data'][:5], indent=2, default=str)}
+{json.dumps(info['preview_data'], indent=2, default=str)}
+```
+
+**Last few rows (for context):**
+```json
+{json.dumps(info.get('last_few_rows', []), indent=2, default=str)}
 ```
 
 **Instructions:**
-1. Determine if this data needs structural transformation
-2. Common issues to look for:
-   - First row should be used as header
-   - Empty rows at the top that should be skipped
-   - Unnamed or poorly named columns
-   - Empty columns that should be dropped
-   - Merged header rows that need special handling
+1. **First, determine if this data is CLEAN or needs transformations**
+   
+   A clean dataset has:
+   - Proper descriptive column headers (not numeric indices like 0, 1, 2...)
+   - Column names are not in the first data row
+   - No empty/unnamed columns
+   - No duplicate column names
+   - Data starts from the correct row (no metadata rows at top)
+   - Consistent data structure throughout
 
-3. For each transformation, propose:
-   - A unique ID (e.g., "use_row_0_as_header")
+2. **If data is CLEAN:**
+   - Set "is_clean": true
+   - Leave "transformations" and "detected_issues" empty
+   - No questions needed
+
+3. **If data needs transformations:**
+   - Set "is_clean": false
+   - List all "detected_issues" 
+   - Propose transformations to fix each issue:
+     * Use first row as header
+     * Skip empty/metadata rows at the top
+     * Drop empty columns
+     * Rename poorly named columns
+     * Handle merged headers
+     * Remove duplicate columns
+   
+4. **For each transformation, include:**
+   - Unique ID (e.g., "use_row_0_as_header")
    - Type of transformation
-   - Description
-   - Parameters
+   - Clear description
+   - Required parameters
    - Confidence score (0.0-1.0)
 
-4. If you're uncertain about any transformation, create a question for the user
+5. **Ask questions only when:**
+   - You're uncertain about a transformation
+   - Multiple valid approaches exist
+   - User input is needed to decide
 
 **Response Format:**
 {{
+  "is_clean": true/false,
+  "detected_issues": ["issue 1", "issue 2", ...],
   "transformations": [
     {{
       "id": "unique_id",
-      "type": "use_row_as_header" | "skip_rows" | "drop_columns" | "rename_columns" | ...,
+      "type": "use_row_as_header" | "skip_rows" | "drop_columns" | "rename_columns" | "drop_rows",
       "description": "Human-readable description",
-      "params": {{"row_index": 0}} or {{"rows_to_skip": 2}} etc,
+      "params": {{"row_index": 0}} or {{"rows_to_skip": 2}} or {{"columns": [...]}} or {{"mapping": {{"col_name_pre":"col_name_post"}}}} or {{"indices": 1}} etc,
       "confidence": 0.95
     }}
   ],
@@ -883,21 +1089,38 @@ class StructureAnalyzer:
   ]
 }}
 
-**IMPORTANT:** If the data already has proper headers and clean structure, return empty transformations list!
+**IMPORTANT:** 
+- Be thorough in examining the data structure
+- Look at column names, first row, data types, and null patterns
+- If everything looks good, confidently mark as clean
+- Don't propose unnecessary transformations
 """
     
     def _get_structure_system_prompt(self) -> str:
         """System prompt for structure analysis"""
-        return """You are an expert data analyst specializing in detecting and fixing structural issues in raw tabular data.
+        return """You are an expert data analyst specializing in detecting structural issues in raw tabular data.
 
 Your job is to:
-1. Identify structural problems (wrong headers, empty rows, malformed columns)
-2. Propose specific transformations to fix them
-3. Ask clarifying questions when uncertain
+1. Carefully examine the DataFrame structure by looking at column names, first rows, data types, and patterns
+2. Determine if the data is CLEAN (ready to use) or needs TRANSFORMATIONS
+3. If transformations are needed, identify all structural problems and propose specific fixes
+4. Ask clarifying questions only when genuinely uncertain
 
-Be conservative: if the data looks clean, don't propose unnecessary transformations.
+**What makes data CLEAN:**
+- Descriptive column headers (not 0, 1, 2, or "Unnamed: X")
+- Headers are in the column name row, not in the first data row
+- No empty or duplicate columns
+- Data starts from the appropriate row
+- Consistent structure throughout
 
-Always respond in valid JSON format with "transformations" and "questions" arrays."""
+**Common structural issues:**
+- Numeric column indices (0, 1, 2...) instead of headers → first row likely contains real headers
+- First row contains text headers while column names are numeric → use first row as header
+- Empty rows at top (metadata, titles) → skip those rows
+- Unnamed or poorly named columns → rename or drop them
+- Merged or multi-level headers → special handling needed
+
+Be precise and confident in your assessment. Always respond in valid JSON format."""
     
     @staticmethod
     def apply_transformation(df: pd.DataFrame, trans: Transformation) -> pd.DataFrame:
@@ -909,11 +1132,12 @@ Always respond in valid JSON format with "transformations" and "questions" array
                 row_idx = trans.params["row_index"]
                 df_result.columns = df_result.iloc[row_idx].astype(str).tolist()
                 df_result = df_result.iloc[row_idx + 1:].reset_index(drop=True)
+                df_result = StructureAnalyzer.validate_and_fix_columns(df_result, f"[{trans.id}] ")
                 
             elif trans.type == TransformationType.SKIP_ROWS:
                 rows_to_skip = trans.params["rows_to_skip"]
                 df_result = df_result.iloc[rows_to_skip:].reset_index(drop=True)
-                
+                df_result = StructureAnalyzer.validate_and_fix_columns(df_result, f"[{trans.id}] ")
             elif trans.type == TransformationType.DROP_COLUMNS:
                 cols = trans.params["columns"]
                 df_result = df_result.drop(columns=cols, errors='ignore')
@@ -933,7 +1157,40 @@ Always respond in valid JSON format with "transformations" and "questions" array
             raise
         
         return df_result
-
+    @staticmethod
+    def validate_and_fix_columns(df: pd.DataFrame, log_prefix: str = "") -> pd.DataFrame:
+        """Validate and fix column names after transformation"""
+        df_result = df.copy()
+        
+        # Convert to strings
+        df_result.columns = [str(col).strip() if col is not None else '' for col in df_result.columns]
+        
+        # Fix empty columns
+        new_columns = []
+        unnamed_counter = 1
+        for col in df_result.columns:
+            if not col or col == '' or col.lower() == 'nan':
+                new_columns.append(f'Unnamed_{unnamed_counter}')
+                unnamed_counter += 1
+            else:
+                new_columns.append(col)
+        df_result.columns = new_columns
+        
+        # Fix duplicates
+        if df_result.columns.duplicated().any():
+            col_counts = {}
+            final_columns = []
+            for col in df_result.columns:
+                if col not in col_counts:
+                    col_counts[col] = 0
+                    final_columns.append(col)
+                else:
+                    col_counts[col] += 1
+                    final_columns.append(f"{col}_{col_counts[col]}")
+            df_result.columns = final_columns
+            logger.info(f"{log_prefix}✓ Fixed duplicate columns")
+        
+        return df_result
 class DataInsightsAnalyzer:
     """Analyze data patterns, anomalies, and distributions using LLM"""
 
@@ -1126,6 +1383,22 @@ class ProfileGenerator:
         max_samples: int = 10
     ) -> Dict[str, ColumnProfile]:
         """Generate profile for each column with type inference"""
+        if df.columns.duplicated().any():
+            duplicates = df.columns[df.columns.duplicated()].tolist()
+            raise ValueError(
+                f"Duplicate column names found: {duplicates}. "
+                f"Please apply transformations to fix column names first."
+            )
+        
+        empty_cols = [col for col in df.columns if not str(col).strip()]
+        if empty_cols:
+            raise ValueError(
+                f"Empty column names found. Please rename these columns first."
+            )
+        
+        # ✅ Convert all to strings
+        df = df.copy()
+        df.columns = [str(col) for col in df.columns]
         profiles = {}
         
         for col in df.columns:
@@ -1135,12 +1408,17 @@ class ProfileGenerator:
             total = len(series)
             
             # Sample values
-            samples = series.dropna().head(max_samples).tolist()
-            raw_samples = series.dropna().astype(str).head(max_samples).tolist()
-            
+            try:
+                samples = series.dropna().head(max_samples).tolist()
+                raw_samples = series.dropna().astype(str).head(max_samples).tolist()
+            except:
+                logger.info(f'DF: {df}')
             # Type inference
             inferred_type, metadata = TypeInferenceEngine.infer_type(series)
-            
+
+            # Detect data issues
+            data_issues = TypeInferenceEngine.detect_data_issues(series)
+
             profile = ColumnProfile(
                 name=str(col),
                 pandas_dtype=str(series.dtype),
@@ -1152,7 +1430,8 @@ class ProfileGenerator:
                 sample_values=samples,
                 sample_raw_values=raw_samples,
                 has_thousand_separator=metadata.get('thousand_separator') is not None,
-                decimal_separator=metadata.get('decimal_separator')
+                decimal_separator=metadata.get('decimal_separator'),
+                data_issues=data_issues
             )
             profiles[str(col)] = profile
         
@@ -1223,7 +1502,28 @@ class SchemaGenerator:
 - Output Fields: {json.dumps([f.field_name for f in question_set.output_fields], indent=2)}
 - Notes: {question_set.additional_notes}
 """
-
+#         return f"""
+# **Response Format:**
+# {{
+#   "questions": [
+#     {{
+#       "id": "salary_unit",
+#       "question": "What is the currency unit for the 'Salary' column?",
+#       "suggested_answer": "VND",
+#       "target": "Salary.unit",
+#       "question_type": "semantic"
+#     }},
+#     {{
+#       "id": "area_unit",
+#       "question": "What is the unit of measurement for 'Area'?",
+#       "suggested_answer": "m2",
+#       "target": "Area.unit",
+#       "question_type": "semantic"
+#     }}
+#   ]
+# }}
+# Return all NONE and just 1 question
+# """
         return f"""Analyze this data and generate clarification questions to better understand the schema.{user_context}
 
 **Column Profiles:**
@@ -1306,13 +1606,28 @@ Always respond in valid JSON format."""
             )
             
             result = json.loads(response.choices[0].message.content)
-            
+
+            # Create case-insensitive mapping for column names
+            profile_mapping = {col.lower(): col for col in profiles.keys()}
+
             schema = {}
             for col, spec in result["schema"].items():
-                # Add original_type from profile
-                original_type = profiles[col].pandas_dtype
-                spec['original_type'] = original_type
-                schema[col] = ColumnSchema(**spec)
+                # Try to find matching column in profiles (case-insensitive)
+                col_lower = col.lower()
+                original_col = profile_mapping.get(col_lower, col)
+
+                # Add original_type from profile if found
+                if original_col in profiles:
+                    original_type = profiles[original_col].pandas_dtype
+                    spec['original_type'] = original_type
+                else:
+                    # Fallback: try to find best match or use 'object' as default
+                    logger.warning(f"Column '{col}' not found in profiles, using default 'object' type")
+                    spec['original_type'] = 'object'
+
+                # Use original column name from data
+                spec['name'] = original_col if original_col in profiles else col
+                schema[original_col if original_col in profiles else col] = ColumnSchema(**spec)
             
             questions = [Question(**q) for q in result.get("questions", [])]
             
@@ -1492,12 +1807,24 @@ class SchemaValidator:
         questions_json = []
         if question_set and question_set.user_questions:
             questions_json = [q.to_dict() for q in question_set.user_questions]
-
         fields_json = []
         if question_set and question_set.output_fields:
             fields_json = [f.to_dict() for f in question_set.output_fields]
+            
+        # Lấy Notes
+        additional_json = "No additional notes."
+        if question_set and question_set.additional_notes:
+            additional_json = question_set.additional_notes
+            
+        logger.info(f'Sending Validation Prompt with Notes: {additional_json}')
 
         return f"""Validate if the current schema can adequately answer the user's questions.
+
+    **🚨 EXISTING BUSINESS LOGIC & NOTES (CHECK HERE FIRST):**
+    ```text
+    {additional_json}
+    ```
+    *(If the answer to a question is found above, DO NOT ask for it again. Mark as sufficient.)*
 
     **User Questions:**
     {json.dumps(questions_json, indent=2)}
@@ -1512,12 +1839,11 @@ class SchemaValidator:
     {json.dumps(sample_rows[:5] if sample_rows else [], indent=2, default=str)}
 
     **Instructions:**
-    1. If a user asks for a field (e.g., "Net Worth") that DOES NOT exist in the schema:
-    - Check if it can be calculated from existing columns (e.g., Salary, Tax).
-    - If yes, ask the user for the FORMULA or LOGIC.
-    - Set target as "Global.logic" or "ColumnName.calculation".
-
-    2. If a column exists but is ambiguous, ask for clarification.
+    1. Check if "Existing Business Logic" answers the User Questions.
+    2. If a user asks for a field (e.g., "Net Worth") that is NOT in schema BUT is in Business Logic -> It is SUFFICIENT.
+    3. Only if truly missing:
+       - Ask for the FORMULA or LOGIC.
+       - Set target as "Global.logic" or "ColumnName.calculation".
 
     **Response Format:**
     {{
@@ -1541,28 +1867,24 @@ class SchemaValidator:
 
 Your task is to determine if a data schema is sufficient to answer specific user questions.
 
-Analyze:
-1. Can each user question be answered with the current schema?
-2. Are the expected output fields mappable to schema columns?
-3. Are there ambiguities or missing information?
-4. What additional clarifications are needed?
+🚨 **CRITICAL RULE - READ THIS FIRST**:
+You MUST check the "Additional Notes / Business Logic" section provided in the context.
+1. **IF A QUESTION IS ALREADY ANSWERED IN "ADDITIONAL NOTES":**
+   - You must consider the schema **SUFFICIENT** for that question.
+   - Do **NOT** generate a new clarification question for it.
+   - Assume the user knows how to calculate it based on the note.
 
-Be thorough but practical. Only request clarifications that are truly necessary.
+2. **IF A COLUMN IS MISSING BUT A FORMULA IS IN "ADDITIONAL NOTES":**
+   - This counts as SUFFICIENT. Do not ask for the formula again.
+
+Analyze:
+1. Can each user question be answered with the current schema OR the provided Business Logic/Notes?
+2. Are the expected output fields mappable to schema columns OR calculate-able via Notes?
+3. Only generate new questions for information that is **completely missing** from BOTH the Schema AND the Additional Notes.
+
+Be thorough but practical. STOP asking about things that are already defined in the Notes.
 
 Always respond in valid JSON format."""
-
-
-# ============================================================================
-# Agent Q&A System
-# ============================================================================
-
-# ============================================================================
-# Data Schema Agent - Flexible OpenAI Agent
-# ============================================================================
-
-# ============================================================================
-# Data Schema Agent - OpenAI Agent Standard
-# ============================================================================
 
 class DataSchemaAgent:
     """
@@ -1619,14 +1941,27 @@ class DataSchemaAgent:
         logger.info(f"DataSchemaAgent initialized with model: {self.model}")
 
     def _default_system_prompt(self) -> str:
-        """Default system prompt for data schema agent"""
-        return """You are an intelligent data analyst assistant with SQL query capabilities.
+        """Default system prompt for data schema agent with scenarios support"""
+        base_prompt = """You are an intelligent data analyst assistant with SQL query capabilities.
+
+🚨 **CRITICAL: SCENARIO-FIRST APPROACH** 🚨
+When answering user questions, you MUST follow this priority order:
+
+1. **CHECK FOR SCENARIO MATCH FIRST** (HIGHEST PRIORITY)
+   - Look at the user's question
+   - Check if it matches any defined scenario pattern in the scenarios section below
+   - If YES: Follow that scenario's output template EXACTLY
+   - Use SQL to get data values, then format according to the template
+   
+2. **FREE-FORM QUERY** (Only if no scenario matches)
+   - Use SQL queries to analyze data
+   - Provide insights and recommendations
 
 **Your Capabilities:**
 - Understand and explain data schemas
 - Execute SQL queries to analyze data
+- Follow predefined output templates for common questions
 - Provide insights and recommendations
-- Answer questions about data with evidence
 
 **SQL Guidelines:**
 - You can only execute SELECT queries (no INSERT, UPDATE, DELETE)
@@ -1651,6 +1986,18 @@ class DataSchemaAgent:
 - Be concise and helpful
 
 When you need to query data, use the execute_sql_query tool."""
+
+        # Add scenarios instruction if available
+        scenarios_instruction = self._format_scenarios_for_prompt()
+        if scenarios_instruction:
+            base_prompt = f"""{base_prompt}
+
+{scenarios_instruction}
+
+🔴 REMEMBER: Always check for scenario matches FIRST before doing free-form analysis!"""
+        
+        return base_prompt
+
 
     def query(
         self,
@@ -1850,14 +2197,13 @@ When you need to query data, use the execute_sql_query tool."""
         # Combine all tool responses
         if responses:
             result_summary = "\n\n".join(responses)
-
-            # Get LLM interpretation of results
+            scenarios_instruction = self._format_scenarios_for_prompt()
             try:
                 interp_response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
                         {"role": "system", "content": "You are a data analyst. Interpret SQL query results and provide insights to answer the user's question."},
-                        {"role": "user", "content": f"**Original Question:** {original_question}\n\n**Query Results:**\n{result_summary}\n\nPlease interpret these results and answer the question:"}
+                        {"role": "user", "content": f"**Original Question:** {original_question}\n\n**Query Results:**\n{result_summary}\n\n**Scenarios:**{scenarios_instruction}\n\nPlease interpret these results and answer the question:"}
                     ],
                     temperature=0.7,
                     max_tokens=500
@@ -2022,32 +2368,67 @@ Only SELECT queries are allowed.""",
                 }
             }
         }]
+    def _format_scenarios_for_prompt(self) -> str:
+        """
+        Format scenarios into instructions for the LLM.
+        Handles pattern matching and variable templating instructions.
+        """
+        if not self.session.scenarios:
+            return ""
 
-# File: schema_pipeline.py -> Class: DataSchemaAgent
+        prompt_parts = ["**🎯 DEFINED SCENARIOS & OUTPUT PATTERNS:**"]
+        prompt_parts.append("You MUST follow these patterns when the user's question matches the intent of a scenario.")
+        prompt_parts.append("IMPORTANT: These scenarios are EXAMPLES. Apply the same logic/formulas to ANY entity (e.g., if defined for Employee A, apply to Employee B).")
+
+        for idx, sc in enumerate(self.session.scenarios):
+            output_desc = sc.output_format.get("description", "") if sc.output_format else ""
+            
+            scenario_text = f"""
+    [Scenario {idx+1}: {sc.name}]
+    - Intent/Trigger: Questions like {json.dumps(sc.questions)}
+    - Relevant Fields: {', '.join(sc.selected_fields)}
+    - Output Template: "{output_desc}"
+    """
+            prompt_parts.append(scenario_text)
+
+        prompt_parts.append("""
+    **Instructions for Scenarios:**
+    1. **Pattern Matching**: If the user asks about a different person/item than in the scenario example, use the SAME formula and format.
+    2. **Placeholders**: When you see syntax like `{data.ColumnName}` in the Output Template:
+       - First, execute SQL to get the value of 'ColumnName' for the requested entity.
+       - Then, REPLACE `{data.ColumnName}` with the actual value in the response.
+    3. **Calculations**: If the template implies a calculation (e.g., "Salary * 0.9"), perform the calculation using the SQL values.
+    """)
+        
+        return "\n".join(prompt_parts)
 
     def _build_context(self) -> str:
-        """Build context including Business Logic/Notes"""
+        """Build context including Business Logic/Notes and Scenarios"""
         parts = []
 
         # 1. Data Source Info
         if self.session.sources:
             parts.append(f"**Data Source:** {self.session.sources[0].file_path}")
 
-        # 2. BUSINESS LOGIC & NOTES (Thêm phần này)
-        if self.session.question_set and self.session.question_set.additional_notes:
-            parts.append(f"**⚠️ BUSINESS RULES & CALCULATIONS:**\n{self.session.question_set.additional_notes}")
-            parts.append("(IMPORTANT: Use these rules when generating SQL queries)")
-
-        # 3. Schema Summary
+        # 2. Schema Summary
         if self.session.schema:
             schema_lines = []
-            for col, col_schema in list(self.session.schema.items())[:20]: # Show more columns
+            for col, col_schema in list(self.session.schema.items())[:30]: # Limit to avoid context overflow
                 line = f"- {col}: {col_schema.semantic_type} ({col_schema.physical_type})"
                 if col_schema.description:
-                    line += f" | Desc: {col_schema.description}" # Show description
+                    line += f" | Desc: {col_schema.description}"
                 schema_lines.append(line)
             
-            parts.append("**Schema:**\n" + "\n".join(schema_lines))
+            parts.append("**Schema Structure:**\n" + "\n".join(schema_lines))
+
+        # 3. Business Rules (General)
+        if self.session.question_set and self.session.question_set.additional_notes:
+            parts.append(f"**⚠️ GLOBAL BUSINESS RULES:**\n{self.session.question_set.additional_notes}")
+
+        # 4. SCENARIOS (New Section)
+        scenario_context = self._format_scenarios_for_prompt()
+        if scenario_context:
+            parts.append(scenario_context)
 
         return "\n\n".join(parts)
     
@@ -2196,10 +2577,10 @@ class SessionManager:
         return session
     
     def save_checkpoint(
-        self, 
-        session: Session, 
-        df: pd.DataFrame, 
-        stage: str, 
+        self,
+        session: Session,
+        df: pd.DataFrame,
+        stage: str,
         description: str
     ) -> DataFrameCheckpoint:
         """Save DataFrame checkpoint"""
@@ -2207,16 +2588,9 @@ class SessionManager:
         timestamp = datetime.now().isoformat()
         
         checkpoint_file = self.checkpoints_dir / f"{checkpoint_id}.parquet"
-        
-        # --- FIX START: Sanitize DataFrame for Parquet ---
+
         df_save = df.copy()
-        
-        # 1. Force column names to string
         df_save.columns = df_save.columns.astype(str)
-        
-        # 2. De-duplicate column names
-        # Example: ["ID", "Name", "ID"] -> ["ID", "Name", "ID.1"]
-        # This prevents df[col] from returning a DataFrame (causing the crash)
         if not df_save.columns.is_unique:
             new_columns = []
             seen = {}
@@ -2228,21 +2602,15 @@ class SessionManager:
                     seen[col] = 0
                     new_columns.append(col)
             df_save.columns = new_columns
-
-        # 3. Handle mixed types in object columns
         for col in df_save.columns:
-            # Now safe because columns are unique, so df_save[col] is always a Series
             if df_save[col].dtype == 'object':
                 df_save[col] = df_save[col].astype(str)
-        # --- FIX END ---
-
         try:
-            df_save.to_parquet(checkpoint_file, index=False)
+            df.to_parquet(checkpoint_file, index=False)
         except Exception as e:
-            logger.warning(f"Parquet save failed: {e}. Falling back to CSV.")
+            logger.warning(f"Parquet save failed: {e}. Falling back to CSV")
             checkpoint_file = self.checkpoints_dir / f"{checkpoint_id}.csv"
-            df.to_csv(checkpoint_file, index=False)
-        
+            df.to_csv(checkpoint_file,index=False)
         checkpoint = DataFrameCheckpoint(
             checkpoint_id=checkpoint_id,
             stage=stage,
@@ -2255,12 +2623,12 @@ class SessionManager:
         session.checkpoints.append(checkpoint)
         
         logger.info(f"✓ Checkpoint: {stage} ({checkpoint.shape[0]}×{checkpoint.shape[1]})")
-        return checkpoint    
+        return checkpoint
+    
     def load_checkpoint(self, checkpoint: DataFrameCheckpoint) -> pd.DataFrame:
         """Load DataFrame from checkpoint"""
         if not checkpoint.file_path:
             raise ValueError("No file path")
-        
         path = Path(checkpoint.file_path)
         
         if path.suffix == '.parquet':
@@ -2269,9 +2637,9 @@ class SessionManager:
             df = pd.read_csv(path)
         else:
             raise ValueError(f"Unsupported checkpoint format: {path.suffix}")
-            
         logger.info(f"✓ Loaded: {checkpoint.stage}")
-        return df    
+        return df
+    
     def save_session(self, session: Session):
         """Save session to JSON"""
         session_file = self.output_dir / f"session_{session.session_id}.json"
