@@ -1,402 +1,353 @@
-# hst_agent.py - HST Agent with Text2SQL and ReAct mechanism
-"""HST Agent for querying tender records database using Text2SQL with ReAct strategy"""
-import logging
-import os
-import time
-import redis
 import json
-import hashlib
-import asyncio
-from decimal import Decimal
-from typing import List, Dict, Any, Generator, Optional, Tuple, AsyncGenerator
-from sqlalchemy import create_engine, text, inspect
-from sqlalchemy.exc import SQLAlchemyError, OperationalError, TimeoutError as SQLTimeoutError
-from openai import OpenAI, AsyncOpenAI, RateLimitError, APIConnectionError, AuthenticationError
-from src.common import TokenUsage
-from src.utils.utils_logging import log_openai_agent_response, log_openai_agent_error
-from datetime import datetime
+import os
 import re
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple, Union,Generator
+from enum import Enum
+import argparse
+from pydantic import BaseModel, Field
+import pandas as pd
+import numpy as np
+from openai import OpenAI
+import logging
+import sys
+import sqlite3
+import redis
+import hashlib
+import time 
 
+logging.basicConfig(level=os.getenv('LOGLEVEL','INFO').upper())
 logger = logging.getLogger(__name__)
 
-# ERROR CODE MAPPING
-ERROR_CODES = {
-    "rate_limit": "01",
-    "authentication": "02",
-    "not_found": "03",
-    "connection": "04",
-    "timeout": "05",
-    "sql_error": "06",
-    "general": "99"
-}
+# ============================================================================
+# Domain Models
+# ============================================================================
+
+class TransformationType(str, Enum):
+    """Types of structural transformations"""
+    SKIP_ROWS = "skip_rows"
+    USE_ROW_AS_HEADER = "use_row_as_header"
+    DROP_COLUMNS = "drop_columns"
+    DROP_ROWS = "drop_rows"
+    RENAME_COLUMNS = "rename_columns"
+    SPLIT_COLUMN = "split_column"
+    MERGE_COLUMNS = "merge_columns"
+    CUSTOM = "custom"
 
 
-# ============================================================================
-# SCHEMA METADATA - Ngữ nghĩa cho từng cột
-# ============================================================================
-SCHEMA_METADATA = {
-    "Năm_phê_duyệt_KQLCNT": {
-        "description": "Năm phê duyệt kết quả lựa chọn nhà thầu (YYYY)",
-        "type": "bigint",
-        "unique values": "2024, 2025"
-    },
-    "Thời_gian_phê_duyệt_KQLCNT": {
-        "description": "Tháng phê duyệt kết quả lựa chọn nhà thầu",
-        "type": "text",
-        "unique values": "Tháng 01, tháng 02, ..., Tháng 12",
-    },
-    "Số_thông_báo_mời_thầu": {
-        "description": "Mã số thông báo mời thầu",
-        "type": "text",
-        "example": "IB2400101502-00"
-    },
-    "Tên_bên_trúng_thầu": {
-        "description": "Tên công ty trúng thầu",
-        "type": "text",
-        "example": "CÔNG TY TNHH FPT IS, CÔNG TY TNHH HỆ THỐNG THÔNG TIN FPT"
-    },
-    "Tên_bên_mời_thầu": {
-        "description": "Tên khách hàng/bên mời thầu",
-        "type": "text",
-        "example": "NGÂN HÀNG THƯƠNG MẠI CỔ PHẦN ĐẦU TƯ VÀ PHÁT TRIỂN VIỆT NAM"
-    },
-    "Tên_gói_thầu": {
-        "description": "Tên gói thầu/dự án",
-        "type": "text",
-        "example": "Mua sắm trang thiết bị phục vụ công tác lý lịch tư pháp"
-    },
-    "Giá_trúng_thầu": {
-        "description": "Giá trị trúng thầu (tỷ VND)",
-        "type": "double precision",
-        "example": "0.2818005, 1.9646627",
-        "note": "Dùng cột này để tính toán, sắp xếp, tổng hợp"
-    },
-    "Hình_thức_LCNT": {
-        "description": "Hình thức lựa chọn nhà thầu",
-        "type": "text",
-        "example": "Tham gia thực hiện cộng đồng, Đàm phán giá, Chỉ định thầu rút gọn"
-    },
-    "Mã_tỉnh_cũ": {
-        "description": "Mã tỉnh cũ của khách hàng",
-        "type": "text",
-        "example": "HNI, QBH"
-    },
-    "Mã_tỉnh_mới": {
-        "description": "Mã tỉnh mới của khách hàng",
-        "type": "text",
-        "example": "HNI, HUE"
-    },
-    "Lĩnh_vực_Khách_hàng": {
-        "description": "Lĩnh vực của khách hàng",
-        "type": "text",
-        "unique values": "GDS, BQP, TW, CQT, YTS, KHDN",
-        "values": {
-            "GDS": "Giáo dục số",
-            "BQP": "Bộ quốc phòng",
-            "TW": "Trung ương/Bộ ngành",
-            "CQT": "Chính quyền tỉnh",
-            "YTS": "Y tế số",
-            "KHDN": "Khách hàng doanh nghiệp",
+class DataCleaningAction(str, Enum):
+    """Types of data cleaning actions"""
+    REMOVE_THOUSAND_SEPARATOR = "remove_thousand_separator"
+    CONVERT_TO_INT = "convert_to_int"
+    CONVERT_TO_FLOAT = "convert_to_float"
+    CONVERT_TO_DATETIME = "convert_to_datetime"
+    STRIP_WHITESPACE = "strip_whitespace"
+    NORMALIZE_CASE = "normalize_case"
+    REPLACE_VALUES = "replace_values"
+    # Advanced numeric cleaning
+    REMOVE_CURRENCY_SYMBOL = "remove_currency_symbol"
+    CONVERT_PERCENT_TO_FLOAT = "convert_percent_to_float"
+    CONVERT_PARENTHESES_TO_NEGATIVE = "convert_parentheses_to_negative"
+    EXTRACT_NUMBER_FROM_STRING = "extract_number_from_string"
+    # Advanced datetime cleaning
+    CONVERT_EXCEL_SERIAL_DATE = "convert_excel_serial_date"
+    PARSE_TEXT_DATE = "parse_text_date"
+    # Boolean cleaning
+    MAP_TO_BOOLEAN = "map_to_boolean"
+    # Null handling
+    REPLACE_PLACEHOLDERS_WITH_NAN = "replace_placeholders_with_nan"
+
+
+class CleaningRule(BaseModel):
+    """A data cleaning rule"""
+    id: str
+    column: str
+    action: DataCleaningAction
+    description: str
+    params: Dict[str, Any] = Field(default_factory=dict)
+    applied: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class Transformation(BaseModel):
+    """A structural transformation to apply to the DataFrame"""
+    id: str
+    type: TransformationType
+    description: str
+    params: Dict[str, Any]
+    confidence: float
+    applied: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class ColumnProfile(BaseModel):
+    """Statistical profile of a single column"""
+    name: str
+    pandas_dtype: str
+    inferred_type: str  # After smart inference
+    non_null_count: int
+    null_count: int
+    null_ratio: float
+    n_unique: int
+    sample_values: List[Any]
+    sample_raw_values: List[str]  # Original string values
+    has_thousand_separator: bool = False
+    decimal_separator: Optional[str] = None
+    data_issues: List[Dict[str, Any]] = Field(default_factory=list)  # Detected data quality issues
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class ColumnSchema(BaseModel):
+    """Schema definition for a single column"""
+    name: str
+    description: str
+    semantic_type: str
+    physical_type: str
+    original_type: str  # Before cleaning
+    unit: Optional[str]
+    is_required: bool
+    constraints: Optional[Dict[str, Any]] = None
+    cleaning_applied: List[str] = Field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class Question(BaseModel):
+    """A question requiring human clarification"""
+    id: str
+    question: str
+    suggested_answer: Optional[str]
+    target: str
+    question_type: str = "semantic"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class Answer(BaseModel):
+    """Human answer to a question"""
+    question_id: str
+    answer: str
+    timestamp: str
+    applied: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class AgentMessage(BaseModel):
+    """Message in agent conversation"""
+    role: str  # "user" or "assistant"
+    content: str
+    timestamp: str
+    context: Optional[Dict[str, Any]] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class DataFrameCheckpoint(BaseModel):
+    """Checkpoint of DataFrame state"""
+    checkpoint_id: str
+    stage: str
+    timestamp: str
+    shape: Tuple[int, int]
+    description: str
+    file_path: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class HistoryEntry(BaseModel):
+    """Single entry in refinement history"""
+    timestamp: str
+    action: str
+    details: Dict[str, Any]
+    schema_version: int
+    checkpoint_id: Optional[str] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class DataSource(BaseModel):
+    """Information about a data source"""
+    source_id: str
+    file_path: str
+    sheet_name: Optional[str] = None
+    source_type: str
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class UserQuestion(BaseModel):
+    """User-defined question that will be frequently asked"""
+    id: str
+    question: str
+    description: str = ""  # Optional description of what the question is about
+    priority: str = "medium"  # low, medium, high
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class OutputField(BaseModel):
+    """Expected output field definition"""
+    field_name: str
+    description: str
+    data_type: str  # Expected data type (string, number, date, etc.)
+    required: bool = True
+    example_value: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class QuestionSet(BaseModel):
+    """Collection of user questions and expected output format"""
+    user_questions: List[UserQuestion] = Field(default_factory=list)
+    output_fields: List[OutputField] = Field(default_factory=list)
+    additional_notes: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "user_questions": [q.to_dict() for q in self.user_questions],
+            "output_fields": [f.to_dict() for f in self.output_fields],
+            "additional_notes": self.additional_notes
         }
-    },
-    "Đơn_vị_kinh_doanh(VTS)": {
-        "description": "Đơn vị kinh doanh của VTS",
-        "type": "text",
-        "unique values": "TT CQĐT, P KHHN, TT GPYTS, TT DTTM, TT GPGDS, TT KHDN, TT QPAN, TT GPMN",
-        "values": {
-            "TT CQĐT": "Trung tâm Chính quyền điện tử",
-            "TT GPYTS": "Trung tâm Giải pháp Y tế số",
-            "TT DTTM": "Trung tâm Đô thị thông minh",
-            "TT GPGDS": "Trung tâm Giải pháp Giáo dục số",
-            "TT KHDN": "Trung tâm Khách hàng doanh nghiệp",
-            "TT QPAN": "Trung tâm Quốc phòng an ninh",
-            "TT GPMN": "Trung tâm Giải pháp miền Nam"
+
+
+class Scenario(BaseModel):
+    """A scenario defining use case, questions, and expected output format"""
+    id: str
+    name: str
+    description: str = ""
+    selected_fields: List[str] = Field(default_factory=list)  # List of column names
+    questions: List[str] = Field(default_factory=list)  # Questions for this scenario
+    output_format: Dict[str, Any] = Field(default_factory=dict)  # JSON schema for output
+    example_input: Optional[Dict[str, Any]] = None  # Example input data
+    example_output: Optional[Dict[str, Any]] = None  # Example expected output
+    created_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+
+
+class DataPattern(BaseModel):
+
+    """Detected pattern in data"""
+
+    pattern_type: str  # "trend", "seasonality", "categorical", "unique_id", etc.
+    column: str
+    description: str
+    confidence: float
+    details: Dict[str, Any] = Field(default_factory=dict)
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+class DataAnomaly(BaseModel):
+    """Detected anomaly in data"""
+    anomaly_type: str  # "outlier", "missing_pattern", "inconsistent_format", etc.
+    column: str
+    description: str
+    severity: str  # "low", "medium", "high"
+    affected_rows: int
+    examples: List[Any] = Field(default_factory=list)
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+class DataInsights(BaseModel):
+    """Complete insights about a dataset"""
+    patterns: List[DataPattern] = Field(default_factory=list)
+    anomalies: List[DataAnomaly] = Field(default_factory=list)
+    distributions: Dict[str, str] = Field(default_factory=dict)  # column -> distribution type
+    correlations: List[Dict[str, Any]] = Field(default_factory=list)
+    summary: str = ""
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+class TransformationOption(BaseModel):
+    """A set of transformations representing one approach to clean data"""
+    id: str
+    name: str  # e.g., "Auto-detect and fix structure", "Custom user transform"
+    description: str
+    transformations: List[Transformation]
+    confidence: float
+    is_recommended: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump()
+class Session(BaseModel):
+    """Complete session state"""
+    session_id: str
+    created_at: str
+
+    sources: List[DataSource]
+    current_source_id: str
+
+    raw_structure_info: Dict[str, Any]
+    transformations: List[Transformation]
+    applied_transformations: List[str]
+
+    # Data cleaning
+    cleaning_rules: List[CleaningRule] = Field(default_factory=list)
+    applied_cleaning_rules: List[str] = Field(default_factory=list)
+
+    # User questions and output format
+    question_set: Optional[QuestionSet] = None
+
+    # Scenarios
+    scenarios: List[Scenario] = Field(default_factory=list)
+
+    schema: Dict[str, ColumnSchema]
+    profiles: Dict[str, ColumnProfile]
+    
+    questions: List[Question]
+    answers: List[Answer]
+    
+    # Agent Q&A
+    agent_conversations: List[AgentMessage] = Field(default_factory=list)
+    agent_enabled: bool = True
+    
+    history: List[HistoryEntry]
+    checkpoints: List[DataFrameCheckpoint]
+    schema_version: int = 1
+    
+    is_clean_structure: bool = False
+    structure_issues: List[str] = Field(default_factory=list)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "created_at": self.created_at,
+            "sources": [s.to_dict() for s in self.sources],
+            "current_source_id": self.current_source_id,
+            "raw_structure_info": self.raw_structure_info,
+            "transformations": [t.to_dict() for t in self.transformations],
+            "applied_transformations": self.applied_transformations,
+            "cleaning_rules": [r.to_dict() for r in self.cleaning_rules],
+            "applied_cleaning_rules": self.applied_cleaning_rules,
+            "question_set": self.question_set.to_dict() if self.question_set else None,
+            "scenarios": [s.to_dict() for s in self.scenarios],
+            "schema": {k: v.to_dict() for k, v in self.schema.items()},
+            "profiles": {k: v.to_dict() for k, v in self.profiles.items()},
+            "questions": [q.to_dict() for q in self.questions],
+            "answers": [a.to_dict() for a in self.answers],
+            "agent_conversations": [m.to_dict() for m in self.agent_conversations],
+            "agent_enabled": self.agent_enabled,
+            "history": [h.to_dict() for h in self.history],
+            "checkpoints": [c.to_dict() for c in self.checkpoints],
+            "schema_version": self.schema_version,
+            "is_clean_structure": self.is_clean_structure,
+            "structure_issues": self.structure_issues
         }
-    },
-    "Phân_loại_sản_phẩm": {
-        "description": "Loại sản phẩm/dịch vụ",
-        "type": "text",
-        "unique values": "Phần mềm, Kênh truyền, dịch vụ, phần cứng, [null]"
-    },
-    "Nhóm_mời_thầu": {
-        "description": "Nhóm phân loại bên mời thầu",
-        "type": "text",
-        "unique values": "dịch vụ đặc thù, Khác, X1"
-    },
-    "Nhóm_trúng_thầu": {
-        "description": "Tên công ty trúng thầu",
-        "type": "text",
-        "example": "FPT, Viettel-IDC, Viettel-VCC, VNPT, Viettel-Khác",
-        "note": "Các giá trị liên quan Viettel cần lọc bằng ILIKE '%Viettel%', không dùng = 'VTS'"
-    },
-    "Nhóm_trúng_thầu_shortlist": {
-        "description": "Tên công ty trúng thầu, group thành 4 nhóm chính.",
-        "type": "text",
-        "unique values": "FPT, Viettel, VNPT, khác"
-    },
-    "Năm_phát_hành_TBMT": {
-        "description": "Năm phát hành thông báo mời thầu",
-        "type": "text",
-        "unique values": "2022, 2023, 2024, 2025"
-    },
-    "Thoi_gian_phe_duyet": {
-        "description": "Thời gian phê duyệt (datetime format)",
-        "type": "datetime",
-        "pg_type": "timestamp without time zone",
-        "validation": "datetime",
-        "example": "2024-10-01 00:00:00",
-        "note": "Dùng để filter theo tháng/năm chính xác"
-    }
-}
-
-
-###############################################################################
-# UNIFIED GUIDE
-###############################################################################
-
-GENERAL_GUIDE_COMBINED = """
-CÁC TÌNH HUỐNG MẪU (Intent Examples) DÀNH CHO TRỢ LÝ HỒ SƠ THẦU (HST)
-
-1. **Phân tích thị phần (market_share)**
-- Hỏi: "Thị phần của Viettel so với FPT trong tháng 10/2025 là bao nhiêu?"
-- Hướng dẫn: dùng WHERE "Nhóm_trúng_thầu" ILIKE '%Viettel%' GROUP BY "Nhóm_trúng_thầu",
-  SUM("Giá_trúng_thầu"), tính tổng và %.
-
-2. **Phân tích đối thủ (competitor_analysis)**
-- Hỏi: "So sánh kết quả đấu thầu giữa Viettel, VNPT và FPT"
-- Hướng dẫn: nhóm theo "Nhóm_trúng_thầu_shortlist", tính tổng giá trị và đếm số gói.
-
-3. **Phân tích theo thời gian (time_series)**
-- Hỏi: "Xu hướng giá trị trúng thầu qua các tháng năm 2025"
-- Hướng dẫn: GROUP BY "Năm_phê_duyệt_KQLCNT", "Thời_gian_phê_duyệt_KQLCNT", SUM("Giá_trúng_thầu").
-
-4. **Phân tích theo đơn vị (unit_performance)**
-- Hỏi: "Trung tâm nào của Viettel có giá trị trúng thầu cao nhất?"
-- Hướng dẫn: GROUP BY "Đơn_vị_kinh_doanh(VTS)", SUM("Giá_trúng_thầu").
-
-5. **Phân tích NSNN (nsnn_analysis)**
-- Hỏi: "Thị phần Viettel trong lĩnh vực NSNN 10 tháng đầu năm 2025"
-- Hướng dẫn: WHERE "Lĩnh_vực_Khách_hàng" IN ('YTS','GDS','CQT'),
-  dùng "Thoi_gian_phe_duyet" để lọc thời gian, tính tổng thị trường và Viettel.
-
-6. **Top hợp đồng (top_contracts)**
-- Hỏi: "Top 5 gói thầu có giá trị cao nhất trong tháng 9"
-- Hướng dẫn: ORDER BY "Giá_trúng_thầu" DESC LIMIT 5.
-
-7. **Báo cáo tổng quan thị trường (market_overview)**
-- Hỏi: "Báo cáo tổng quan thị trường thầu lũy kế 10 tháng" hoặc 
-       "Tổng quan thị trường đấu thầu năm 2025 đến nay"
-- Gợi ý SQL:
-  ```sql
-  SELECT 
-      "Nhóm_trúng_thầu_shortlist",
-      COUNT(*) AS tong_so_goi,
-      SUM("Giá_trúng_thầu") AS tong_gia_tri_thi_truong
-  FROM thau_2025
-  WHERE "Thoi_gian_phe_duyet" >= DATE_TRUNC('year', CURRENT_DATE)
-      AND "Thoi_gian_phe_duyet" < DATE_TRUNC('month', CURRENT_DATE)
-  GROUP BY "Nhóm_trúng_thầu_shortlist"
-  ORDER BY tong_gia_tri_thi_truong DESC;
-  ```
-- Gợi ý hiển thị: bảng tổng hợp thị phần từng nhóm (FPT, Viettel, VNPT, Khác) kèm số lượng gói và tổng giá trị.
-
-8. **Báo cáo thị phần tháng cụ thể (monthly_market_share_report)**
-- Hỏi: "Báo cáo thị phần thầu tháng 10/2025"
-- Hướng dẫn: Tổng hợp giá trị trúng thầu theo "Nhóm_trúng_thầu", lọc theo tháng 10 và năm 2025.
-- Gợi ý SQL:
-  ```sql
-    SELECT 
-        "Nhóm_trúng_thầu",
-        SUM("Giá_trúng_thầu") AS tong_gia_tri_trung_thau,
-        COUNT(*) AS so_goi_thau,
-        ROUND(
-            CAST(SUM("Giá_trúng_thầu") * 100.0 /
-            SUM(SUM("Giá_trúng_thầu")) OVER () AS numeric), 
-            2
-        ) AS thi_phan_phan_tram
-    FROM thau_2025
-    WHERE 
-        "Năm_phê_duyệt_KQLCNT" = 2025
-        AND LOWER("Thời_gian_phê_duyệt_KQLCNT") IN ('tháng 10')
-        AND "Giá_trúng_thầu" IS NOT NULL
-        AND "Giá_trúng_thầu" > 0
-        AND "Nhóm_trúng_thầu" != 'Khác'
-    GROUP BY "Nhóm_trúng_thầu"
-    ORDER BY tong_gia_tri_trung_thau DESC
-    LIMIT 10;
-
-9. **So sánh giá trị thầu giữa các tháng (month_comparison)**
-- Hỏi ví dụ: "So sánh giá trị thầu trong tháng 9 và 10 với trung bình 6 tháng đầu năm"
-- Lưu ý: Phải tự hiểu là chỉ tính cho Viettel
-- Gợi ý SQL:
-  ```sql
-    WITH 
-    -- Tổng giá trị theo tháng (chỉ Viettel)
-    thau_theo_thang AS (
-        SELECT 
-            EXTRACT(MONTH FROM "Thoi_gian_phe_duyet") AS thang,
-            SUM(CAST("Giá_trúng_thầu" AS DECIMAL)) AS tong_gia_tri,
-            COUNT(*) AS so_goi
-        FROM thau_2025
-        WHERE 
-            EXTRACT(YEAR FROM "Thoi_gian_phe_duyet") = 2025
-            AND "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-        GROUP BY EXTRACT(MONTH FROM "Thoi_gian_phe_duyet")
-    ),
-
-    -- Trung bình 6 tháng đầu năm
-    tb_6_thang_dau AS (
-        SELECT 
-            AVG(tong_gia_tri) AS tb_6_thang_dau_nam
-        FROM thau_theo_thang
-        WHERE thang BETWEEN 1 AND 6
-    )
-
-    SELECT 
-        t10.so_goi AS so_goi_thang_10,
-        t10.tong_gia_tri AS gia_tri_thang_10,
-        t9.tong_gia_tri AS gia_tri_thang_9,
-        tb.tb_6_thang_dau_nam,
-        ROUND((t10.tong_gia_tri - t9.tong_gia_tri) / NULLIF(t9.tong_gia_tri, 0) * 100, 2) AS ty_le_tang_vs_thang9,
-        ROUND((t10.tong_gia_tri - tb.tb_6_thang_dau_nam) / NULLIF(tb.tb_6_thang_dau_nam, 0) * 100, 2) AS ty_le_tang_vs_tb6
-    FROM thau_theo_thang t10
-    JOIN thau_theo_thang t9 ON t9.thang = 9
-    CROSS JOIN tb_6_thang_dau tb
-    WHERE t10.thang = 10;
-  ```
-- Dùng để so sánh quy mô giá trị và tốc độ tăng trưởng giữa tháng hiện tại, tháng trước và trung bình 6T đầu năm
-
-10. Báo cáo thị phần lĩnh vực Chính quyền Tỉnh (provincial_gov_market_share)
-- Hỏi ví dụ: "Báo cáo thị phần lĩnh vực chính quyền tỉnh"
-- Gợi ý SQL:
-    ```sql
-    SELECT 
-        "Nhóm_trúng_thầu_shortlist" AS nhom,
-        COUNT(*) AS so_goi,
-        SUM(CAST("Giá_trúng_thầu" AS DECIMAL)) AS gia_tri,
-        ROUND(SUM(CAST("Giá_trúng_thầu" AS DECIMAL)) 
-            / NULLIF(
-                (SELECT SUM(CAST("Giá_trúng_thầu" AS DECIMAL)) 
-                FROM thau_2025 
-                WHERE "Lĩnh_vực_Khách_hàng" = 'CQT' 
-                AND EXTRACT(YEAR FROM "Thoi_gian_phe_duyet") = 2025
-                AND "Thoi_gian_phe_duyet" < DATE_TRUNC('month', CURRENT_DATE)
-                ), 0
-            ) * 100, 2) AS thi_phan_phan_tram
-    FROM thau_2025
-    WHERE 
-        "Lĩnh_vực_Khách_hàng" = 'CQT'
-        AND EXTRACT(YEAR FROM "Thoi_gian_phe_duyet") = 2025
-        AND "Thoi_gian_phe_duyet" < DATE_TRUNC('month', CURRENT_DATE)
-    GROUP BY "Nhóm_trúng_thầu_shortlist"
-    ORDER BY gia_tri DESC;
-    ```
-- Dùng để tạo báo cáo chi tiết thị phần Viettel, VNPT, FPT trong lĩnh vực chính quyền tỉnh.
-
-11. **Gói thầu lớn nhất (largest_contract)**
-- Hỏi ví dụ: 
-  - "Gói thầu lớn nhất của VNPT là gì?"
-  - "Cho tôi thông tin gói thầu có giá trị cao nhất của Viettel năm 2025"
-- Hướng dẫn:
-  - Lọc theo "Nhóm_trúng_thầu_shortlist" tương ứng ('Viettel', 'VNPT', 'FPT', 'Khác')
-  - Nếu người dùng chỉ nói "Viettel", có thể match bằng ILIKE '%Viettel%' trên "Nhóm_trúng_thầu"
-  - Có thể thêm điều kiện theo năm nếu được nhắc đến.
-  - Sắp xếp giảm dần theo "Giá_trúng_thầu" và lấy LIMIT 1.
-- Gợi ý SQL:
-  ```sql
-  SELECT 
-      "Số_thông_báo_mời_thầu",
-      "Tên_gói_thầu",
-      "Tên_bên_trúng_thầu",
-      "Tên_bên_mời_thầu",
-      "Giá_trúng_thầu",
-      "Lĩnh_vực_Khách_hàng",
-      "Đơn_vị_kinh_doanh(VTS)",
-      "Phân_loại_sản_phẩm",
-      "Hình_thức_LCNT",
-      "Thoi_gian_phe_duyet",
-      "Năm_phê_duyệt_KQLCNT",
-      "Thời_gian_phê_duyệt_KQLCNT"
-  FROM thau_2025
-  WHERE 
-      "Nhóm_trúng_thầu_shortlist" = 'VNPT'
-      AND "Giá_trúng_thầu" IS NOT NULL
-      AND "Giá_trúng_thầu" > 0
-  ORDER BY "Giá_trúng_thầu" DESC
-  LIMIT 1;
-    ```
-
-12. **So sánh kết quả theo quý có phụ thuộc lịch sử hội thoại (quarter_comparison_with_history)**
-
-CASE MẪU:
-
-Lượt 1 — User hỏi:
-"so sánh số gói và tổng giá trị trúng thầu của VTS quý 3 năm 2025 với cùng kỳ năm ngoái"
-
-→ SQL chuẩn phải tạo:
-SELECT 
-    EXTRACT(YEAR FROM "Thoi_gian_phe_duyet") AS nam,
-    COUNT(*) AS so_goi_thau,
-    SUM("Giá_trúng_thầu") AS tong_gia_tri
-FROM thau_2025
-WHERE 
-    "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-    AND EXTRACT(MONTH FROM "Thoi_gian_phe_duyet") IN (7,8,9)
-    AND EXTRACT(YEAR FROM "Thoi_gian_phe_duyet") IN (2024,2025)
-    AND "Giá_trúng_thầu" IS NOT NULL
-    AND "Giá_trúng_thầu" > 0
-GROUP BY nam
-ORDER BY nam;
-
-Giải thích:
-- User nói “VTS” → mapping chính xác phải là "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-- Quý 3 = tháng 7–9 → dùng EXTRACT(MONTH) IN (7,8,9)
-- “cùng kỳ năm ngoái” → luôn lấy năm hiện tại trong câu hỏi và năm hiện tại - 1
-- Dùng Thoi_gian_phe_duyet (datetime) để lọc thời gian.
-- GROUP BY theo năm để có 2 dòng: 2024 & 2025.
-
-***
-
-Lượt 2 — User hỏi:
-"thế còn quý 2"
-
-→ Agent phải hiểu:
-- User KHÔNG nhắc lại “VTS” vì đã nói ở lượt 1 → tiếp tục dùng Viettel
-- Không nhắc lại “2025” nhưng phải hiểu: vẫn so năm 2025 và 2024
-- Chỉ thay đổi quý → dùng tháng 4–6
-
-→ SQL chuẩn:
-SELECT 
-    EXTRACT(YEAR FROM "Thoi_gian_phe_duyet") AS nam,
-    COUNT(*) AS so_goi_thau,
-    SUM("Giá_trúng_thầu") AS tong_gia_tri
-FROM thau_2025
-WHERE 
-    "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-    AND EXTRACT(MONTH FROM "Thoi_gian_phe_duyet") IN (4,5,6)
-    AND EXTRACT(YEAR FROM "Thoi_gian_phe_duyet") IN (2024,2025)
-    AND "Giá_trúng_thầu" IS NOT NULL
-    AND "Giá_trúng_thầu" > 0
-GROUP BY nam
-ORDER BY nam;
-
-Nguyên tắc cần ghi nhớ cho mọi trường hợp tương tự:
-- Nếu user ở lượt sau chỉ thay đổi một phần câu hỏi (ví dụ: “thế còn quý 2”, “còn tháng 8 thì sao”, “còn FPT?”), agent phải:
-  1. Kế thừa toàn bộ cấu trúc logic từ câu hỏi trước đó  
-  2. Chỉ thay đổi duy nhất phần mà user hỏi lại  
-  3. Tuyệt đối không reset ý nghĩa, không hiểu sang ngữ cảnh mới  
-
-👉 Trong mọi trường hợp, tuân thủ các quy tắc SQL và quy trình ReAct chuẩn:
-- Dùng cột "Giá_trúng_thầu" (numeric) để tính toán.
-- Dùng "Thoi_gian_phe_duyet" cho điều kiện thời gian (NOT "Thời_gian_phê_duyệt_KQLCNT").
-- Các nhóm nhà thầu chuẩn: FPT, Viettel, VNPT, Khác.
-- Kết quả trả lời phải có số liệu cụ thể, không placeholder.
-"""
-
-
-# ============================================================================
-# StreamBuffer, ErrorHandler, 
-# ============================================================================
 
 class StreamBuffer:
     """Buffer chunks for optimized streaming"""
@@ -419,1984 +370,2911 @@ class StreamBuffer:
         self.buffer = []
         return result
 
+class QueryCache:
+    """Semantic query result cache"""
+    
+    def __init__(self, redis_client: redis.Redis):
+        self.redis = redis_client
+        
+    def _cache_key(self, source_name: str, question: str, model: str) -> str:
+        """Generate cache key from question semantics"""
+        normalized = question.lower().strip()
+        hash_input = f"{source_name}:{normalized}:{model}"
+        hash_val = hashlib.md5(hash_input.encode()).hexdigest()
+        return f"query_cache:{source_name}:{hash_val}"
+    
+    def get(self, source_name: str, question: str, model: str) -> Optional[Dict]:
+        """Get cached query result"""
+        key = self._cache_key(source_name, question, model)
+        try:
+            cached = self.redis.get(key)
+            if cached:
+                data = json.loads(cached)
+                logger.info(f"Query cache HIT for {source_name}")
+                return data
+        except Exception as e:
+            logger.warning(f"Query cache read error: {e}")
+        return None
+    
+    def set(self, source_name: str, question: str, model: str, 
+            response_text: str, response_id: str, usage: Any):
+        """Cache query result"""
+        key = self._cache_key(source_name, question, model)
+        try:
+            data = {
+                "response_text": response_text,
+                "response_id": response_id,
+                "usage": {
+                    "prompt_tokens": getattr(usage, 'prompt_tokens', 0),
+                    "completion_tokens": getattr(usage, 'completion_tokens', 0),
+                    "total_tokens": getattr(usage, 'total_tokens', 0)
+                },
+                "cached_at": int(time.time())
+            }
+            self.redis.set(key, json.dumps(data))
+            logger.debug(f"Cached query result for {source_name}")
+        except Exception as e:
+            logger.warning(f"Query cache write error: {e}")
+    
+    def invalidate_source(self, source_name: str):
+        """Invalidate all cached queries for a source"""
+        try:
+            pattern = f"query_cache:{source_name}:*"
+            keys = list(self.redis.scan_iter(match=pattern, count=100))
+            if keys:
+                self.redis.delete(*keys)
+                logger.info(f"Invalidated {len(keys)} cached queries for {source_name}")
+        except Exception as e:
+            logger.warning(f"Query cache invalidation error: {e}")
 
-class ErrorHandler:
-    """Centralized error handling với mã lỗi"""
+
+class SQLQueryTool:
+    """Tool to execute SQL queries on the cleaned data"""
+    
+    def __init__(self, db_path: str, df: pd.DataFrame, table_name: str = "data"):
+        self.db_path = db_path
+        self.table_name = table_name
+        self.conn = None
+        self._create_database(df)
+    
+    def _create_database(self, df: pd.DataFrame):
+        """Create SQLite database from DataFrame"""
+        try:
+            self.conn = sqlite3.connect(self.db_path)
+            df.to_sql(self.table_name, self.conn, if_exists='replace', index=False)
+            
+            cursor = self.conn.cursor()
+            cursor.execute(f"PRAGMA table_info({self.table_name})")
+            columns = cursor.fetchall()
+            
+            logger.info(f"✓ Created SQL database: {self.db_path}")
+            logger.info(f"  Table: {self.table_name}, Columns: {len(columns)}, Rows: {len(df)}")
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to create database: {str(e)}")
+    
+    def execute_query(self, query: str) -> Tuple[pd.DataFrame, Optional[str]]:
+        """Execute SQL query and return results"""
+        try:
+            query_upper = query.upper().strip()
+            if not query_upper.startswith('SELECT'):
+                return pd.DataFrame(), "Error: Only SELECT queries allowed"
+            
+            dangerous = ['DROP', 'DELETE', 'INSERT', 'UPDATE', 'ALTER', 'CREATE']
+            for keyword in dangerous:
+                if keyword in query_upper:
+                    return pd.DataFrame(), f"Error: {keyword} not allowed"
+            
+            result_df = pd.read_sql_query(query, self.conn)
+            return result_df, None
+            
+        except Exception as e:
+            return pd.DataFrame(), f"SQL Error: {str(e)}"
+    
+    def get_schema_info(self) -> Dict[str, Any]:
+        """Get table schema information"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(f"PRAGMA table_info({self.table_name})")
+            columns = cursor.fetchall()
+            
+            cursor.execute(f"SELECT COUNT(*) FROM {self.table_name}")
+            row_count = cursor.fetchone()[0]
+            
+            return {
+                "table_name": self.table_name,
+                "columns": [{"name": col[1], "type": col[2]} for col in columns],
+                "row_count": row_count
+            }
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+# ============================================================================
+# Type Inference & Data Cleaning
+# ============================================================================
+
+class TypeInferenceEngine:
+    """Smart type inference that handles formatted numbers and various data issues"""
+
+    # Common null placeholders
+    NULL_PLACEHOLDERS = {'N/A', 'n/a', 'NA', 'null', 'NULL', 'None', 'NONE', '-', '?', 'Unknown', 'unknown', '', ' '}
+
+    # Currency symbols
+    CURRENCY_SYMBOLS = {'$', '€', '£', '¥', 'USD', 'EUR', 'GBP', 'JPY', 'VND', 'VNĐ', '₫'}
+
+    # Boolean mappings
+    BOOLEAN_MAPPINGS = {
+        'yes': True, 'no': False,
+        'y': True, 'n': False,
+        'true': True, 'false': False,
+        'có': True, 'không': False,
+        'enabled': True, 'disabled': False,
+        '1': True, '0': False,
+        'on': True, 'off': False
+    }
+
+    @staticmethod
+    def detect_thousand_separator(series: pd.Series) -> Optional[str]:
+        """Detect thousand separator (. or ,)"""
+        sample = series.dropna().astype(str).head(100)
+        
+        # Check for patterns like 1.000, 500.000.000
+        dot_pattern = r'^\d{1,3}(\.\d{3})+$'
+        comma_pattern = r'^\d{1,3}(,\d{3})+$'
+        
+        dot_matches = sum(1 for val in sample if re.match(dot_pattern, val.strip()))
+        comma_matches = sum(1 for val in sample if re.match(comma_pattern, val.strip()))
+        
+        if dot_matches > 0:
+            return '.'
+        if comma_matches > 0:
+            return ','
+        
+        return None
     
     @staticmethod
-    def get_user_friendly_message(error: Exception, source_name: str = "") -> Tuple[str, str]:
-        """
-        Convert exception to user-friendly message + error code
-        Returns: (message, error_code)
-        """
-        error_str = str(error).lower()
+    def detect_decimal_separator(series: pd.Series, thousand_sep: Optional[str]) -> Optional[str]:
+        """Detect decimal separator"""
+        sample = series.dropna().astype(str).head(100)
         
-        # SQL Error
-        if isinstance(error, (SQLAlchemyError, OperationalError, SQLTimeoutError)):
-            logger.error(f"SQL error for {source_name}: {error}")
-            return (
-                f"Lỗi truy vấn cơ sở dữ liệu. Vui lòng thử lại. (Mã lỗi: {ERROR_CODES['sql_error']})",
-                ERROR_CODES['sql_error']
-            )
+        # If thousand sep is '.', decimal is ','
+        if thousand_sep == '.':
+            # Check for pattern like 1.000,50
+            pattern = r'\d+\.\d{3},\d{1,2}$'
+            if sum(1 for val in sample if re.match(pattern, val.strip())) > 0:
+                return ','
         
-        # Timeout Error
-        if "timeout" in error_str or isinstance(error, asyncio.TimeoutError):
-            logger.warning(f"Timeout for {source_name}: {error}")
-            return (
-                f"Truy vấn mất quá nhiều thời gian. Vui lòng thử lại. (Mã lỗi: {ERROR_CODES['timeout']})",
-                ERROR_CODES['timeout']
-            )
+        # If thousand sep is ',', decimal is '.'
+        elif thousand_sep == ',':
+            # Check for pattern like 1,000.50
+            pattern = r'\d+,\d{3}\.\d{1,2}$'
+            if sum(1 for val in sample if re.match(pattern, val.strip())) > 0:
+                return '.'
         
-        # Rate Limit Error
-        if isinstance(error, RateLimitError) or "rate limit" in error_str or "429" in error_str:
-            logger.warning(f"Rate limit hit for {source_name}: {error}")
-            return (
-                f"Hệ thống đang quá tải. Vui lòng thử lại sau ít phút. (Mã lỗi: {ERROR_CODES['rate_limit']})",
-                ERROR_CODES['rate_limit']
-            )
+        # Default: check for single decimal point
+        if any('.' in str(val) and str(val).count('.') == 1 for val in sample):
+            return '.'
         
-        # Authentication Error
-        if isinstance(error, AuthenticationError) or "authentication" in error_str or "401" in error_str:
-            logger.error(f"Authentication error for {source_name}: {error}")
-            return (
-                f"Lỗi xác thực hệ thống. Vui lòng liên hệ quản trị viên. (Mã lỗi: {ERROR_CODES['authentication']})",
-                ERROR_CODES['authentication']
-            )
-        
-        # Connection Error
-        if isinstance(error, APIConnectionError) or "connection" in error_str:
-            logger.error(f"Connection error for {source_name}: {error}")
-            return (
-                f"Không thể kết nối tới hệ thống. Vui lòng kiểm tra kết nối mạng. (Mã lỗi: {ERROR_CODES['connection']})",
-                ERROR_CODES['connection']
-            )
-        
-        # General Error
-        logger.error(f"General error for {source_name}: {error}")
-        return (
-            f"Có lỗi xảy ra trong quá trình xử lý. Vui lòng thử lại sau. (Mã lỗi: {ERROR_CODES['general']})",
-            ERROR_CODES['general']
-        )
+        return None
     
     @staticmethod
-    def should_retry(error: Exception) -> Tuple[bool, float]:
+    def infer_type(series: pd.Series) -> Tuple[str, Dict[str, Any]]:
         """
-        Determine if should retry and wait time
-        Returns: (should_retry, wait_seconds)
+        Infer actual data type from series.
+        Returns: (inferred_type, metadata)
         """
-        error_str = str(error).lower()
+        if pd.api.types.is_numeric_dtype(series):
+            if pd.api.types.is_integer_dtype(series):
+                return 'int', {}
+            else:
+                return 'float', {}
         
-        # Rate limit - extract wait time from error message
-        if isinstance(error, RateLimitError) or "rate limit" in error_str:
-            import re
-            match = re.search(r'try again in (\d+)ms', error_str)
-            if match:
-                wait_ms = int(match.group(1))
-                wait_seconds = (wait_ms / 1000.0) + 0.5
-                return True, min(wait_seconds, 10.0)
-            return True, 2.0
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return 'datetime', {}
         
-        # Connection errors - quick retry
-        if isinstance(error, (APIConnectionError, OperationalError)) or "connection" in error_str or "timeout" in error_str:
-            return True, 1.0
+        if series.dtype == 'object':
+            sample = series.dropna()
+            if len(sample) == 0:
+                return 'string', {}
+            
+            thousand_sep = TypeInferenceEngine.detect_thousand_separator(sample)
+            decimal_sep = TypeInferenceEngine.detect_decimal_separator(sample, thousand_sep)
+            
+            metadata = {
+                'thousand_separator': thousand_sep,
+                'decimal_separator': decimal_sep
+            }
+            
+            try:
+                if thousand_sep:
+                    cleaned = sample.astype(str).str.replace(thousand_sep, '', regex=False)
+                    
+                    if decimal_sep and decimal_sep != '.':
+                        cleaned = cleaned.str.replace(decimal_sep, '.', regex=False)
+                    
+                    numeric = pd.to_numeric(cleaned, errors='coerce')
+                    
+                    if numeric.notna().sum() / len(numeric) > 0.8:
+                        if (numeric.dropna() % 1 == 0).all():
+                            return 'int', metadata
+                        else:
+                            return 'float', metadata
+                
+                # Try direct numeric conversion
+                numeric = pd.to_numeric(sample, errors='coerce')
+                if numeric.notna().sum() / len(numeric) > 0.8:
+                    if (numeric.dropna() % 1 == 0).all():
+                        return 'int', {}
+                    else:
+                        return 'float', {}
+                
+                # Try datetime
+                dt = pd.to_datetime(sample, errors='coerce')
+                if dt.notna().sum() / len(dt) > 0.8:
+                    return 'datetime', {}
+                
+            except:
+                pass
         
-        # Don't retry auth errors
-        return False, 0.0
+        return 'string', {}
+
+    @staticmethod
+    def detect_data_issues(series: pd.Series) -> List[Dict[str, Any]]:
+        """
+        Detect various data quality issues in a series.
+        Returns list of issues with type and details.
+        """
+        issues = []
+        sample = series.dropna().astype(str).head(100)
+
+        if len(sample) == 0:
+            return issues
+
+        # 1. Currency symbols
+        currency_pattern = r'[$€£¥₫]|USD|EUR|GBP|JPY|VND|VNĐ'
+        has_currency = sample.str.contains(currency_pattern, regex=True, na=False).any()
+        if has_currency:
+            issues.append({
+                'type': 'currency',
+                'action': DataCleaningAction.REMOVE_CURRENCY_SYMBOL,
+                'description': 'Contains currency symbols',
+                'examples': sample[sample.str.contains(currency_pattern, regex=True, na=False)].head(3).tolist()
+            })
+
+        # 2. Percentages
+        percent_pattern = r'^\s*-?\d+(?:[.,]\d+)?\s*%\s*$'
+        has_percent = sample.str.match(percent_pattern, na=False).any()
+        if has_percent:
+            issues.append({
+                'type': 'percentage',
+                'action': DataCleaningAction.CONVERT_PERCENT_TO_FLOAT,
+                'description': 'Contains percentage values',
+                'examples': sample[sample.str.match(percent_pattern, na=False)].head(3).tolist()
+            })
+
+        # 3. Accounting negatives (parentheses)
+        paren_pattern = r'^\(\s*\d+(?:[.,]\d+)?\s*\)$'
+        has_parentheses = sample.str.match(paren_pattern, na=False).any()
+        if has_parentheses:
+            issues.append({
+                'type': 'accounting_negative',
+                'action': DataCleaningAction.CONVERT_PARENTHESES_TO_NEGATIVE,
+                'description': 'Contains accounting-style negative numbers (parentheses)',
+                'examples': sample[sample.str.match(paren_pattern, na=False)].head(3).tolist()
+            })
+
+        # 4. Units (numbers with text suffix)
+        unit_pattern = r'^\s*\d+(?:[.,]\d+)?\s+[a-zA-Z]+\d*\s*$'
+        has_units = sample.str.match(unit_pattern, na=False).any()
+        if has_units:
+            issues.append({
+                'type': 'units_suffix',
+                'action': DataCleaningAction.EXTRACT_NUMBER_FROM_STRING,
+                'description': 'Contains numbers with unit suffixes (kg, cm, m2, etc.)',
+                'examples': sample[sample.str.match(unit_pattern, na=False)].head(3).tolist()
+            })
+
+
+        # 6. Boolean-like values
+        unique_lower = set(sample.str.lower().str.strip())
+        boolean_keys = set(TypeInferenceEngine.BOOLEAN_MAPPINGS.keys())
+        if unique_lower.issubset(boolean_keys | {'nan', 'none'}):
+            issues.append({
+                'type': 'boolean_text',
+                'action': DataCleaningAction.MAP_TO_BOOLEAN,
+                'description': 'Contains boolean-like text values',
+                'examples': list(unique_lower)[:5]
+            })
+
+        # 7. Null placeholders
+        all_null_found = len(unique_lower & TypeInferenceEngine.NULL_PLACEHOLDERS) == len(unique_lower)
+
+        null_placeholders_found = unique_lower & TypeInferenceEngine.NULL_PLACEHOLDERS
+        if all_null_found:
+            issues.append({
+                'type': 'null_placeholders',
+                'action': DataCleaningAction.REPLACE_PLACEHOLDERS_WITH_NAN,
+                'description': 'Contains text representing null values',
+                'examples': list(null_placeholders_found)
+            })
+
+        return issues
+
+    @staticmethod
+    def generate_cleaning_rules(df: pd.DataFrame, profiles: Dict[str, ColumnProfile]) -> List[CleaningRule]:
+        """Generate cleaning rules based on inferred types and detected issues"""
+        rules = []
+
+        for col_name, profile in profiles.items():
+            # First, generate rules from detected data issues
+            for issue in profile.data_issues:
+                rule_id = f"clean_{col_name}_{issue['type']}"
+                rules.append(CleaningRule(
+                    id=rule_id,
+                    column=col_name,
+                    action=issue['action'],
+                    description=f"{col_name}: {issue['description']} (e.g., {issue['examples'][:2]})",
+                    params=issue.get('params', {}),
+                    applied=False
+                ))
+
+            # Then, existing logic for type conversions
+            # Skip if inferred type matches pandas type
+            if profile.inferred_type == 'int' and df[col_name].dtype in ['int64', 'int32']:
+                continue
+            if profile.inferred_type == 'float' and df[col_name].dtype in ['float64', 'float32']:
+                continue
+            
+            # Generate cleaning rule for number with thousand separator
+            if profile.has_thousand_separator:
+                if profile.decimal_separator:
+                    # Has both thousand and decimal
+                    rules.append(CleaningRule(
+                        id=f"clean_{col_name}_numeric",
+                        column=col_name,
+                        action=DataCleaningAction.CONVERT_TO_FLOAT,
+                        description=f"Convert '{col_name}' from formatted number to float (remove {profile.sample_raw_values[0]!r} → float)",
+                        params={
+                            'thousand_separator': '.',
+                            'decimal_separator': profile.decimal_separator
+                        }
+                    ))
+                else:
+                    # Only thousand separator (integer)
+                    rules.append(CleaningRule(
+                        id=f"clean_{col_name}_int",
+                        column=col_name,
+                        action=DataCleaningAction.CONVERT_TO_INT,
+                        description=f"Convert '{col_name}' from formatted number to integer (remove dots: {profile.sample_raw_values[0]!r} → int)",
+                        params={
+                            'thousand_separator': '.'
+                        }
+                    ))
+            
+            # Generate rule for plain numeric conversion
+            elif profile.inferred_type == 'int' and df[col_name].dtype == 'object':
+                rules.append(CleaningRule(
+                    id=f"clean_{col_name}_to_int",
+                    column=col_name,
+                    action=DataCleaningAction.CONVERT_TO_INT,
+                    description=f"Convert '{col_name}' to integer",
+                    params={}
+                ))
+            
+            elif profile.inferred_type == 'float' and df[col_name].dtype == 'object':
+                rules.append(CleaningRule(
+                    id=f"clean_{col_name}_to_float",
+                    column=col_name,
+                    action=DataCleaningAction.CONVERT_TO_FLOAT,
+                    description=f"Convert '{col_name}' to float",
+                    params={}
+                ))
+        
+        return rules
+    
+    @staticmethod
+    def apply_cleaning_rule(df: pd.DataFrame, rule: CleaningRule) -> pd.DataFrame:
+        """Apply a single cleaning rule"""
+        df_result = df.copy()
+        col = rule.column
+        
+        try:
+            if rule.action == DataCleaningAction.CONVERT_TO_INT:
+                # Remove thousand separator if specified
+                if 'thousand_separator' in rule.params:
+                    df_result[col] = df_result[col].astype(str).str.replace(
+                        rule.params['thousand_separator'], '', regex=False
+                    )
+                
+                # Convert to int
+                df_result[col] = pd.to_numeric(df_result[col], errors='coerce').astype('Int64')
+                logger.info(f"✓ Converted '{col}' to integer")
+            
+            elif rule.action == DataCleaningAction.CONVERT_TO_FLOAT:
+                series = df_result[col].astype(str)
+                
+                # Remove thousand separator
+                if 'thousand_separator' in rule.params:
+                    series = series.str.replace(rule.params['thousand_separator'], '', regex=False)
+                
+                # Replace decimal separator
+                if 'decimal_separator' in rule.params and rule.params['decimal_separator'] != '.':
+                    series = series.str.replace(rule.params['decimal_separator'], '.', regex=False)
+                
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Converted '{col}' to float")
+        
+            
+            elif rule.action == DataCleaningAction.STRIP_WHITESPACE:
+                df_result[col] = df_result[col].astype(str).str.strip()
+                logger.info(f"✓ Stripped whitespace from '{col}'")
+            
+            elif rule.action == DataCleaningAction.NORMALIZE_CASE:
+                case_type = rule.params.get('case', 'lower')
+                if case_type == 'lower':
+                    df_result[col] = df_result[col].astype(str).str.lower()
+                elif case_type == 'upper':
+                    df_result[col] = df_result[col].astype(str).str.upper()
+                logger.info(f"✓ Normalized case for '{col}'")
+
+            # Advanced numeric cleaning
+            elif rule.action == DataCleaningAction.REMOVE_CURRENCY_SYMBOL:
+                # Remove currency symbols and convert to numeric
+                currency_pattern = r'[$€£¥₫]|USD|EUR|GBP|JPY|VND|VNĐ'
+                series = df_result[col].astype(str).str.replace(currency_pattern, '', regex=True)
+                series = series.str.replace(',', '').str.strip()
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Removed currency symbols from '{col}'")
+
+            elif rule.action == DataCleaningAction.CONVERT_PERCENT_TO_FLOAT:
+                # Remove % and convert to float (optionally divide by 100)
+                series = df_result[col].astype(str).str.replace('%', '').str.strip()
+                df_result[col] = pd.to_numeric(series, errors='coerce') / 100
+                logger.info(f"✓ Converted percentages to floats in '{col}'")
+
+            elif rule.action == DataCleaningAction.CONVERT_PARENTHESES_TO_NEGATIVE:
+                # Convert (500) to -500
+                def convert_paren(x):
+                    s = str(x).strip()
+                    if s.startswith('(') and s.endswith(')'):
+                        return '-' + s[1:-1]
+                    return s
+                series = df_result[col].apply(convert_paren)
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Converted parentheses to negatives in '{col}'")
+
+            elif rule.action == DataCleaningAction.EXTRACT_NUMBER_FROM_STRING:
+                # Extract numeric part from strings like "50 kg", "175 cm"
+                series = df_result[col].astype(str).str.extract(r'([-+]?\d+(?:[.,]\d+)?)', expand=False)
+                df_result[col] = pd.to_numeric(series, errors='coerce')
+                logger.info(f"✓ Extracted numbers from strings in '{col}'")
+
+            # Advanced datetime cleaning
+            elif rule.action == DataCleaningAction.PARSE_TEXT_DATE:
+                # Parse textual dates with flexible format
+                df_result[col] = pd.to_datetime(df_result[col], errors='coerce', infer_datetime_format=True)
+                logger.info(f"✓ Parsed text dates in '{col}'")
+
+            # Boolean mapping
+            elif rule.action == DataCleaningAction.MAP_TO_BOOLEAN:
+                # Map various text values to boolean
+                df_result[col] = df_result[col].astype(str).str.lower().str.strip().map(
+                    TypeInferenceEngine.BOOLEAN_MAPPINGS
+                )
+                logger.info(f"✓ Mapped to boolean in '{col}'")
+
+            # Null handling
+            elif rule.action == DataCleaningAction.REPLACE_PLACEHOLDERS_WITH_NAN:
+                # Replace null placeholders with actual NaN
+                df_result[col] = df_result[col].replace(list(TypeInferenceEngine.NULL_PLACEHOLDERS), pd.NA)
+                logger.info(f"✓ Replaced null placeholders in '{col}'")
+
+        except Exception as e:
+            logger.error(f"✗ Failed to apply cleaning rule {rule.id}: {str(e)}")
+            raise
+
+        return df_result
 
 
 # ============================================================================
-# HSTAgent - Main Agent Class
+# Data Ingestion (same as V3)
 # ============================================================================
 
-class HSTAgent:
-    """HST Agent with Text2SQL and ReAct mechanism"""
+class DataIngestor:
+    """Handles file loading and validation with multi-file/multi-sheet support"""
     
-    DEFAULT_MODEL = "gpt-4.1"
-    TIMEOUT_SECONDS = 120
-    MAX_RETRIES = 3
+    SUPPORTED_EXTENSIONS = {'.csv', '.xlsx', '.xls'}
     
+    @classmethod
+    def discover_sources(cls, file_paths: List[str]) -> List[DataSource]:
+        """Discover all data sources from file paths"""
+        sources = []
+        
+        for file_path in file_paths:
+            path = Path(file_path)
+            
+            if not path.exists():
+                logger.warning(f"File not found: {file_path}")
+                continue
+            
+            if path.suffix.lower() not in cls.SUPPORTED_EXTENSIONS:
+                logger.warning(f"Unsupported file: {file_path}")
+                continue
+            
+            if path.suffix.lower() == '.csv':
+                source = DataSource(
+                    source_id=f"{path.stem}_csv",
+                    file_path=file_path,
+                    source_type="csv"
+                )
+                sources.append(source)
+            else:
+                try:
+                    xls = pd.ExcelFile(file_path)
+                    for sheet_name in xls.sheet_names:
+                        source = DataSource(
+                            source_id=f"{path.stem}_{sheet_name}",
+                            file_path=file_path,
+                            sheet_name=sheet_name,
+                            source_type="xlsx_sheet"
+                        )
+                        sources.append(source)
+                except Exception as e:
+                    logger.warning(f"Failed to read Excel sheets from {file_path}: {e}")
+        
+        logger.info(f"✓ Discovered {len(sources)} data source(s)")
+        return sources
+    
+    @classmethod
+    def load_source(cls, source: DataSource, header: Optional[int] = 0) -> pd.DataFrame:
+        """Load a specific data source"""
+        try:
+            if source.source_type == "csv":
+                df = pd.read_csv(source.file_path, header=header)
+            else:
+                df = pd.read_excel(
+                    source.file_path, 
+                    sheet_name=source.sheet_name,
+                    header=header
+                )
+            
+            if df.empty:
+                raise ValueError("DataFrame is empty")
+            
+            logger.info(f"✓ Loaded {source.source_id}: {len(df)} rows × {len(df.columns)} columns")
+            return df
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load {source.source_id}: {str(e)}")
+    
+    @classmethod
+    def load_raw(cls, source: DataSource) -> pd.DataFrame:
+        """
+        Load raw data strictly as strings with NO header assumptions.
+        This prevents PyArrow errors with mixed types and allows correct structure analysis.
+        """
+        try:
+            # Luôn đọc tất cả là string để tránh lỗi mixed types của PyArrow
+            # Luôn để header=None để LLM nhìn thấy dòng đầu tiên thực tế
+            if source.source_type == "csv":
+                df = pd.read_csv(source.file_path, header=None, dtype=str)
+            else:
+                df = pd.read_excel(
+                    source.file_path, 
+                    sheet_name=source.sheet_name,
+                    header=None,
+                    dtype=str
+                )
+            
+            # Thay thế NaN bằng chuỗi rỗng để clean hơn khi hiển thị
+            df = df.fillna("")
+            
+            logger.info(f"✓ Loaded RAW {source.source_id}: {len(df)} rows (treated as string grid)")
+            return df
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to load raw source {source.source_id}: {str(e)}")
+
+
+# ============================================================================
+# Structure Analysis (from V3)
+# ============================================================================
+
+class StructureAnalyzer:
+    """Analyzes raw DataFrame structure using LLM for clean data detection"""
+    
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+    
+    def analyze_structure(
+        self, 
+        df: pd.DataFrame, 
+        max_preview_rows: int = 10
+    ) -> Tuple[Dict[str, Any], List[Transformation], List[Question], bool]:
+        """
+        Analyze raw structure using LLM to check if data is clean.
+        Returns: (structure_info, transformations, questions, is_clean)
+        """
+        
+        # Extract structure info for LLM analysis
+        structure_info = self._extract_structure_info(df, max_preview_rows)
+        
+        # Use LLM to check if data is clean and propose transformations
+        prompt = self._build_structure_prompt(structure_info)
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_structure_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            
+            is_clean = result.get("is_clean", False)
+            transformations = [Transformation(**t) for t in result.get("transformations", [])]
+            questions = [Question(**q) for q in result.get("questions", [])]
+            
+            if is_clean:
+                logger.info("✓ Data structure is clean - no transformations needed")
+                return structure_info, [], [], True, []
+            else:
+                issues = result.get("detected_issues", [])
+                logger.info(f"⚠ Detected structure issues: {', '.join(issues)}")
+                logger.info(f"✓ Analyzed structure: {len(transformations)} transformations proposed, {len(questions)} questions")
+                return structure_info, transformations, questions, False,issues
+            
+        except Exception as e:
+            raise RuntimeError(f"Structure analysis failed: {str(e)}")
+    def custom_free_transform(self, user_input: str, 
+                              df: pd.DataFrame, 
+                              max_preview_rows: int = 10) -> pd.DataFrame:
+        """
+        Execute custom transformation based on free-form user input.
+        Uses LLM to generate and execute Python code for transformations outside predefined cases.
+        
+        :param user_input: Natural language description of desired transformation
+        :param df: Input DataFrame to transform
+        :return: Transformed DataFrame
+        """
+        structure_info = self._extract_structure_info(df, max_preview_rows)
+        
+        # Use LLM to check if data is clean and propose transformations
+        prompt = self._build_custom_prompt(user_input,structure_info)
+        try:
+
+            parse_response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_structure_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+            
+            parsed = json.loads(parse_response.choices[0].message.content)
+            transform_type = parsed.get("type")
+            
+            known_types = ["use_row_as_header", "skip_rows", "drop_columns", "rename_columns", "drop_rows"]
+            if transform_type in known_types:
+                transformation = Transformation(
+                    id=f"custom_{transform_type}",
+                    type=TransformationType(transform_type),
+                    description=parsed.get("description", user_input),
+                    params=parsed.get("params", {}),
+                    confidence=0.9
+                )
+                df_result = self.apply_transformation(df, transformation)
+                logger.info(f"✓ Applied structured transformation: {transformation.description}")
+                return df_result
+            
+            # Otherwise, generate custom Python code
+            logger.info(f"⚡ Generating custom code for: {user_input}")
+            
+            # Get DataFrame info for context
+            
+            code_response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_custom_system_prompt()},
+                    {"role": "user", "content": f"""DataFrame info:
+    {json.dumps(structure_info, indent=2, default=str)}
+
+    User request: {user_input}
+
+    Generate Python code to transform 'df' according to the request.
+    Store result in 'df_result'.
+    """}
+                ],
+                temperature=0
+            )
+            
+            # Extract and clean the code
+            generated_code = code_response.choices[0].message.content.strip()
+            
+            # Remove markdown code blocks if present
+            if "```python" in generated_code:
+                generated_code = generated_code.split("```python")[1].split("```")[0].strip()
+            elif "```" in generated_code:
+                generated_code = generated_code.split("```")[1].split("```")[0].strip()
+            
+            logger.info(f"📝 Generated code:\n{generated_code}")
+            
+            # Execute the code safely
+            local_vars = {"df": df.copy(), "pd": pd, "np": np}
+            exec(generated_code, {"__builtins__": __builtins__, "pd": pd, "np": np}, local_vars)
+            
+            if "df_result" not in local_vars:
+                raise RuntimeError("Generated code did not produce 'df_result' variable")
+            
+            df_result = local_vars["df_result"]
+            
+            # Validate the result
+            if not isinstance(df_result, pd.DataFrame):
+                raise RuntimeError(f"Result is not a DataFrame, got {type(df_result)}")
+            
+            # Apply column validation and fixing
+            df_result = self.validate_and_fix_columns(df_result, "[custom_transform] ")
+            
+            logger.info(f"✓ Custom transformation successful: {df.shape} → {df_result.shape}")
+            return df_result
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"✗ Failed to parse LLM response: {str(e)}")
+            raise RuntimeError(f"Failed to parse transformation request: {str(e)}")
+        except Exception as e:
+            logger.error(f"✗ Custom transformation failed: {str(e)}")
+            raise RuntimeError(f"Custom transformation failed: {str(e)}")
+
+
+    def _get_custom_system_prompt(self) -> str:
+        """System prompt for generating custom transformation code"""
+        return """You are an expert Python Data Scientist specializing in pandas DataFrame transformations.
+
+    Your task is to write clean, efficient Python code to transform a DataFrame named 'df'.
+    The transformed result MUST be assigned to a variable named 'df_result'.
+
+    CRITICAL RULES:
+    1. ONLY use pandas (pd) and numpy (np) - they are already imported
+    2. Work with the existing DataFrame 'df' - do NOT read files
+    3. Store the final result in 'df_result'
+    4. Write production-ready code with proper error handling
+    5. Use .copy() when modifying DataFrames to avoid warnings
+    6. RETURN ONLY THE CODE - no markdown, no explanations, no comments outside code
+
+    COMMON OPERATIONS:
+    - Filtering: df_result = df[df['column'] > value].copy()
+    - Aggregation: df_result = df.groupby('col').agg({'col2': 'sum'}).reset_index()
+    - Merging: df_result = pd.merge(df, other_df, on='key')
+    - Pivoting: df_result = df.pivot_table(values='val', index='idx', columns='col')
+    - String operations: df_result = df.copy(); df_result['col'] = df['col'].str.upper()
+    - Date operations: df_result = df.copy(); df_result['date'] = pd.to_datetime(df['date'])
+    - Creating columns: df_result = df.copy(); df_result['new'] = df['a'] + df['b']
+    - Sorting: df_result = df.sort_values('column').reset_index(drop=True)
+
+    EXAMPLE OUTPUT:
+    df_result = df[df['sales'] > 1000].copy()
+    df_result = df_result.sort_values('date', ascending=False).reset_index(drop=True)
+
+    Remember: Output ONLY executable Python code, nothing else."""
+
+
+    def _build_custom_prompt(self, user_input: str,info: Dict[str,Any]) -> str:
+        """Build prompt to parse custom transformation request"""
+        return f"""Parse this transformation request into a structured format.
+
+    Request: "{user_input}"
+    **DataFrame Info:**
+        - Shape: {info['shape']['rows']} rows × {info['shape']['columns']} columns
+        - Current column names: {info['column_names']}
+        - Data types: {json.dumps(info['dtypes'], indent=2)}
+        - Null counts: {json.dumps(info['null_counts'], indent=2)}
+
+        **First row values:**
+        {json.dumps(info['first_row_values'], indent=2, default=str)}
+
+        **Preview (first few rows):**
+        ```json
+        {json.dumps(info['preview_data'], indent=2, default=str)}
+        ```
+
+        **Last few rows (for context):**
+        ```json
+        {json.dumps(info.get('last_few_rows', []), indent=2, default=str)}
+        ```
+    Analyze if this matches any standard transformation pattern:
+    - "Use row X as header" → use_row_as_header
+    - "Skip first N rows" → skip_rows  
+    - "Drop column(s) X" → drop_columns
+    - "Rename column A to B" → rename_columns
+    - "Drop row(s) X" → drop_rows
+
+    If it matches, provide structured JSON. If it's a custom operation (filtering, aggregating, pivoting, etc.), use type "custom".
+
+    RESPONSE FORMAT:
+    {{
+    "type": "use_row_as_header" | "skip_rows" | "drop_columns" | "rename_columns" | "drop_rows" | "custom",
+    "params": {{
+        // For standard types, use appropriate params:
+        "row_index": 2,              // for use_row_as_header
+        "rows_to_skip": 3,           // for skip_rows
+        "columns": ["col1", "col2"], // for drop_columns
+        "mapping": {{"old": "new"}},   // for rename_columns
+        "indices": [0, 1, 2]         // for drop_rows
+        
+        // For "custom" type, params can be empty
+    }},
+    "description": "Human-readable description of what will be done"
+    }}
+
+    EXAMPLES:
+
+    Input: "Use row 2 as header"
+    Output: {{"type": "use_row_as_header", "params": {{"row_index": 2}}, "description": "Use row 2 as column headers"}}
+
+    Input: "Skip first 5 rows"
+    Output: {{"type": "skip_rows", "params": {{"rows_to_skip": 5}}, "description": "Skip first 5 rows"}}
+
+    Input: "Drop columns A, B, C"
+    Output: {{"type": "drop_columns", "params": {{"columns": ["A", "B", "C"]}}, "description": "Drop columns A, B, C"}}
+
+    Input: "Rename Sales to Revenue"
+    Output: {{"type": "rename_columns", "params": {{"mapping": {{"Sales": "Revenue"}}}}, "description": "Rename Sales to Revenue"}}
+
+    Input: "Filter rows where sales > 1000"
+    Output: {{"type": "custom", "params": {{}}, "description": "Filter rows where sales > 1000"}}
+
+    Input: "Calculate average by category"
+    Output: {{"type": "custom", "params": {{}}, "description": "Calculate average by category"}}
+
+    Respond with ONLY the JSON object."""
+
+    def _build_structure_prompt(self, info: Dict[str, Any]) -> str:
+        """Build prompt for structure analysis"""
+        return f"""Analyze this raw DataFrame structure to determine if it's clean or needs transformations.
+
+**DataFrame Info:**
+- Shape: {info['shape']['rows']} rows × {info['shape']['columns']} columns
+- Current column names: {info['column_names']}
+- Data types: {json.dumps(info['dtypes'], indent=2)}
+- Null counts: {json.dumps(info['null_counts'], indent=2)}
+
+**First row values:**
+{json.dumps(info['first_row_values'], indent=2, default=str)}
+
+**Preview (first few rows):**
+```json
+{json.dumps(info['preview_data'], indent=2, default=str)}
+```
+
+**Last few rows (for context):**
+```json
+{json.dumps(info.get('last_few_rows', []), indent=2, default=str)}
+```
+
+**Instructions:**
+1. **First, determine if this data is CLEAN or needs transformations**
+   
+   A clean dataset has:
+   - Proper descriptive column headers (not numeric indices like 0, 1, 2...)
+   - Column names are not in the first data row
+   - No empty/unnamed columns
+   - No duplicate column names
+   - Data starts from the correct row (no metadata rows at top)
+   - Consistent data structure throughout
+
+2. **If data is CLEAN:**
+   - Set "is_clean": true
+   - Leave "transformations" and "detected_issues" empty
+   - No questions needed
+
+3. **If data needs transformations:**
+   - Set "is_clean": false
+   - List all "detected_issues" 
+   - Propose transformations to fix each issue:
+     * Use first row as header
+     * Skip empty/metadata rows at the top
+     * Drop empty columns
+     * Rename poorly named columns
+     * Handle merged headers
+     * Remove duplicate columns
+   
+4. **For each transformation, include:**
+   - Unique ID (e.g., "use_row_0_as_header")
+   - Type of transformation
+   - Clear description
+   - Required parameters
+   - Confidence score (0.0-1.0)
+
+5. **Ask questions only when:**
+   - You're uncertain about a transformation
+   - Multiple valid approaches exist
+   - User input is needed to decide
+
+**Response Format:**
+{{
+  "is_clean": true/false,
+  "detected_issues": ["issue 1", "issue 2", ...],
+  "transformations": [
+    {{
+      "id": "unique_id",
+      "type": "use_row_as_header",
+      "description": "Human-readable description",
+      "params": {{"row_index": 0}},
+      "confidence": 0.95
+    }}
+  ],
+  "questions": [
+    {{
+      "id": "question_id",
+      "question": "Should we...?",
+      "suggested_answer": "yes" or null,
+      "target": "transform.unique_id",
+      "question_type": "structural"
+    }}
+  ]
+}}
+
+**IMPORTANT:** 
+- Be thorough in examining the data structure
+- Look at column names, first row, data types, and null patterns
+- If everything looks good, confidently mark as clean
+- Don't propose unnecessary transformations
+"""
+    
+    def _get_structure_system_prompt(self) -> str:
+        """System prompt for structure analysis"""
+        return """You are an expert data analyst specializing in detecting structural issues in raw tabular data.
+
+Your job is to:
+1. Carefully examine the DataFrame structure by looking at column names, first rows, data types, and patterns
+2. Determine if the data is CLEAN (ready to use) or needs TRANSFORMATIONS
+3. If transformations are needed, identify all structural problems and propose specific fixes
+4. Ask clarifying questions only when genuinely uncertain
+
+**What makes data CLEAN:**
+- Descriptive column headers (not 0, 1, 2, or "Unnamed: X")
+- Headers are in the column name row, not in the first data row
+- No empty or duplicate columns
+- Data starts from the appropriate row
+- Consistent structure throughout
+
+**Common structural issues:**
+- Numeric column indices (0, 1, 2...) instead of headers → first row likely contains real headers
+- First row contains text headers while column names are numeric → use first row as header
+- Empty rows at top (metadata, titles) → skip those rows
+- Unnamed or poorly named columns → rename or drop them
+- Merged or multi-level headers → special handling needed
+
+Be precise and confident in your assessment. Always respond in valid JSON format."""
+    def _extract_structure_info(self, df: pd.DataFrame, max_rows: int = 10) -> Dict[str, Any]:
+        """Extract structure information for LLM analysis"""
+        preview_rows = min(max_rows, len(df))
+        
+        return {
+            "shape": {"rows": len(df), "columns": len(df.columns)},
+            "column_names": df.columns.tolist(),
+            "dtypes": df.dtypes.astype(str).to_dict(),
+            "preview_data": df.head(preview_rows).to_dict(orient='records'),
+            "null_counts": df.isna().sum().to_dict(),
+            "first_row_values": df.iloc[0].tolist() if len(df) > 0 else [],
+            "last_few_rows": df.tail(3).to_dict(orient='records') if len(df) > 3 else []
+        }
+
+    @staticmethod
+    def apply_transformation(df: pd.DataFrame, trans: Transformation) -> pd.DataFrame:
+        """Apply a single transformation to DataFrame"""
+        df_result = df.copy()
+        
+        try:
+            if trans.type == TransformationType.USE_ROW_AS_HEADER:
+                row_idx = trans.params["row_index"]
+                df_result.columns = df_result.iloc[row_idx].astype(str).tolist()
+                df_result = df_result.iloc[row_idx + 1:].reset_index(drop=True)
+                df_result = StructureAnalyzer.validate_and_fix_columns(df_result, f"[{trans.id}] ")
+                
+            elif trans.type == TransformationType.SKIP_ROWS:
+                rows_to_skip = trans.params["rows_to_skip"]
+                df_result = df_result.iloc[rows_to_skip:].reset_index(drop=True)
+                df_result = StructureAnalyzer.validate_and_fix_columns(df_result, f"[{trans.id}] ")
+            elif trans.type == TransformationType.DROP_COLUMNS:
+                cols = trans.params["columns"]
+                df_result = df_result.drop(columns=cols, errors='ignore')
+                
+            elif trans.type == TransformationType.DROP_ROWS:
+                indices = trans.params["indices"]
+                df_result = df_result.drop(index=indices, errors='ignore').reset_index(drop=True)
+                
+            elif trans.type == TransformationType.RENAME_COLUMNS:
+                mapping = trans.params["mapping"]
+                df_result = df_result.rename(columns=mapping)
+            
+            logger.info(f"✓ Applied: {trans.description}")
+            
+        except Exception as e:
+            logger.error(f"✗ Failed to apply {trans.id}: {str(e)}")
+            raise
+        
+        return df_result
+    @staticmethod
+    def validate_and_fix_columns(df: pd.DataFrame, log_prefix: str = "") -> pd.DataFrame:
+        """Validate and fix column names after transformation"""
+        df_result = df.copy()
+        
+        # Convert to strings
+        df_result.columns = [str(col).strip() if col is not None else '' for col in df_result.columns]
+        
+        # Fix empty columns
+        new_columns = []
+        unnamed_counter = 1
+        for col in df_result.columns:
+            if not col or col == '' or col.lower() == 'nan':
+                new_columns.append(f'Unnamed_{unnamed_counter}')
+                unnamed_counter += 1
+            else:
+                new_columns.append(col)
+        df_result.columns = new_columns
+        
+        # Fix duplicates
+        if df_result.columns.duplicated().any():
+            col_counts = {}
+            final_columns = []
+            for col in df_result.columns:
+                if col not in col_counts:
+                    col_counts[col] = 0
+                    final_columns.append(col)
+                else:
+                    col_counts[col] += 1
+                    final_columns.append(f"{col}_{col_counts[col]}")
+            df_result.columns = final_columns
+            logger.info(f"{log_prefix}✓ Fixed duplicate columns")
+        
+        return df_result
+class DataInsightsAnalyzer:
+    """Analyze data patterns, anomalies, and distributions using LLM"""
+
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+
+    def analyze_insights(
+        self,
+        df: pd.DataFrame,
+        profiles: Dict[str, ColumnProfile]
+    ) -> DataInsights:
+        """
+        Analyze data patterns, anomalies, correlations, and distributions.
+        This runs AFTER structure is fixed and types are inferred.
+        """
+
+        # Build analysis prompt
+        prompt = self._build_insights_prompt(df, profiles)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_insights_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+
+            # Parse patterns
+            patterns = [DataPattern(**p) for p in result.get("patterns", [])]
+
+            # Parse anomalies
+            anomalies = [DataAnomaly(**a) for a in result.get("anomalies", [])]
+
+            insights = DataInsights(
+                patterns=patterns,
+                anomalies=anomalies,
+                distributions=result.get("distributions", {}),
+                correlations=result.get("correlations", []),
+                summary=result.get("summary", "")
+            )
+
+            logger.info(f"✓ Data insights: {len(patterns)} patterns, {len(anomalies)} anomalies detected")
+            return insights
+
+        except Exception as e:
+            raise RuntimeError(f"Insights analysis failed: {str(e)}")
+
+    def _build_insights_prompt(
+        self,
+        df: pd.DataFrame,
+        profiles: Dict[str, ColumnProfile]
+    ) -> str:
+        """Build prompt for data insights analysis"""
+
+        # Sample data
+        sample_rows = df.head(20).to_dict(orient='records')
+
+        # Basic statistics for numeric columns
+        numeric_stats = {}
+        for col in df.select_dtypes(include=[np.number]).columns:
+            numeric_stats[str(col)] = {
+                "mean": float(df[col].mean()) if not df[col].isna().all() else None,
+                "median": float(df[col].median()) if not df[col].isna().all() else None,
+                "std": float(df[col].std()) if not df[col].isna().all() else None,
+                "min": float(df[col].min()) if not df[col].isna().all() else None,
+                "max": float(df[col].max()) if not df[col].isna().all() else None
+            }
+
+        # Categorical columns
+        categorical_info = {}
+        for col in df.select_dtypes(include=['object']).columns:
+            if df[col].nunique() < 50:  # Only for low cardinality
+                categorical_info[str(col)] = {
+                    "unique_count": int(df[col].nunique()),
+                    "top_values": df[col].value_counts().head(10).to_dict()
+                }
+
+        return f"""Analyze this dataset and identify patterns, anomalies, and insights.
+
+**Dataset Overview:**
+- Shape: {df.shape[0]} rows × {df.shape[1]} columns
+- Columns: {list(df.columns)}
+
+**Column Profiles:**
+{json.dumps({col: {"type": profile.inferred_type, "null_ratio": profile.null_ratio, "unique": profile.n_unique} for col, profile in list(profiles.items())[:20]}, indent=2)}
+
+**Numeric Statistics:**
+{json.dumps(numeric_stats, indent=2, default=str)}
+
+**Categorical Info:**
+{json.dumps(categorical_info, indent=2, default=str)}
+
+**Sample Data (first 20 rows):**
+{json.dumps(sample_rows[:10], indent=2, default=str)}
+
+**Instructions:**
+Analyze the data and identify:
+
+1. **Patterns** (pattern_type, column, description, confidence, details):
+   - Trends (increasing/decreasing over time)
+   - Seasonality or cycles
+   - Unique identifiers (ID columns)
+   - Categorical groupings
+   - Date/time patterns
+   - Hierarchical relationships
+
+2. **Anomalies** (anomaly_type, column, description, severity, affected_rows, examples):
+   - Outliers in numeric data
+   - Missing data patterns
+   - Inconsistent formats
+   - Duplicate entries
+   - Data quality issues
+
+3. **Distributions** (column -> distribution type):
+   - "normal", "uniform", "skewed_left", "skewed_right", "bimodal", "categorical", etc.
+
+4. **Correlations** (list of related columns):
+   - Strong correlations between numeric columns
+   - Relationships between categorical and numeric
+
+5. **Summary**: Brief overview of key findings
+
+**Response Format:**
+{{
+  "patterns": [
+    {{
+      "pattern_type": "unique_id" | "trend" | "categorical" | "temporal" | ...,
+      "column": "column_name",
+      "description": "Description of the pattern",
+      "confidence": 0.95,
+      "details": {{"key": "value"}}
+    }}
+  ],
+  "anomalies": [
+    {{
+      "anomaly_type": "outlier" | "missing_pattern" | "inconsistent_format" | ...,
+      "column": "column_name",
+      "description": "Description of the anomaly",
+      "severity": "low" | "medium" | "high",
+      "affected_rows": 10,
+      "examples": ["example1", "example2"]
+    }}
+  ],
+  "distributions": {{
+    "column_name": "normal",
+    "another_column": "skewed_right"
+  }},
+  "correlations": [
+    {{
+      "columns": ["col1", "col2"],
+      "type": "positive" | "negative",
+      "strength": "strong" | "moderate" | "weak",
+      "description": "Description"
+    }}
+  ],
+  "summary": "Brief summary of key insights about this dataset"
+}}
+"""
+
+    def _get_insights_system_prompt(self) -> str:
+        """System prompt for insights analysis"""
+        return """You are an expert data scientist specializing in exploratory data analysis.
+
+Your job is to:
+1. Identify meaningful patterns in the data
+2. Detect anomalies and data quality issues
+3. Determine statistical distributions
+4. Find correlations and relationships between variables
+5. Provide actionable insights
+
+Be thorough but concise. Focus on insights that would help users understand their data better.
+
+Always respond in valid JSON format."""
+# ============================================================================
+# Profile Generation (Enhanced with Type Inference)
+# ============================================================================
+
+class ProfileGenerator:
+    """Generate statistical profiles with smart type inference"""
+    
+    @staticmethod
+    def generate_profiles(
+        df: pd.DataFrame, 
+        max_samples: int = 10
+    ) -> Dict[str, ColumnProfile]:
+        """Generate profile for each column with type inference"""
+        if df.columns.duplicated().any():
+            duplicates = df.columns[df.columns.duplicated()].tolist()
+            raise ValueError(
+                f"Duplicate column names found: {duplicates}. "
+                f"Please apply transformations to fix column names first."
+            )
+        
+        empty_cols = [col for col in df.columns if not str(col).strip()]
+        if empty_cols:
+            raise ValueError(
+                f"Empty column names found. Please rename these columns first."
+            )
+        
+        df = df.copy()
+        df.columns = [str(col) for col in df.columns]
+        profiles = {}
+        
+        for col in df.columns:
+            series = df[col]
+            non_null = series.notna().sum()
+            null = series.isna().sum()
+            total = len(series)
+
+            try:
+                samples = series.dropna().head(max_samples).tolist()
+                raw_samples = series.dropna().astype(str).head(max_samples).tolist()
+            except:
+                logger.info(f'DF: {df}')
+            # Type inference
+            inferred_type, metadata = TypeInferenceEngine.infer_type(series)
+
+            # Detect data issues
+            data_issues = TypeInferenceEngine.detect_data_issues(series)
+
+            profile = ColumnProfile(
+                name=str(col),
+                pandas_dtype=str(series.dtype),
+                inferred_type=inferred_type,
+                non_null_count=int(non_null),
+                null_count=int(null),
+                null_ratio=float(null / total) if total > 0 else 0.0,
+                n_unique=int(series.nunique()),
+                sample_values=samples,
+                sample_raw_values=raw_samples,
+                has_thousand_separator=metadata.get('thousand_separator') is not None,
+                decimal_separator=metadata.get('decimal_separator'),
+                data_issues=data_issues
+            )
+            profiles[str(col)] = profile
+        
+        return profiles
+    
+    @staticmethod
+    def get_sample_rows(df: pd.DataFrame, n: int = 5) -> List[Dict[str, Any]]:
+        """Get sample rows"""
+        return df.head(n).to_dict(orient='records')
+
+
+class SchemaGenerator:
+    """Generate semantic schema using LLM with type awareness"""
+
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+
+    def generate_clarification_questions(
+        self,
+        profiles: Dict[str, ColumnProfile],
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None
+    ) -> List[Question]:
+        """
+        Analyze data and generate clarification questions before schema generation.
+
+        Examples: unit of measurement, data format, constraints, relationships, etc.
+        """
+        prompt = self._build_clarification_prompt(profiles, sample_rows, question_set)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_clarification_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+            questions = [Question(**q) for q in result.get("questions", [])]
+
+            logger.info(f"✓ Generated {len(questions)} clarification questions")
+            return questions
+
+        except Exception as e:
+            raise RuntimeError(f"Clarification question generation failed: {str(e)}")
+
+    def _build_clarification_prompt(
+        self,
+        profiles: Dict[str, ColumnProfile],
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None
+    ) -> str:
+        """Build prompt for clarification questions"""
+
+        profiles_json = {col: prof.to_dict() for col, prof in profiles.items()}
+
+        user_context = ""
+        if question_set and (question_set.user_questions or question_set.output_fields):
+            user_context = f"""
+
+**User's Expected Usage:**
+- Questions: {json.dumps([q.question for q in question_set.user_questions], indent=2)}
+- Output Fields: {json.dumps([f.field_name for f in question_set.output_fields], indent=2)}
+- Notes: {question_set.additional_notes}
+"""
+#         return f"""
+# **Response Format:**
+# {{
+#   "questions": [
+#     {{
+#       "id": "salary_unit",
+#       "question": "What is the currency unit for the 'Salary' column?",
+#       "suggested_answer": "VND",
+#       "target": "Salary.unit",
+#       "question_type": "semantic"
+#     }},
+#     {{
+#       "id": "area_unit",
+#       "question": "What is the unit of measurement for 'Area'?",
+#       "suggested_answer": "m2",
+#       "target": "Area.unit",
+#       "question_type": "semantic"
+#     }}
+#   ]
+# }}
+# Return all NONE and just 1 question
+# """
+        return f"""Analyze this data and generate clarification questions to better understand the schema.{user_context}
+
+**Column Profiles:**
+```json
+{json.dumps(profiles_json, indent=2, default=str)}
+```
+
+**Sample Rows:**
+```json
+{json.dumps(sample_rows[:5], indent=2, default=str)}
+```
+
+Generate clarification questions about:
+1. **Units**: For numeric columns (price, area, salary, etc.) - what is the unit? (VND, USD, m², etc.)
+2. **Format**: For date/text columns - what format is expected?
+3. **Constraints**: Any min/max values, allowed ranges?
+4. **Relationships**: Foreign keys, categorical hierarchies?
+5. **Business Context**: What does this column represent in business terms?
+
+Focus on questions that will help generate an accurate, useful schema.
+
+**Response Format:**
+{{
+  "questions": [
+    {{
+      "id": "salary_unit",
+      "question": "What is the currency unit for the 'Salary' column?",
+      "suggested_answer": "VND",
+      "target": "Salary.unit",
+      "question_type": "semantic"
+    }},
+    {{
+      "id": "area_unit",
+      "question": "What is the unit of measurement for 'Area'?",
+      "suggested_answer": "m2",
+      "target": "Area.unit",
+      "question_type": "semantic"
+    }}
+  ]
+}}
+
+Generate necessary clarification questions to has a deep understand about schema.
+"""
+
+    def _get_clarification_system_prompt(self) -> str:
+        """System prompt for clarification questions"""
+        return """You are a data analyst expert who asks clarifying questions about data schemas.
+
+Your job is to analyze column profiles and sample data, then ask questions that will help:
+1. Understand units of measurement for numeric columns
+2. Clarify date/time formats
+3. Identify constraints and validation rules
+4. Understand business context and relationships
+
+Ask specific, actionable questions. Each question should help define a specific schema attribute.
+Be concise but thorough. Prioritize questions that impact data interpretation.
+
+Always respond in valid JSON format. Response in Vietnamese
+"""
+
+    def generate_schema(
+        self,
+        profiles: Dict[str, ColumnProfile],
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None,
+        clarification_answers: Optional[List[Answer]] = None
+    ) -> Tuple[Dict[str, ColumnSchema], List[Question]]:
+        """Generate schema with semantic types, guided by user questions and clarification answers"""
+
+        prompt = self._build_schema_prompt(profiles, sample_rows, question_set, clarification_answers)
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_schema_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+
+            # Create case-insensitive mapping for column names
+            profile_mapping = {col.lower(): col for col in profiles.keys()}
+
+            schema = {}
+            for col, spec in result["schema"].items():
+                # Try to find matching column in profiles (case-insensitive)
+                col_lower = col.lower()
+                original_col = profile_mapping.get(col_lower, col)
+
+                # Add original_type from profile if found
+                if original_col in profiles:
+                    original_type = profiles[original_col].pandas_dtype
+                    spec['original_type'] = original_type
+                else:
+                    # Fallback: try to find best match or use 'object' as default
+                    logger.warning(f"Column '{col}' not found in profiles, using default 'object' type")
+                    spec['original_type'] = 'object'
+
+                # Use original column name from data
+                spec['name'] = original_col if original_col in profiles else col
+                schema[original_col if original_col in profiles else col] = ColumnSchema(**spec)
+            
+            questions = [Question(**q) for q in result.get("questions", [])]
+            
+            logger.info(f"✓ Generated schema for {len(schema)} columns")
+            return schema, questions
+            
+        except Exception as e:
+            raise RuntimeError(f"Schema generation failed: {str(e)}")
+    
+    def _build_schema_prompt(
+        self,
+        profiles: Dict[str, ColumnProfile],
+        sample_rows: List[Dict[str, Any]],
+        question_set: Optional[QuestionSet] = None,
+        clarification_answers: Optional[List[Answer]] = None
+    ) -> str:
+        """Build prompt with type inference info, user questions, and clarification answers"""
+
+        profiles_json = {}
+        for col, prof in profiles.items():
+            prof_dict = prof.to_dict()
+            # Add inference hints
+            if prof.has_thousand_separator:
+                prof_dict['note'] = f"Has thousand separator (e.g., {prof.sample_raw_values[0]!r}), should be {prof.inferred_type}"
+            profiles_json[col] = prof_dict
+
+        # Build clarification answers context
+        clarification_context = ""
+        if clarification_answers:
+            clarification_context = "\n\n**Clarification Answers:**\n"
+            for answer in clarification_answers:
+                clarification_context += f"- {answer.question_id}: {answer.answer}\n"
+
+        # Build user questions context if provided
+        user_context = ""
+        if question_set and (question_set.user_questions or question_set.output_fields):
+            user_context = f"""
+
+**IMPORTANT: User's Expected Usage**
+
+The user has specified how they intend to use this data:
+
+**Questions the user will ask:**
+{json.dumps([q.to_dict() for q in question_set.user_questions], indent=2)}
+
+**Expected output fields needed:**
+{json.dumps([f.to_dict() for f in question_set.output_fields], indent=2)}
+
+**Additional notes:**
+{question_set.additional_notes}
+
+Please ensure the schema you generate has enough semantic information to:
+1. Answer the user's questions accurately
+2. Map to the expected output fields
+3. Provide clear descriptions that help answer these questions
+"""
+
+        return f"""Analyze column profiles and generate semantic schema.{user_context}{clarification_context}
+
+**Column Profiles (with type inference):**
+```json
+{json.dumps(profiles_json, indent=2, default=str)}
+```
+
+**Sample Rows:**
+```json
+{json.dumps(sample_rows, indent=2, default=str)}
+```
+
+Generate schema for each column:
+
+**Response Format:**
+{{
+  "schema": {{
+    "column_name": {{
+      "name": "column_name",
+      "description": "Brief description",
+      "semantic_type": "categorical" | "numeric" | "boolean" | "datetime" | "text" | "identifier",
+      "physical_type": "int64" | "float64" | "string" | "datetime64[ns]",
+      "unit": "m" | "m2" | "VND" | "USD" | null,
+      "is_required": true | false,
+      "constraints": {{"min": 0}} or null
+    }}
+  }},
+  "questions": [
+    {{
+      "id": "price_unit",
+      "question": "What is the unit of the 'price' column?",
+      "suggested_answer": "VND",
+      "target": "price.unit",
+      "question_type": "semantic"
+    }}
+  ]
+}}
+
+IMPORTANT: Use the inferred_type to set physical_type correctly (not pandas_dtype if it's object but should be int/float).
+"""
+    
+    def _get_schema_system_prompt(self) -> str:
+        """System prompt"""
+        return """You are an expert data analyst specializing in semantic schema inference.
+
+Analyze profiles and determine:
+1. Semantic type (what it represents)
+2. Physical type (actual data type - use inferred_type from profile)
+3. Units if applicable
+4. Required status (based on null_ratio)
+5. Constraints
+
+Pay attention to type inference hints - if a column has "inferred_type": "int" but "pandas_dtype": "object",
+it means the data has formatting (like 500.000) and should be treated as int after cleaning.
+
+Always respond in valid JSON."""
+
+
+class SchemaValidator:
+    """Validate if schema can answer user questions and suggest refinements"""
+
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+        self.client = OpenAI(api_key=api_key)
+        self.model = model
+
+    def validate_schema_for_questions(
+        self,
+        schema: Dict[str, ColumnSchema],
+        profiles: Dict[str, ColumnProfile],
+        question_set: QuestionSet,
+        sample_rows: List[Dict[str, Any]]
+    ) -> Tuple[bool, List[Question], str]:
+        """
+        Validate if current schema can answer user questions.
+
+        Returns:
+            - is_sufficient: Whether schema is sufficient
+            - additional_questions: Questions to ask if schema is insufficient
+            - validation_report: Detailed report of the validation
+        """
+        prompt = self._build_validation_prompt(schema, profiles, question_set, sample_rows)
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self._get_validation_system_prompt()},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+
+            result = json.loads(response.choices[0].message.content)
+
+            is_sufficient = result.get("is_sufficient", False)
+            additional_questions = [Question(**q) for q in result.get("additional_questions", [])]
+            validation_report = result.get("validation_report", "")
+
+            logger.info(f"✓ Schema validation: {'Sufficient' if is_sufficient else 'Needs refinement'}")
+            if not is_sufficient:
+                logger.info(f"  Additional questions needed: {len(additional_questions)}")
+
+            return is_sufficient, additional_questions, validation_report
+
+        except Exception as e:
+            raise RuntimeError(f"Schema validation failed: {str(e)}")
+
+    def _build_validation_prompt(
+        self,
+        schema: Dict[str, ColumnSchema],
+        profiles: Dict[str, ColumnProfile],
+        question_set: QuestionSet,
+        sample_rows: List[Dict[str, Any]]
+    ) -> str:
+        """Build validation prompt with robust serialization"""
+        
+        schema_json = {k: v.to_dict() for k, v in schema.items()} if schema else {}
+        
+        questions_json = []
+        if question_set and question_set.user_questions:
+            questions_json = [q.to_dict() for q in question_set.user_questions]
+        fields_json = []
+        if question_set and question_set.output_fields:
+            fields_json = [f.to_dict() for f in question_set.output_fields]
+            
+        # Lấy Notes
+        additional_json = "No additional notes."
+        if question_set and question_set.additional_notes:
+            additional_json = question_set.additional_notes
+            
+        logger.info(f'Sending Validation Prompt with Notes: {additional_json}')
+
+        return f"""Validate if the current schema can adequately answer the user's questions.
+
+    **🚨 EXISTING BUSINESS LOGIC & NOTES (CHECK HERE FIRST):**
+    ```text
+    {additional_json}
+    ```
+    *(If the answer to a question is found above, DO NOT ask for it again. Mark as sufficient.)*
+
+    **User Questions:**
+    {json.dumps(questions_json, indent=2)}
+
+    **Expected Output Fields:**
+    {json.dumps(fields_json, indent=2)}
+
+    **Current Schema:**
+    {json.dumps(schema_json, indent=2, default=str)}
+
+    **Sample Data:**
+    {json.dumps(sample_rows[:5] if sample_rows else [], indent=2, default=str)}
+
+    **Instructions:**
+    1. Check if "Existing Business Logic" answers the User Questions.
+    2. If a user asks for a field (e.g., "Net Worth") that is NOT in schema BUT is in Business Logic -> It is SUFFICIENT.
+    3. Only if truly missing:
+       - Ask for the FORMULA or LOGIC.
+       - Set target as "Global.logic" or "ColumnName.calculation".
+
+    **Response Format:**
+    {{
+    "is_sufficient": false,
+    "validation_report": "Missing 'Net Worth' column.",
+    "additional_questions": [
+        {{
+        "id": "missing_net_worth",
+        "question": "The dataset has 'rawsalary' but no 'Net Worth'. How should Net Worth be calculated?",
+        "suggested_answer": "Net Worth = rawsalary - 10%",
+        "target": "Global.calculation",
+        "question_type": "semantic"
+        }}
+    ]
+    }}
+    """
+
+    def _get_validation_system_prompt(self) -> str:
+        """System prompt for validation"""
+        return """You are an expert data schema validator.
+
+Your task is to determine if a data schema is sufficient to answer specific user questions.
+
+🚨 **CRITICAL RULE - READ THIS FIRST**:
+You MUST check the "Additional Notes / Business Logic" section provided in the context.
+1. **IF A QUESTION IS ALREADY ANSWERED IN "ADDITIONAL NOTES":**
+   - You must consider the schema **SUFFICIENT** for that question.
+   - Do **NOT** generate a new clarification question for it.
+   - Assume the user knows how to calculate it based on the note.
+
+2. **IF A COLUMN IS MISSING BUT A FORMULA IS IN "ADDITIONAL NOTES":**
+   - This counts as SUFFICIENT. Do not ask for the formula again.
+
+Analyze:
+1. Can each user question be answered with the current schema OR the provided Business Logic/Notes?
+2. Are the expected output fields mappable to schema columns OR calculate-able via Notes?
+3. Only generate new questions for information that is **completely missing** from BOTH the Schema AND the Additional Notes.
+
+Be thorough but practical. STOP asking about things that are already defined in the Notes.
+
+Always respond in valid JSON format."""
+
+class DataSchemaAgent:
+    """
+    Data Schema Agent following OpenAI Agent standard
+
+    Features:
+    - Streaming query interface (Generator pattern)
+    - SQL query execution with dynamic schema
+    - Helper methods: get_sample_rows, get_distinct_values, execute_query
+    - Can be instantiated and used from any code
+    - Fully flexible - adapts to any schema
+    """
+
+    DEFAULT_MODEL = "gpt-4o-mini"
+
     def __init__(
         self,
-        source_name: str,
-        db_connection_string: str,
-        table_name: str,
-        redis_client: redis.Redis,
-        system_prompt: str = None,
-        model: str = None
+        session: 'Session',
+        api_key: str,
+        model: str = None,
+        df_cleaned: Optional[pd.DataFrame] = None,
+        sql_tool: Optional['SQLQueryTool'] = None,
+        system_prompt: str = None
     ):
         """
-        Initialize HST Agent
-        
+        Initialize Data Schema Agent
+
         Args:
-            source_name: Name of the data source
-            db_connection_string: Database connection string
-            table_name: Table name to query
-            redis_client: Redis client for caching
-            system_prompt: Custom system prompt
-            model: Model to use (default: gpt-4.1)
+            session: Session with schema info
+            api_key: OpenAI API key
+            model: Model to use (default: gpt-4o-mini)
+            df_cleaned: Cleaned DataFrame (optional)
+            sql_tool: SQL query tool (optional, will create if df_cleaned provided)
+            system_prompt: Custom system prompt (optional)
         """
-        self.source_name = source_name
-        self.db_connection_string = db_connection_string
-        self.table_name = table_name
-        self.redis_client = redis_client
+        self.session = session
+        self.df_cleaned = df_cleaned
+        self.client = OpenAI(api_key=api_key)
         self.model = model or self.DEFAULT_MODEL
-        self.model = self.model.split("/")[1] if "/" in self.model else self.model
-        self.vector_store_id = "hst"
-        logger.warning(f"Model for hst agent is {self.model}")
-        
-        # Initialize OpenAI client
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        
-        # Initialize database engine
-        self.engine = create_engine(
-            db_connection_string,
-            pool_pre_ping=True,
-            pool_recycle=3600
-        )
-        
+        self.sql_tool = sql_tool
+
         # System prompt
         self.system_prompt = system_prompt or self._default_system_prompt()
-    
-        # Thời gian hiện tại 
-        now = datetime.now()
-        self.current_date = now
-        self.current_year = now.year
-        self.current_month = now.month
-        self.current_day = now.day
 
-        logger.info(f"[TIME CONTEXT] Current date context initialized: {self.current_date}")
+        # Create SQL database if cleaned data provided and no sql_tool
+        if df_cleaned is not None and sql_tool is None:
+            db_dir = Path("./agent_databases")
+            db_dir.mkdir(exist_ok=True)
 
-        # Initialize schema
-        self._initialize_schema()
-        
-        logger.info(f"HST Agent initialized for {source_name} with table {table_name}")
-    
+            self.db_path = db_dir / f"data_{session.session_id}.db"
+            self.sql_tool = SQLQueryTool(str(self.db_path), df_cleaned)
+            logger.info("✓ Agent initialized with SQL capability")
+
+        logger.info(f"DataSchemaAgent initialized with model: {self.model}")
+
     def _default_system_prompt(self) -> str:
-        """Default system prompt for HST Agent"""
-        return """Bạn là trợ lý AI chuyên trả lời câu hỏi về hồ sơ thầu (HST).
-Bạn có khả năng chuyển đổi câu hỏi tiếng Việt thành SQL query để truy vấn database.
+        """Default system prompt for data schema agent with scenarios support"""
+        base_prompt = """You are an intelligent data analyst assistant with SQL query capabilities.
 
-Quy trình ReAct:
-1. THOUGHT: Phân tích câu hỏi và xác định thông tin cần thiết
-2. ACTION: Quyết định hành động tiếp theo (execute_query, final_answer)
-3. OBSERVATION: Phân tích kết quả từ hành động
-4. Lặp lại cho đến khi bạn CHO LÀ đã đủ thông tin để trả lời
+🚨 **CRITICAL: SCENARIO-FIRST APPROACH** 🚨
+When answering user questions, you MUST follow this priority order:
 
-💡 Lưu ý:
-- Bạn tự quyết định khi nào dùng final_answer. Nếu thấy đủ dữ liệu/thông tin, hãy trả lời.
-- Khi viết final_answer, PHẢI chèn các con số cụ thể (tổng giá trị, % thị phần, số hợp đồng, v.v.)
-- Nếu chưa có số, hãy thực hiện thêm execute_query hoặc phép tính trung gian (tổng, chia, %).
-    Ví dụ:
-    ✅ "Tổng giá trị NSNN là 1.230 tỷ VND, VTS đạt 615 tỷ (50%)."
-    ❌ "Tổng giá trị là X đồng, VTS đạt Y đồng, chiếm Z%."
-
-🧭 QUY TẮC CHO AGENT REACT:
-- Bạn KHÔNG cần viết câu trả lời tự nhiên trong final_answer.
-- Khi bạn đã xác định được SQL đúng, đã thực thi query và dữ liệu trả về hợp lý (có kết quả, không lỗi),
-  hãy kết thúc bằng:
-  ACTION: final_answer("ready")
-- Agent phía sau sẽ tự tổng hợp báo cáo chi tiết từ dữ liệu.
-
-QUAN TRỌNG (PostgreSQL):
-1. TÊN CỘT: Sử dụng CHÍNH XÁC tên cột từ schema (có dấu, chữ hoa/thường đúng)
+1. **CHECK FOR SCENARIO MATCH FIRST** (HIGHEST PRIORITY)
+   - Look at the user's question
+   - Check if it matches any defined scenario pattern in the scenarios section below
+   - If YES: Follow that scenario's output template EXACTLY
+   - Use SQL to get data values, then format according to the template
    
-   ⚠️ PostgreSQL yêu cầu DOUBLE QUOTES cho column names có dấu/mixed case
-   
-   DANH SÁCH TÊN CỘT ĐÚNG (luôn wrap trong ""):
-   ✅ "Giá_trúng_thầu" (số, dùng để tính toán)
-   ✅ "Giá_trúng_thầu" (text, KHÔNG dùng để tính)
-   ✅ "Lĩnh_vực_Khách_hàng"
-   ✅ "Thời_gian_phê_duyệt_KQLCNT" (có _KQLCNT ở cuối)
-   ✅ "Năm_phê_duyệt_KQLCNT" (có _KQLCNT ở cuối)
-   ✅ "Đơn_vị_kinh_doanh(VTS)" (có (VTS) ở cuối)
-   ✅ "Nhóm_trúng_thầu"
-   ✅ "Tên_bên_trúng_thầu"
-   ✅ "Tên_bên_mời_thầu"
-   ✅ "Tên_gói_thầu"
-   
-   VÍ DỤ SQL ĐÚNG (với double quotes):
-   SELECT "Giá_trúng_thầu", "Nhóm_trúng_thầu" FROM table
-   WHERE "Thời_gian_phê_duyệt_KQLCNT" = 'Tháng 10'
-   
-   SAI THƯỜNG GẶP:
-   ❌ Giá_trúng_thầu (no quotes) → SYNTAX ERROR
-   ❌ 'Giá_trúng_thầu' (single quotes) → ERROR
-   ✅ "Giá_trúng_thầu" (double quotes) → CORRECT
-   
-2. STRING LITERALS: Dùng dấu nháy đơn cho values (NOT column names)
-   ✅ ĐÚNG: WHERE "Nhóm_trúng_thầu" = 'VTS'
-   ❌ SAI: WHERE Nhóm_trúng_thầu = 'VTS' - missing quotes on column
-   
-3. ACTION FORMAT: Tên cột KHÔNG CẦN quotes trong action parameter
-   ✅ ĐÚNG: get_distinct_values("Thời_gian_phê_duyệt_KQLCNT")
-   ⚠️ NOTE: Code sẽ tự thêm double quotes khi generate SQL
-   
-4. KIỂM TRA SQL TRƯỚC KHI EXECUTE:
-   - Column names wrapped trong double quotes ""
-   - String values wrapped trong single quotes ''
-   - Không có empty column name
-""" + "\n\n" + GENERAL_GUIDE_COMBINED
-    
-    def _initialize_schema(self):
-        """Initialize database schema information with metadata"""
-        try:
-            # Get schema from database
-            inspector = inspect(self.engine)
-            columns = inspector.get_columns(self.table_name)
-            
-            # Enrich with metadata
-            enriched_columns = []
-            for col in columns:
-                col_name = col["name"]
-                col_info = {
-                    "name": col_name,
-                    "type": str(col["type"]),
-                    "nullable": col.get("nullable", True)
-                }
-                
-                # Add metadata if available
-                if col_name in SCHEMA_METADATA:
-                    col_info.update(SCHEMA_METADATA[col_name])
-                
-                enriched_columns.append(col_info)
-            
-            self.schema_info = {
-                "table_name": self.table_name,
-                "columns": enriched_columns
-            }
-            
-            logger.info(f"Initialized enriched schema for {self.source_name}")
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize schema: {e}")
-            self.schema_info = {"table_name": self.table_name, "columns": []}
-    
-    def _get_sample_rows(self, limit: int = 5) -> List[Dict]:
-        """Get sample rows from database"""
-        try:
-            # Query database
-            query = text(f"SELECT * FROM {self.table_name} LIMIT {limit}")
-            logger.info(f"[SQL SAMPLES] SELECT * FROM {self.table_name} LIMIT {limit}")
-            
-            with self.engine.connect() as conn:
-                result = conn.execute(query)
-                samples = []
-                for row in result:
-                    mapped = {}
-                    for k, v in dict(row._mapping).items():
-                        if isinstance(v, datetime):
-                            mapped[k] = v.isoformat(sep=" ", timespec="seconds")
-                        else:
-                            mapped[k] = v
-                    samples.append(mapped)
-            
-            logger.info(f"[SQL SAMPLES SUCCESS] Retrieved {len(samples)} sample rows")
-            return samples
-            
-        except Exception as e:
-            logger.error(f"[SQL SAMPLES FAILED] Failed to get sample rows: {e}")
-            return []
-    
-    def _get_distinct_values(self, column_name: str, limit: int = 50) -> List[Any]:
-        """Get distinct values for a column"""
-        try:
-            # PostgreSQL requires double quotes for column names with special chars or mixed case
-            # Wrap column name in double quotes
-            quoted_column = f'"{column_name}"'
-            query = text(f'SELECT DISTINCT {quoted_column} FROM {self.table_name} WHERE {quoted_column} IS NOT NULL LIMIT {limit}')
-            
-            # Log the query
-            logger.info(f'[SQL DISTINCT] SELECT DISTINCT {quoted_column} FROM {self.table_name} WHERE {quoted_column} IS NOT NULL LIMIT {limit}')
-            
-            with self.engine.connect() as conn:
-                result = conn.execute(query)
-                values = [row[0] for row in result]
-            
-            logger.info(f"[SQL DISTINCT SUCCESS] Found {len(values)} distinct values for '{column_name}'")
-            return values
-            
-        except Exception as e:
-            logger.error(f"[SQL DISTINCT FAILED] Failed to get distinct values for {column_name}: {e}")
-            return []
-    
-    def _validate_sql(self, sql_query: str) -> Tuple[bool, Optional[str]]:
-        """
-        Validate SQL query before execution
-        Returns: (is_valid, error_message)
-        """
-        try:
-            # Check for empty/whitespace query
-            if not sql_query or not sql_query.strip():
-                return False, "Empty SQL query"
-            
-            # Check parentheses balance
-            if sql_query.count('(') != sql_query.count(')'):
-                return False, "Unbalanced parentheses"
-            
-            # Check for common column name mistakes (case-insensitive patterns)
-            
-            # Pattern 1: Wrong column names
-            common_mistakes = {
-                'giá_trúng_thầu': 'Giá_trúng_thầu',
-                'gia_trung_thau': 'Giá_trúng_thầu',  # Missing dấu
-                'lĩnh_vực_khách_hàng': 'Lĩnh_vực_Khách_hàng',
-                'linh_vuc_khach_hang': 'Lĩnh_vực_Khách_hàng',
-                'thời_gian_phê_duyệt_kqlcnt': 'Thời_gian_phê_duyệt_KQLCNT',
-                'thoi_gian_phe_duyet_kqlcnt': 'Thời_gian_phê_duyệt_KQLCNT',
-                'thời_gian_phê_duyệt': 'Thời_gian_phê_duyệt_KQLCNT',  # Thiếu _KQLCNT
-                'thoi_gian_phe_duyet': 'Thời_gian_phê_duyệt_KQLCNT',
-                'đơn_vị_kinh_doanh': 'Đơn_vị_kinh_doanh(VTS)',
-                'don_vi_kinh_doanh': 'Đơn_vị_kinh_doanh(VTS)',
-                'năm_phê_duyệt_kqlcnt': 'Năm_phê_duyệt_KQLCNT',
-                'nam_phe_duyet_kqlcnt': 'Năm_phê_duyệt_KQLCNT'
-            }
-            
-            for wrong, correct in common_mistakes.items():
-                # Use word boundary to avoid false positives
-                import re
-                pattern = r'\b' + re.escape(wrong) + r'\b'
-                if re.search(pattern, sql_query):
-                    return False, f"Wrong column name: use '{correct}' instead of '{wrong}'"
-            
-            # Gợi ý thay thế bằng DATE_TRUNC
-            if 'Thoi_gian_phe_duyet' not in sql_query and 'CURRENT_DATE' in sql_query:
-                logger.warning("[SQL VALIDATION] Cảnh báo: có thể cần dùng Thoi_gian_phe_duyet cho điều kiện thời gian.")
-            
-            return True, None
-            
-        except Exception as e:
-            logger.warning(f"SQL validation error: {e}")
-            return True, None  # Don't block if validator fails
-    
-    def _execute_sql(self, sql_query: str) -> Tuple[List[Dict], Optional[str]]:
-        """Execute SQL query with validation and automatic scalar handling"""
-        is_valid, validation_error = self._validate_sql(sql_query)
-        if not is_valid:
-            error_msg = f"SQL Validation Error: {validation_error}"
-            logger.error(error_msg)
-            return [], error_msg
+2. **FREE-FORM QUERY** (Only if no scenario matches)
+   - Use SQL queries to analyze data
+   - Provide insights and recommendations
 
-        logger.info(f"[SQL EXECUTING] {sql_query}")
+**Your Capabilities:**
+- Understand and explain data schemas
+- Execute SQL queries to analyze data
+- Follow predefined output templates for common questions
+- Provide insights and recommendations
 
-        try:
-            with self.engine.connect() as conn:
-                # Clean escape characters if accidentally added
-                sql_query = sql_query.replace('\\"', '"').replace("\\'", "'")
+**SQL Guidelines:**
+- You can only execute SELECT queries (no INSERT, UPDATE, DELETE)
+- Table name: 'data'
+- Use column names exactly as shown in the schema
+- Use LIMIT for previews (e.g., LIMIT 10)
+- Use aggregations: COUNT(), SUM(), AVG(), MIN(), MAX()
+- Use GROUP BY for category analysis
+- Use WHERE for filtering
+- Use ORDER BY for sorting
 
-                # Detect if it's a single-value aggregate
-                is_scalar_query = bool(
-                    re.search(r'\b(SUM|AVG|COUNT|MAX|MIN)\b', sql_query, re.IGNORECASE)
-                    and not re.search(r'\bGROUP\s+BY\b', sql_query, re.IGNORECASE)
-                )
+**Query Examples:**
+- Preview data: `SELECT * FROM data LIMIT 5`
+- Calculate average: `SELECT AVG(price) FROM data WHERE category='A'`
+- Count by category: `SELECT category, COUNT(*) as count FROM data GROUP BY category ORDER BY count DESC`
+- Find top records: `SELECT * FROM data ORDER BY price DESC LIMIT 10`
 
-                if is_scalar_query:
-                    scalar_val = conn.scalar(text(sql_query))
-                    if scalar_val is None:
-                        scalar_val = 0.0
-                    try:
-                        scalar_val = float(scalar_val)
-                    except Exception:
-                        scalar_val = float(str(scalar_val).replace(",", "")) if scalar_val else 0.0
-                    logger.info(f"[SQL SCALAR] Result: {scalar_val:,.2f}")
-                    return ([{"column": "value", "value": scalar_val, "formatted": f"{scalar_val:,.2f}"}], None)
+**Response Guidelines:**
+- Always explain your reasoning
+- Use specific numbers and facts from query results
+- Provide actionable insights
+- Be concise and helpful
 
-                # Normal multi-row query
-                result = conn.execute(text(sql_query))
-                rows = []
-                for row in result:
-                    mapped = {}
-                    for k, v in dict(row._mapping).items():
-                        # Force convert Decimal / memoryview / bytearray / None to float
-                        if isinstance(v, (Decimal, memoryview, bytearray)):
-                            try:
-                                mapped[k] = float(str(v))
-                            except Exception:
-                                mapped[k] = None
-                        elif isinstance(v, (int, float)):
-                            mapped[k] = float(v)
-                        elif v is None:
-                            mapped[k] = 0.0
-                        else:
-                            try:
-                                mapped[k] = float(v) if str(v).replace('.', '', 1).isdigit() else v
-                            except Exception:
-                                mapped[k] = v
-                    rows.append(mapped)
+When you need to query data, use the execute_sql_query tool."""
 
-                # Handle single-row numeric fallback
-                if len(rows) == 1 and len(rows[0]) == 1:
-                    key, val = list(rows[0].items())[0]
-                    try:
-                        val = float(val or 0)
-                    except Exception:
-                        val = 0.0
-                    logger.info(f"[SQL SINGLE NUMERIC] {key}: {val:,.2f}")
-                    return ([{"column": key, "value": val, "formatted": f"{val:,.2f}"}], None)
+        # Add scenarios instruction if available
+        scenarios_instruction = self._format_scenarios_for_prompt()
+        if scenarios_instruction:
+            base_prompt = f"""{base_prompt}
 
-                logger.info(f"[SQL SUCCESS] Returned {len(rows)} rows")
-                return rows, None
+{scenarios_instruction}
 
-        except Exception as e:
-            err = f"SQL Execution Error: {e}"
-            logger.error(f"[SQL FAILED] {err}")
-            return [], err
+🔴 REMEMBER: Always check for scenario matches FIRST before doing free-form analysis!"""
         
-    async def _execute_sql_async(self, sql: str):
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: self._execute_sql(sql))
-    
-    async def run_queries_parallel(self, queries: list[dict]):
-        tasks = []
-        for q in queries:
-            tasks.append(self._execute_sql_async(q["sql"]))
-        results = await asyncio.gather(*tasks)
-        merged = []
-        for idx, (rows, error) in enumerate(results):
-            merged.append({
-                "id": queries[idx].get("id"),
-                "description": queries[idx].get("description"),
-                "error": error,
-                "rows": rows
-            })
-        return merged
+        return base_prompt
 
-    
-    def _create_react_prompt(self, question: str, react_history: List[Dict] = None) -> str:
-        """Create ReAct prompt with schema metadata and guides"""
-        
-        # Schema information với metadata
-        schema_str = json.dumps(self.schema_info, ensure_ascii=False, indent=2)
-        
-        # Sample rows
-        samples = self._get_sample_rows(3)
-        samples_str = json.dumps(samples, ensure_ascii=False, indent=2)
-
-        # Dùng toàn bộ hướng dẫn chung
-        general_guides = GENERAL_GUIDE_COMBINED
-
-        # ReAct history
-        history_str = ""
-        if react_history:
-            history_str = "\n\nLịch sử các bước đã thực hiện:\n"
-            for i, step in enumerate(react_history, 1):
-                history_str += f"Bước {i}:\n"
-                history_str += f"  THOUGHT: {step.get('thought', '')}\n"
-                history_str += f"  ACTION: {step.get('action', '')}\n"
-                history_str += f"  OBSERVATION: {step.get('observation', '')}\n"
-        
-        prompt = f"""Database Schema (có metadata mô tả ý nghĩa từng cột):
-{schema_str}
-
-Sample Data (3 dòng mẫu):
-{samples_str}
-
-{general_guides}
-
-Available Actions:
-- get_distinct_values(column_name): Lấy các giá trị unique của một cột
-- execute_query(sql): Thực thi SQL query
-- final_answer(answer): Đưa ra câu trả lời cuối cùng
-
-Question: {question}
-{history_str}
-
-Hãy sử dụng quy trình ReAct để trả lời câu hỏi. Với mỗi bước:
-1. THOUGHT: Suy nghĩ về những gì cần làm dựa trên metadata và general guide
-2. ACTION: Quyết định hành động tiếp theo (execute_query, final_answer)
-3. OBSERVATION: Phân tích kết quả từ hành động
-
-Hãy bắt đầu với THOUGHT đầu tiên:
-"""
-        
-        return prompt
-    
-    def _parse_react_response(self, response_text: str) -> Tuple[str, str, str]:
-        """
-        Parse ReAct response - handles multiline ACTION
-        Returns: (action_type, action_param, thought)
-        """
-        import re
-        
-        thought = ""
-        action_type = ""
-        action_param = ""
-        
-        # Extract THOUGHT
-        thought_match = re.search(r'THOUGHT:\s*(.+?)(?=ACTION:|$)', response_text, re.DOTALL)
-        if thought_match:
-            thought = thought_match.group(1).strip()
-        
-        # Extract ACTION (may span multiple lines)
-        action_match = re.search(r'ACTION:\s*(.+?)(?=OBSERVATION:|THOUGHT:|$)', response_text, re.DOTALL)
-        if not action_match:
-            return "", "", thought
-        
-        action_text = action_match.group(1).strip()
-        
-        # Parse action type and parameter
-        if "get_distinct_values" in action_text:
-            action_type = "get_distinct_values"
-            # Extract column name
-            match = re.search(r'get_distinct_values\s*\(\s*["\']([^"\']+)["\']\s*\)', action_text)
-            if match:
-                action_param = match.group(1).strip()
-            else:
-                # Without quotes
-                match = re.search(r'get_distinct_values\s*\(\s*([^\)]+)\s*\)', action_text)
-                if match:
-                    action_param = match.group(1).strip()
-            
-            # Validate
-            if not action_param or not action_param.strip():
-                logger.warning(f"Empty column name parsed from: {action_text[:100]}")
-                action_type = ""
-                
-        elif "execute_query" in action_text:
-            action_type = "execute_query"
-            
-            # Log what we're trying to parse
-            logger.info(f"[REACT PARSE] Attempting to parse execute_query from: {action_text[:200]}...")
-            
-            # Clean action_text - remove extra whitespace/newlines between function call
-            cleaned = re.sub(r'execute_query\s*\(\s*', 'execute_query(', action_text)
-            
-            # Pattern 1: execute_query("SQL") or execute_query('SQL')
-            match = re.search(r'execute_query\(["\'](.+?)["\']\)', cleaned, re.DOTALL)
-            if match:
-                action_param = match.group(1).strip()
-                logger.info(f"[REACT PARSE] Pattern 1 matched, SQL length: {len(action_param)}")
-            else:
-                # Pattern 2: execute_query( "SQL" ) with spaces
-                match = re.search(r'execute_query\(\s*["\'](.+?)["\']\s*\)', action_text, re.DOTALL)
-                if match:
-                    action_param = match.group(1).strip()
-                    logger.info(f"[REACT PARSE] Pattern 2 matched, SQL length: {len(action_param)}")
-                else:
-                    # Pattern 3: Try greedy match - everything between ( and last )
-                    match = re.search(r'execute_query\s*\((.+)\)', action_text, re.DOTALL)
-                    if match:
-                        sql = match.group(1).strip()
-                        # Remove surrounding quotes if any
-                        if (sql.startswith('"') and sql.endswith('"')) or (sql.startswith("'") and sql.endswith("'")):
-                            sql = sql[1:-1]
-                        action_param = sql.strip()
-                        logger.info(f"[REACT PARSE] Pattern 3 (greedy) matched, SQL length: {len(action_param)}")
-                    else:
-                        # Pattern 4: Incomplete - missing closing paren
-                        logger.error(f"[REACT PARSE] Failed to parse execute_query")
-                        logger.error(f"[REACT PARSE] Action text: {action_text}")
-            
-            # Validate
-            if not action_param or not action_param.strip():
-                logger.warning(f"Empty SQL parsed from: {action_text[:200]}")
-                action_type = ""
-            else:
-                logger.info(f"[REACT PARSE SUCCESS] Extracted SQL: {action_param[:100]}...")
-                
-        elif "final_answer" in action_text:
-            action_type = "final_answer"
-            # Extract answer
-            match = re.search(r'final_answer\s*\(\s*["\'](.+?)["\']\s*\)', action_text, re.DOTALL)
-            if match:
-                action_param = match.group(1).strip()
-            else:
-                # Without quotes
-                match = re.search(r'final_answer\s*\(\s*(.+?)\s*\)\s*$', action_text, re.DOTALL)
-                if match:
-                    answer = match.group(1).strip()
-                    if (answer.startswith('"') and answer.endswith('"')) or (answer.startswith("'") and answer.endswith("'")):
-                        answer = answer[1:-1]
-                    action_param = answer.strip()
-        
-        return action_type, action_param, thought
-
-
-    async def query_agentic(self, question: str):
-        """
-        Agentic V2:
-        1. Planner draft kế hoạch
-        2. SQL Agent chạy song song
-        3. Summarizer viết báo cáo
-        """
-
-        # 1. PLANNER
-        planner = PlannerAgent(model=self.model)
-        plan = planner.plan(question, self.schema_info)
-
-        if "queries" not in plan:
-            return "❌ Planner lỗi: không thể lập kế hoạch.", plan
-
-        queries = plan["queries"]
-
-        # 2. SQL EXECUTOR (parallel)
-        sql_results = await self.run_queries_parallel(queries)
-
-        # 3. SUMMARIZER
-        summarizer = SummarizerAgent(model=self.model)
-        final_report = summarizer.summarize(
-            question=question,
-            sql_query=json.dumps(queries, ensure_ascii=False),
-            sql_results=sql_results,
-            scenario=plan.get("scenario")
-        )
-
-        return final_report, {
-            "plan": plan,
-            "sql_results": sql_results
-        }
 
     def query(
         self,
         question: str,
         conversation_history: List[Dict[str, Any]] = None,
-        model: str = None,
-        max_react_steps: int = 20
+        model: str = None
     ) -> Generator[str, None, Dict[str, Any]]:
         """
-        Query with ReAct mechanism - streaming response
-        
+        Query with streaming response
+
         Args:
             question: User question
-            conversation_history: Conversation history
-            model: Model to use
-            max_react_steps: Maximum ReAct steps
-            
+            conversation_history: Previous conversation (optional)
+            model: Model to override default (optional)
+
         Yields:
-            Response chunks (text)
-            
+            Response text chunks
+
         Returns:
-            Final metadata dict with usage info
+            Metadata dict with usage info
         """
+        import time
         start_time = time.time()
-        # ============================================================
-        # AUTO-DETECT: Nếu câu hỏi cần multi-query → chuyển sang agentic
-        # ============================================================
-        planner = PlannerAgent(model=self.model or self.DEFAULT_MODEL)
-        scenario = planner.classify(question)
-        
-        # Nếu là scenario_1, scenario_2, hoặc scenario_3 → dùng agentic mode
-        if scenario in ["scenario_1", "scenario_2", "scenario_3"]:
-            logger.info(f"[AUTO-DETECT] Question matches {scenario} → switching to AGENTIC mode")
-            
-            # Stream thông báo cho user
-            yield "🔍 Đang phân tích câu hỏi và lập kế hoạch thực thi...\n\n"
-            import asyncio
-            import concurrent.futures
-            try:
-                # Check if there's a running loop
-                try:
-                    loop = asyncio.get_running_loop()
-                    # Loop is running - use thread pool
-                    use_thread = True
-                except RuntimeError:
-                    # No running loop - we can create one
-                    use_thread = False
-                
-                if use_thread:
-                    # Run in a separate thread with its own event loop
-                    def run_in_new_loop():
-                        new_loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(new_loop)
-                        try:
-                            return new_loop.run_until_complete(self.query_agentic(question))
-                        finally:
-                            new_loop.close()
-                    
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(run_in_new_loop)
-                        final_report, metadata = future.result()
-                        # ✅ FIX 1: Stream report ra user
-                        buffer = StreamBuffer(buffer_size=5)
-                        for char in final_report:
-                            buffered = buffer.add(char)
-                            if buffered:
-                                yield buffered
-                        remaining = buffer.flush()
-                        if remaining:
-                            yield remaining
-
-                        # ✅ FIX 2: RETURN để dừng execution (CRITICAL!)
-                        return metadata  # ← THÊM DÒNG NÀY!
-                else:
-                    # No running loop, create and use one
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    try:
-                        final_report, metadata = loop.run_until_complete(self.query_agentic(question))
-                    finally:
-                        loop.close()
-                        
-            except Exception as e:
-                logger.error(f"Event loop error: {e}")
-                yield "⚠️ Có lỗi xảy ra trong quá trình xử lý. Vui lòng thử lại sau. (Mã lỗi: 99)\n"
-                return {"error": str(e), "error_code": "99"}
-        
-        # Nếu không phải multi-query scenario → tiếp tục ReAct mode
-        logger.info(f"[AUTO-DETECT] Question is '{scenario}' → using REACT mode")
-
-        react_history = []
-        full_response = ""
-        total_prompt_tokens = 0
-        total_completion_tokens = 0
-    
+        buffer = StreamBuffer(buffer_size=5)
         try:
-            for step in range(max_react_steps):
-                logger.info(f"[REACT STEP {step+1}/{max_react_steps}] Starting...")
-                
-                # Create prompt
-                prompt = self._create_react_prompt(question, react_history)
-                
-                # Call LLM
+            # Build context
+            context = self._build_context()
+
+            # Build messages
+            messages = [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user", "content": f"**Context:**\n{context}\n\n**Question:**\n{question}"}
+            ]
+
+            # Add conversation history if provided
+            if conversation_history:
+                for msg in conversation_history[-10:]:  # Last 10 messages
+                    messages.append(msg)
+
+            # Determine if SQL tools should be available
+            tools = self._get_tools() if self.sql_tool else None
+
+            # Call OpenAI
+            use_model = model or self.model
+
+            if tools:
+                # With SQL capability - use tools
                 response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.1,
-                    max_tokens=2000
+                    model=use_model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    temperature=0.7,
+                    max_tokens=1000
                 )
-                
-                response_text = response.choices[0].message.content
-                logger.debug(f"[REACT RAW STEP OUTPUT]\n{response_text}")
-                total_prompt_tokens += response.usage.prompt_tokens
-                total_completion_tokens += response.usage.completion_tokens
-                
-                # Parse ReAct response
-                action_type, action_param, thought = self._parse_react_response(response_text)
-                
-                logger.info(f"[REACT STEP {step+1}] Action: {action_type}, Thought: {thought[:100]}...")
-                
-                if action_type == "get_distinct_values":
-                    # Get distinct values
-                    logger.info(f"[REACT ACTION] get_distinct_values('{action_param}')")
-                    values = self._get_distinct_values(action_param)
-                    observation = f"Distinct values: {values[:20]}"  # Limit to 20
-                    react_history.append({
-                        "thought": thought,
-                        "action": f"get_distinct_values({action_param})",
-                        "observation": observation
-                    })
-                    
-                elif action_type == "execute_query":
-                    logger.info(f"[REACT ACTION] execute_query('{action_param[:100]}...')")
-                    results, error = self._execute_sql(action_param)
-                    if error:
-                        observation = f"Error: {error}"
-                        logger.warning(f"[REACT ACTION FAILED] SQL error: {error}")
-                    else:
-                        # Không cắt chỉ "First row", giữ toàn bộ dữ liệu
-                        observation = f"Query returned {len(results)} rows with full dataset attached."
-                        logger.info(f"[REACT ACTION SUCCESS] Returned {len(results)} rows (full data retained).")
-                    
-                    react_history.append({
-                        "thought": thought,
-                        "action": f"execute_query({action_param})",
-                        "observation": observation,
-                        "results": results if not error else []
-                    })
-                        
-                elif action_type == "final_answer":
-                    logger.info("[REACT FINAL] Detected final_answer trigger — skipping LLM-generated text.")
-                    
-                    # Luôn tìm kết quả query cuối cùng có dữ liệu
-                    last_exec = next(
-                        (s for s in reversed(react_history)
-                        if s.get("action", "").startswith("execute_query") and s.get("results")),
-                        None
-                    )
 
-                    summarizer = SummarizerAgent(model=self.model)
-                    if last_exec:
-                        full_results = last_exec.get("results", [])
-                        logger.info(f"[REACT FINAL] Feeding {len(full_results)} rows to summarizer for final report.")
-                        try:
-                            full_response = summarizer.summarize(
-                                question,
-                                last_exec.get("action", ""),
-                                full_results,
-                                scenario=None   # ReAct không có Planner
-                            )
-                            logger.info("[REACT FINAL] SummarizerAgent successfully generated final report.")
-                        except Exception as e:
-                            logger.error(f"[REACT FINAL] SummarizerAgent failed: {e}")
-                            full_response = "Không thể sinh báo cáo tổng hợp do lỗi Summarizer."
-                    else:
-                        logger.warning("[REACT FINAL] Không có dữ liệu execute_query — không thể tổng hợp báo cáo.")
-                        full_response = "Không tìm thấy dữ liệu truy vấn để tổng hợp báo cáo."
-
-                    # Stream ra user
-                    buffer = StreamBuffer(buffer_size=5)
-                    for char in full_response:
+                assistant_msg = response.choices[0].message
+                final_text = ""
+                if assistant_msg.tool_calls:
+                    for chunk in self._handle_tool_calls(assistant_msg, question):
+                        final_text += chunk
                         buffered = buffer.add(char)
                         if buffered:
-                            yield buffered
+                            yield chunk
                     remaining = buffer.flush()
                     if remaining:
                         yield remaining
-                    break
-            
-            # Create response ID
-            response_id = f"hst_{int(time.time())}_{hashlib.md5(question.encode()).hexdigest()[:8]}"
-            
-            # Calculate usage
-            usage = TokenUsage(
-                prompt_tokens=total_prompt_tokens,
-                completion_tokens=total_completion_tokens,
-                total_tokens=total_prompt_tokens + total_completion_tokens,
-                model=self.model
-            )
-            
-            # Log
-            log_openai_agent_response(
-                response_id=response_id,
-                source_name=self.source_name,
-                vector_store_id="hst",
-                user_query=question,
-                assistant_response=full_response,
-                model=self.model,
-                usage=usage
-            )
-            
+
+                else:
+                    # No tools called, stream response
+                    final_text = assistant_msg.content or ""
+                    for char in final_text:
+                        buffered = buffer.add(char)
+                        if buffered:
+                            yield char
+                        remaining = buffer.flush()
+                        if remaining:
+                            yield remaining
+                # Calculate usage
+                usage = {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                }
+            else:
+                # Without SQL - simple streaming response
+                response = self.client.chat.completions.create(
+                    model=use_model,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=500,
+                    stream=True
+                )
+
+                final_text = ""
+                for chunk in response:
+                    if chunk.choices[0].delta.content:
+                        text = chunk.choices[0].delta.content
+                        final_text += text
+                        yield text
+
+                usage = {"estimated_tokens": len(final_text) // 4}  # Rough estimate
+
+            # Record in conversation
+            if hasattr(self, 'session'):
+                self.session.agent_conversations.append(AgentMessage(
+                    role="user",
+                    content=question,
+                    timestamp=datetime.now().isoformat()
+                ))
+                self.session.agent_conversations.append(AgentMessage(
+                    role="assistant",
+                    content=final_text,
+                    timestamp=datetime.now().isoformat(),
+                    context={"used_sql": bool(tools)}
+                ))
+
+            # Return metadata
             return {
-                "response_id": response_id,
                 "usage": usage,
                 "duration": time.time() - start_time,
-                "source_name": self.source_name,
-                "model": model,
-                "react_steps": len(react_history)
+                "model": use_model,
+                "used_sql": bool(tools)
             }
-            
+
         except Exception as e:
-            error_msg, error_code = ErrorHandler.get_user_friendly_message(e, self.source_name)
-            logger.error(f"Query failed: {e}")
-            
-            yield f"\n\n⚠️ {error_msg}"
-            
-            log_openai_agent_error(
-                source_name=self.source_name,
-                vector_store_id="hst",
-                model=self.model,
-                user_query=question,
-                error_message=str(e)
-            )
-            
+            logger.error(f"Query failed: {str(e)}")
+            error_msg = f"\n\n⚠️ Error: {str(e)}"
+            yield error_msg
+
             return {
-                "error": error_msg,
-                "error_code": error_code,
+                "error": str(e),
                 "duration": time.time() - start_time,
-                "source_name": self.source_name,
-                "model": model
+                "model": model or self.model
             }
-    
-    async def query_async(self, *args, **kwargs):
-        """Async wrapper around sync query for API compatibility"""
-        if kwargs.get("mode") == "agentic":
-            async for out in self.query_agentic(*args, **kwargs):
-                yield out
-            return
-
-        loop = asyncio.get_event_loop()
-        def run_sync():
-            results = []
-            for chunk in self.query(*args, **kwargs):
-                results.append(chunk)
-            return results
-
-        # Chạy sync query trong thread executor
-        chunks = await loop.run_in_executor(None, run_sync)
-        for c in chunks:
-            yield c
-    
-    async def generate_title_from_message(self, message: str, model: str = None) -> Tuple[str, TokenUsage]:
-        """Generate conversation title - async"""
+    # def _streaming_query(
+    #     self,
+    #     question: str,
+    #     chat_history: List[Dict[str, Any]],
+    #     model: str,
+    #     max_results: int,
+    #     response_id: str = None,
+    #     previous_response_id: str = None,
+    #     user_prompt: str = "",
+    #     orchestrator_request_id: str = None 
+    # ) -> Generator[Dict[str, Any], None, None]:
         
-        try:
-            async_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            
-            response = await async_client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "Tạo tiêu đề ngắn (≤10 từ) cho cuộc hội thoại về hồ sơ thầu. Chỉ trả tiêu đề."},
-                    {"role": "user", "content": f"Tiêu đề: {message[:200]}"}
-                ],
-                max_tokens=40,
-                temperature=0.3
-            )
-            
-            title = response.choices[0].message.content.strip().strip('"')
-            usage = TokenUsage(
-                prompt_tokens=response.usage.prompt_tokens,
-                completion_tokens=response.usage.completion_tokens,
-                total_tokens=response.usage.total_tokens,
-                model=self.model
-            )
-            
-            return title, usage
-            
-        except Exception as e:
-            logger.error(f"Title generation failed: {str(e)}")
-            return f"Hội thoại {self.source_name.title()}", TokenUsage(model=self.model)
-    
-    async def generate_next_turn_suggestions(
-        self, 
-        conversation_history: List[Dict[str, Any]], 
-        model: str = None
-    ) -> Tuple[List[str], TokenUsage]:
-        """Generate next turn suggestions - async"""
+
+
+    #     conversation_messages = []
+    #     for turn in chat_history[-3:]:
+    #         role = "user" if turn.get("role") == "user" else "assistant"
+    #         conversation_messages.append({"role": role, "content": turn.get("content", "")})
         
-        try:
-            async_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            
-            recent_history = conversation_history[-2:]
-            formatted_history = "\n".join([
-                f"{msg['role'].capitalize()}: {msg['content'][:300]}"
-                for msg in recent_history
-            ])
-            
-            system_prompt = (
-                "Gợi ý 3-5 câu hỏi tiếp theo về hồ sơ thầu.\n"
-                "JSON array. Không giải thích.\n"
-                "Nếu không phù hợp → []."
-            )
-            
-            response = await async_client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": formatted_history}
-                ],
-                max_tokens=300,
-                temperature=0.3
-            )
-            
-            suggestions_text = response.choices[0].message.content.strip()
-            try:
-                suggestions = json.loads(suggestions_text)
-                if not isinstance(suggestions, list):
-                    suggestions = []
-            except:
-                suggestions = []
-            
-            usage = TokenUsage(
-                prompt_tokens=response.usage.prompt_tokens,
-                completion_tokens=response.usage.completion_tokens,
-                total_tokens=response.usage.total_tokens,
-                model=self.model
-            )
-            
-            return suggestions, usage
-            
-        except Exception as e:
-            logger.error(f"Suggestions failed: {str(e)}")
-            return [], TokenUsage(model=self.model)
+    #     tools = self._get_tools() if self.sql_tool else None
 
-class SummarizerAgent:
-    """
-    Agent tóm tắt kết quả SQL thành báo cáo tự nhiên.
-    - Tập trung mô tả, so sánh dựa trên số liệu.
-    - Không đưa ra nhận định chủ quan, dự đoán, khuyến nghị hay phần ký tên.
-    - Trọng tâm là góc nhìn của Viettel Solutions (VTS), so với FPT và VNPT.
-    """
-
-    def __init__(self, model: str = "gpt-4.1"):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = model
-
-    def sanitize_json(self, obj):
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        if isinstance(obj, Decimal):
-            return float(obj)
-        return obj
-
-    def summarize(self, question: str, sql_query: str, sql_results: list[dict], scenario: str = None):
+    #     request_params = {
+    #         "model": model.split("/")[-1] if '/' in model else model,
+    #         "input": question,
+    #         "tools": tools,
+    #         "stream": True,
+    #         "include": ["file_search_call.results"],
+    #     }
+    #     pass
+    def chat(self, user_message: str) -> str:
         """
-        Sinh báo cáo tiếng Việt, khách quan, tập trung vào số liệu thực tế.
+        Simple chat interface (non-streaming)
+
+        Args:
+            user_message: User message
+
+        Returns:
+            Assistant response text
         """
-        logger.info("=== DEBUG SUMMARIZER START ===")
-        logger.info(f"SQL_RESULTS_RAW: {sql_results}")
-        try:
-            logger.info(f"SQL_RESULTS_KEYS: {[list(r.keys()) for r in sql_results]}")
-        except Exception as e:
-            logger.info(f"FAILED TO EXTRACT KEYS: {e}")
-
-        if scenario:
-            logger.info(f"[SUMMARIZER] Using forwarded scenario: {scenario}")
-        else:
-            scenario = self.detect_template(sql_results)
-
-        if scenario == "scenario_1":
-            template = open("src/agents/hst/templates/scenario_1.txt").read() 
-        elif scenario == "scenario_2":
-            template = open("src/agents/hst/templates/scenario_2.txt").read()
-        elif scenario == "scenario_3":
-            template = open("src/agents/hst/templates/scenario_3.txt").read()
-        else:
-            template = """
-            Hãy tóm tắt ngắn gọn dựa trên dữ liệu.
-            YÊU CẦU TRÌNH BÀY:
-1. **Tổng quan thị trường**: mô tả quy mô, xu hướng chính (nếu có thể). LƯU Ý không nói về nhóm 'KHÁC'.
-2. **Chi tiết từng bên**: trình bày kết quả theo bảng (số gói, giá trị, tỷ trọng).
-3. **Kết luận**: Kết luận ngắn gọn (không suy diễn, hạn chế nhắc lại ý ở phần 1). LƯU Ý không nói về nhóm 'KHÁC'.
-            """
-            
-        prompt = f"""
-Bạn là chuyên gia phân tích dữ liệu đấu thầu của Viettel Solutions (VTS).
-Hãy viết báo cáo tóm tắt dựa hoàn toàn trên dữ liệu được cung cấp — KHÔNG được suy diễn, dự đoán hoặc đưa ra nhận định chủ quan.
-
-Câu hỏi người dùng: {question}
-
-Hãy trả về báo cáo đúng format template sau:
-
-{template}
-
-SQL được thực thi:
-{sql_query}
-
-Kết quả dữ liệu SQL (JSON):
-{json.dumps(sql_results, default=self.sanitize_json, ensure_ascii=False, indent=2)}
-
-HƯỚNG DẪN BỔ SUNG:
-- Ưu tiên trình bày kết quả ở dạng bảng, dễ đọc.
-- Các số liệu đầu ra đều tính theo **tỷ Việt Nam Đồng (tỷ VND)**.
-- Trọng tâm là hiệu quả và vị thế của Viettel Solutions (VTS), so với FPT và VNPT nếu có dữ liệu.
-- Nhóm “Khác” chỉ cần nêu tổng giá trị và tỷ trọng, không đi sâu chi tiết.
-- Tuyệt đối không thêm phần "Khuyến nghị", "Ghi chú", hoặc "Phòng Phân tích dữ liệu".
-
-QUY TẮC ĐỊNH DẠNG SỐ:
-- Dữ liệu đầu vào có dấu thập phân là "." (ví dụ: 100100.1).
-- Khi hiển thị trong báo cáo, chuyển sang định dạng tiếng Việt:
-  + Dấu phân cách phần thập phân là ",".
-  + Dấu phân cách hàng nghìn, hàng triệu, tỷ là ".".
-  Ví dụ: 100100.1 → 100.100,1
-- Đảm bảo định dạng này áp dụng nhất quán cho tất cả số liệu trong báo cáo.
-"""
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Bạn là chuyên gia phân tích dữ liệu đấu thầu của Viettel Solutions, chỉ mô tả và so sánh số liệu, không được đưa ra nhận định chủ quan hay khuyến nghị."
-                },
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.15,
-            max_tokens=900
-        )
-        return response.choices[0].message.content.strip()
-
-    def detect_template(self, sql_results):
-            """
-            Nhận diện template dựa vào metadata của planner hoặc cấu trúc dữ liệu từ ReAct,
-            KHÔNG bắt buộc phải có field 'id' trong từng row SQL.
-            
-            Logic:
-            - Nếu có field 'id' → dùng logic cũ (Planner mode)
-            - Nếu không có 'id' → phân tích cấu trúc dữ liệu (ReAct mode)
-            """
-            logger.info("=== DEBUG detect_template START ===")
-            logger.info(f"INPUT sql_results: {sql_results}")
-
-            if not sql_results:
-                logger.error("detect_template: EMPTY sql_results → return 'other'")
-                return "other"
-
-            try:
-                all_keys = [list(r.keys()) for r in sql_results]
-                logger.info(f"detect_template: KEYS OF ROWS → {all_keys}")
-            except Exception as e:
-                logger.error(f"detect_template: FAILED TO LIST KEYS: {e}")
-                return "other"
-
-            # Kiểm tra xem có field 'id' không
-            first_row_keys = list(sql_results[0].keys()) if sql_results else []
-            has_id_field = "id" in first_row_keys
-            
-            logger.info(f"detect_template: has_id_field = {has_id_field}")
-
-            # ============================================================
-            # PLANNER MODE: Nếu có field 'id', dùng logic cũ
-            # ============================================================
-            if has_id_field:
-                logger.info("detect_template: Using PLANNER MODE (id-based detection)")
-                
-                try:
-                    if any(r.get("id") == "nsnn" for r in sql_results):
-                        logger.info("MATCH scenario_1")
-                        return "scenario_1"
-                except Exception as e:
-                    logger.error(f"detect_template ERROR at scenario_1: {e}")
-
-                try:
-                    if any(r.get("id") == "viettel_overview" for r in sql_results):
-                        logger.info("MATCH scenario_2")
-                        return "scenario_2"
-                except Exception as e:
-                    logger.error(f"detect_template ERROR at scenario_2: {e}")
-
-                try:
-                    if any(str(r.get("id", "")).startswith("obj_") for r in sql_results):
-                        logger.info("MATCH scenario_3")
-                        return "scenario_3"
-                except Exception as e:
-                    logger.error(f"detect_template ERROR at scenario_3: {e}")
-
-                logger.info("detect_template: PLANNER MODE → RETURN 'other'")
-                return "other"
-
-            # ============================================================
-            # REACT MODE: Phân tích dựa trên cấu trúc dữ liệu
-            # ============================================================
-            logger.info("detect_template: Using REACT MODE (structure-based detection)")
-            
-            # Lấy tất cả các keys từ kết quả SQL
-            all_column_names = set()
-            for row in sql_results:
-                all_column_names.update(row.keys())
-            
-            logger.info(f"detect_template: All column names found: {all_column_names}")
-            
-            # Scenario 1: Market overview - có nhiều nhóm trúng thầu và phân khúc
-            # Đặc điểm: có trường "Nhóm_trúng_thầu_shortlist" hoặc nhiều rows với các nhóm khác nhau
-            scenario_1_indicators = {
-                "Nhóm_trúng_thầu_shortlist",
-                "market_total",
-                "nsnn",
-                "khdn"
-            }
-            
-            # Scenario 2: Viettel detail analysis
-            # Đặc điểm: có trường liên quan đến tháng, ĐVKD, hoặc so sánh với FPT/VNPT
-            scenario_2_indicators = {
-                "thang",
-                "dvkd", 
-                "Đơn_vị_kinh_doanh(VTS)",
-                "by_month",
-                "by_center"
-            }
-            
-            # Scenario 3: Specific object analysis (province, sector, unit)
-            # Đặc điểm: có trường tỉnh, lĩnh vực, hoặc phân tích theo đối tượng cụ thể
-            scenario_3_indicators = {
-                "Mã_tỉnh_mới",
-                "Mã_tỉnh_cũ",
-                "Lĩnh_vực_Khách_hàng",
-                "obj_monthly"
-            }
-            
-            # Kiểm tra overlap với các indicators
-            s1_match = len(all_column_names & scenario_1_indicators)
-            s2_match = len(all_column_names & scenario_2_indicators)
-            s3_match = len(all_column_names & scenario_3_indicators)
-            
-            logger.info(f"detect_template: scenario_1 matches: {s1_match}")
-            logger.info(f"detect_template: scenario_2 matches: {s2_match}")
-            logger.info(f"detect_template: scenario_3 matches: {s3_match}")
-            
-            # Quyết định scenario dựa trên số lượng match
-            if s1_match > 0 and s1_match >= s2_match and s1_match >= s3_match:
-                logger.info("detect_template: REACT MODE → scenario_1 (market overview)")
-                return "scenario_1"
-            elif s2_match > 0 and s2_match > s1_match and s2_match >= s3_match:
-                logger.info("detect_template: REACT MODE → scenario_2 (viettel detail)")
-                return "scenario_2"
-            elif s3_match > 0:
-                logger.info("detect_template: REACT MODE → scenario_3 (specific object)")
-                return "scenario_3"
-            
-            # Kiểm tra dựa trên số lượng rows và có GROUP BY
-            # Nếu có nhiều rows với "Nhóm_trúng_thầu" → likely market share query
-            if "Nhóm_trúng_thầu" in all_column_names and len(sql_results) > 2:
-                logger.info("detect_template: REACT MODE → scenario_1 (detected market share pattern)")
-                return "scenario_1"
-            
-            # Nếu có "thang" (month) → time series analysis, likely scenario 2
-            if "thang" in all_column_names:
-                logger.info("detect_template: REACT MODE → scenario_2 (detected time series)")
-                return "scenario_2"
-            
-            logger.info("detect_template: REACT MODE → RETURN 'other'")
-            return "other"
-
-
-class PlannerAgent:
-    """
-    Planner Agent:
-    - Nhận user query
-    - Phân loại vào 4 scenario
-    - Sinh danh sách SQL queries tương ứng
-    """
-
-    def __init__(self, model="gpt-4.1"):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = model
-        self.allowed_scenarios = ["scenario_1", "scenario_2", "scenario_3", "other"]
-
-    # =========================
-    # 1. LLM-based classifier
-    # =========================
-    def _classify_llm(self, question: str) -> str:
-        """
-        Dùng LLM để phân loại intent.
-        Chỉ được trả về 1 trong 4 chuỗi:
-        - scenario_1
-        - scenario_2
-        - scenario_3
-        - other
-        """
-        try:
-            system_prompt = """
-Bạn là hệ thống phân loại intent cho trợ lý hồ sơ thầu (HST). 
-Nhiệm vụ: Dựa trên câu hỏi tiếng Việt của người dùng, phân loại vào đúng MỘT trong 4 nhóm sau:
-
-===========================================================
-🎯 **scenario_1 — Báo cáo THỊ PHẦN TỔNG QUAN / TOÀN THỊ TRƯỜNG**
-===========================================================
-Miêu tả:
-- Người dùng hỏi về toàn thị trường nói chung, *không* tập trung vào Viettel.
-- Thời gian có thể là tháng cụ thể, lũy kế, hoặc nhiều tháng.
-- Có thể yêu cầu tổng hợp, cập nhật, xu hướng chung của thị trường.
-
-Dấu hiệu:
-- “thị phần thầu nói chung”, “tổng quan thị trường”, “báo cáo thị phần”, 
-  “tổng hợp thị phần”, “tình hình thị phần”, “toàn thị trường”.
-- KHÔNG nhắc tới Viettel hoặc DVKD/tỉnh cụ thể.
-
-Ví dụ đúng scenario_1:
-- “Báo cáo thị phần thầu lũy kế 10 tháng”
-- “Tổng hợp thị phần thầu tháng 9/2025”
-- “Báo cáo thị phần các tháng 6 7 8”
-- “Cập nhật thị phần thầu 34 tỉnh”
-- “Xu hướng thị phần toàn thị trường năm 2025”
-
-Ví dụ KHÔNG phải scenario_1:
-- “Báo cáo thị phần Viettel tháng 10” → scenario_2
-- “Top ĐVKD của Viettel” → scenario_3
-- “Thị phần tỉnh Hà Nội tháng 9” → scenario_3
-
-
-===========================================================
-🎯 **scenario_2 — Báo cáo THỊ PHẦN CHI TIẾT CHO VIETTEL**
-===========================================================
-Miêu tả:
-- Người dùng hỏi về kết quả hoặc thị phần của **Viettel (VTS)**.
-- Trọng tâm là Viettel so với đối thủ (FPT, VNPT, GAET,…).
-- Câu hỏi chỉ nhắm vào Viettel, không nhắm vào một đơn vị/tỉnh/lĩnh vực cụ thể.
-
-Dấu hiệu:
-- “Viettel”, “VTS”, “Viettel Solutions”, “thị phần của Viettel”.
-- Hỏi riêng về Viettel hoặc so sánh Viettel với đơn vị khác.
-
-Ví dụ đúng scenario_2:
-- “Báo cáo thị phần thầu tháng 10 của Viettel”
-- “Hiệu suất của Viettel trong quý 2”
-- “So sánh thị phần Viettel với FPT và VNPT”
-- “Tổng giá trị trúng thầu của Viettel lũy kế 9 tháng”
-
-Ví dụ KHÔNG phải scenario_2:
-- “Báo cáo thị phần ĐVKD miền Nam của Viettel” → scenario_3
-- “Thị phần tỉnh Hà Nội của Viettel” → scenario_3
-- “Báo cáo thị phần toàn thị trường” → scenario_1
-
-
-===========================================================
-🎯 **scenario_3 — Báo cáo THEO ĐỐI TƯỢNG CỤ THỂ**
-===========================================================
-Miêu tả:
-- Câu hỏi nhắm vào một **dimension cụ thể** như:
-  ▸ Đơn vị kinh doanh (ĐVKD)  
-  ▸ Tỉnh / Thành phố  
-  ▸ Lĩnh vực khách hàng   
-- Dù có hoặc không nhắc tới Viettel.
-
-Dấu hiệu:
-- “tỉnh”, “thành phố”, “Hà Nội”, “Đà Nẵng”
-- “ĐVKD”, “trung tâm”, “TT CQĐT”, “KHDN”
-- “lĩnh vực khách hàng”, “YTS”, “GDS”, “CQT”, “BQP”
-
-Ví dụ đúng scenario_3:
-- “Báo cáo thị phần thầu tháng 10 của Hà Nội”
-- “Báo cáo thị phần nhóm ĐVKD TT CQĐT”
-- “Thị phần lĩnh vực YTS năm 2025”
-- “Báo cáo thị phần Đà Nẵng tháng 9”
-- “Thị phần phân khúc CQT của Viettel”
-
-Ví dụ KHÔNG phải scenario_3:
-- “Báo cáo thị phần Viettel năm 2025” → scenario_2
-- “Tổng quan thị phần lũy kế” → scenario_1
-
-
-===========================================================
-🎯 **other — Không thuộc 3 nhóm trên**
-===========================================================
-Miêu tả:
-- Mọi câu hỏi không thuộc về 3 nhóm trên.
-
-===========================================================
-⚠️ QUY TẮC ƯU TIÊN PHÂN LOẠI (VERY IMPORTANT)
-===========================================================
-1. Nếu câu hỏi nhắc rõ Viettel → ưu tiên scenario_2  
-   *Trừ khi nhắc rõ một đối tượng cụ thể (tỉnh/ĐVKD/lĩnh vực) → scenario_3.*
-
-2. Nếu câu hỏi có tỉnh/ĐVKD/lĩnh vực → scenario_3  
-   *Dù có hoặc không nhắc Viettel.*
-
-3. Nếu không nhắc đối tượng cụ thể & không nhấn mạnh Viettel → scenario_1.
-
-4. Luôn trả về duy nhất một chuỗi:  
-   👉 “scenario_1”, “scenario_2”, “scenario_3” hoặc “other”.
-
-5. Không giải thích thêm bất kỳ nội dung nào.
-
-
-===========================================================
-CHỈ TRẢ VỀ:
-scenario_1
-hoặc
-scenario_2
-hoặc
-scenario_3
-hoặc
-other
-===========================================================
-"""
-
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0.0,
-                max_tokens=10,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": question},
-                ],
-            )
-
-            label = resp.choices[0].message.content.strip()
-            # Chuẩn hóa
-            label = label.split()[0]  # phòng trường hợp model lỡ nói thêm gì đó
-            if label not in self.allowed_scenarios:
-                return "other"
-            return label
-
-        except Exception as e:
-            logger.error(f"[PLANNER] LLM classify failed: {e}")
-            return "other"
-
-    # =========================
-    # 2. Public API
-    # =========================
-    def classify(self, question: str) -> str:
-        scenario = self._classify_llm(question)
-        return scenario
-
-
-    # =========================
-    # 3. Planner logic (giữ nguyên)
-    # =========================
-    def plan(self, question: str, schema):
-        scenario = self.classify(question)
-
-        if scenario == "scenario_1":
-            return self._plan_scenario_1()
-
-        if scenario == "scenario_2":
-            return self._plan_scenario_2()
-
-        if scenario == "scenario_3":
-            return self._plan_scenario_3(question)
-
-        return {"scenario": "other", "queries": []}
-    
-    def _plan_scenario_1(self):
-        queries = [
-            {
-                "id": "market_total",
-                "description": "Tổng số gói + tổng giá trị toàn thị trường",
-                "sql": """
-                    SELECT 
-                        COUNT(*) AS so_goi,
-                        SUM("Giá_trúng_thầu") AS tong_gia_tri
-                    FROM thau_2025
-                    WHERE "Giá_trúng_thầu" > 0
-                    AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                """
-            },
-            {
-                "id": "market_by_vendor",
-                "description": "Tổng giá trị theo nhóm trúng thầu",
-                "sql": """
-                    SELECT 
-                        "Nhóm_trúng_thầu_shortlist",
-                        COUNT(*) AS so_goi,
-                        SUM("Giá_trúng_thầu") AS gia_tri
-                    FROM thau_2025
-                    WHERE "Giá_trúng_thầu" > 0
-                    AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                    GROUP BY "Nhóm_trúng_thầu_shortlist"
-                    ORDER BY gia_tri DESC
-                """
-            },
-            {
-                "id": "nsnn",
-                "description": "Giá trị theo nhóm NSNN",
-                "sql": """
-                    SELECT 
-                        "Nhóm_trúng_thầu_shortlist",
-                        COUNT(*) AS so_goi,
-                        SUM("Giá_trúng_thầu") AS gia_tri
-                    FROM thau_2025
-                    WHERE "Giá_trúng_thầu" > 0
-                        AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                        AND "Lĩnh_vực_Khách_hàng" IN ('TW','BQP','CQT','YTS','GDS')
-                    GROUP BY "Nhóm_trúng_thầu_shortlist"
-                    ORDER BY gia_tri DESC
-                """
-            },
-            {
-                "id": "khdn",
-                "description": "Khối doanh nghiệp",
-                "sql": """
-                    SELECT 
-                        "Nhóm_trúng_thầu_shortlist",
-                        COUNT(*) AS so_goi,
-                        SUM("Giá_trúng_thầu") AS gia_tri
-                    FROM thau_2025
-                    WHERE "Giá_trúng_thầu" > 0
-                        AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                        AND "Lĩnh_vực_Khách_hàng" = 'KHDN'
-                    GROUP BY "Nhóm_trúng_thầu_shortlist"
-                    ORDER BY gia_tri DESC
-                """
-            },
-            {
-                "id": "kenh_truyen",
-                "description": "Dịch vụ kênh truyền",
-                "sql": """
-                    SELECT 
-                        "Nhóm_trúng_thầu_shortlist",
-                        COUNT(*) AS so_goi,
-                        SUM("Giá_trúng_thầu") AS gia_tri
-                    FROM thau_2025
-                    WHERE "Giá_trúng_thầu" > 0
-                        AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                        AND "Phân_loại_sản_phẩm" = 'Kênh truyền'
-                    GROUP BY "Nhóm_trúng_thầu_shortlist"
-                    ORDER BY gia_tri DESC
-                """
-            }
-        ]
-        return {"scenario": "scenario_1", "queries": queries}
-    
-    def _plan_scenario_2(self):
-        """
-        Scenario 2: Báo cáo thị phần chi tiết của Viettel
-        Yêu cầu đầy đủ các queries theo template scenario_2.txt
-        """
-        return {
-            "scenario": "scenario_2",
-            "queries": [
-                # 1. TỔNG QUAN VIETTEL
-                {
-                    "id": "viettel_overview",
-                    "description": "Tổng quan Viettel: số gói, tổng giá trị, thị phần, xếp hạng",
-                    "sql": """
-                        WITH market_total AS (
-                            SELECT 
-                                SUM("Giá_trúng_thầu") AS tong_thi_truong
-                            FROM thau_2025
-                            WHERE "Giá_trúng_thầu" > 0
-                                AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                        ),
-                        viettel_data AS (
-                            SELECT 
-                                COUNT(*) AS so_goi,
-                                SUM("Giá_trúng_thầu") AS gia_tri
-                            FROM thau_2025
-                            WHERE "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                                AND "Giá_trúng_thầu" > 0
-                        ),
-                        vendor_ranking AS (
-                            SELECT 
-                                "Nhóm_trúng_thầu_shortlist",
-                                SUM("Giá_trúng_thầu") AS gia_tri,
-                                RANK() OVER (ORDER BY SUM("Giá_trúng_thầu") DESC) AS rank
-                            FROM thau_2025
-                            WHERE "Giá_trúng_thầu" > 0
-                                AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                            GROUP BY "Nhóm_trúng_thầu_shortlist"
-                        )
-                        SELECT 
-                            vd.so_goi,
-                            vd.gia_tri,
-                            ROUND(CAST(vd.gia_tri * 100.0 / mt.tong_thi_truong AS NUMERIC), 1) AS market_share,
-                            vr.rank
-                        FROM viettel_data vd
-                        CROSS JOIN market_total mt
-                        LEFT JOIN vendor_ranking vr ON vr."Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                    """
-                },
-                
-                # 2. LĨNH VỰC VIETTEL ĐỨNG SỐ 1
-                {
-                    "id": "fields_rank1",
-                    "description": "Danh sách lĩnh vực Viettel đứng hạng 1",
-                    "sql": """
-                        WITH field_ranking AS (
-                            SELECT 
-                                "Lĩnh_vực_Khách_hàng",
-                                "Nhóm_trúng_thầu_shortlist",
-                                SUM("Giá_trúng_thầu") AS gia_tri,
-                                RANK() OVER (
-                                    PARTITION BY "Lĩnh_vực_Khách_hàng" 
-                                    ORDER BY SUM("Giá_trúng_thầu") DESC
-                                ) AS rank
-                            FROM thau_2025
-                            WHERE "Giá_trúng_thầu" > 0
-                                AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                                AND "Lĩnh_vực_Khách_hàng" IS NOT NULL
-                            GROUP BY "Lĩnh_vực_Khách_hàng", "Nhóm_trúng_thầu_shortlist"
-                        )
-                        SELECT 
-                            "Lĩnh_vực_Khách_hàng" AS linh_vuc,
-                            gia_tri
-                        FROM field_ranking
-                        WHERE "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                            AND rank = 1
-                        ORDER BY gia_tri DESC
-                    """
-                },
-                
-                # 3. LĨNH VỰC VIETTEL CHƯA ĐỨNG SỐ 1
-                {
-                    "id": "fields_not_rank1",
-                    "description": "Danh sách lĩnh vực Viettel chưa đứng hạng 1",
-                    "sql": """
-                        WITH field_ranking AS (
-                            SELECT 
-                                "Lĩnh_vực_Khách_hàng",
-                                "Nhóm_trúng_thầu_shortlist",
-                                SUM("Giá_trúng_thầu") AS gia_tri,
-                                RANK() OVER (
-                                    PARTITION BY "Lĩnh_vực_Khách_hàng" 
-                                    ORDER BY SUM("Giá_trúng_thầu") DESC
-                                ) AS rank
-                            FROM thau_2025
-                            WHERE "Giá_trúng_thầu" > 0
-                                AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                                AND "Lĩnh_vực_Khách_hàng" IS NOT NULL
-                            GROUP BY "Lĩnh_vực_Khách_hàng", "Nhóm_trúng_thầu_shortlist"
-                        ),
-                        viettel_fields AS (
-                            SELECT 
-                                "Lĩnh_vực_Khách_hàng" AS linh_vuc,
-                                gia_tri AS viettel_gia_tri,
-                                rank AS viettel_rank
-                            FROM field_ranking
-                            WHERE "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                        ),
-                        top_vendor AS (
-                            SELECT 
-                                "Lĩnh_vực_Khách_hàng" AS linh_vuc,
-                                "Nhóm_trúng_thầu_shortlist" AS top_vendor_name,
-                                gia_tri AS top_gia_tri
-                            FROM field_ranking
-                            WHERE rank = 1
-                        )
-                        SELECT 
-                            vf.linh_vuc,
-                            vf.viettel_gia_tri,
-                            vf.viettel_rank,
-                            tv.top_vendor_name,
-                            tv.top_gia_tri
-                        FROM viettel_fields vf
-                        LEFT JOIN top_vendor tv ON vf.linh_vuc = tv.linh_vuc
-                        WHERE vf.viettel_rank > 1
-                        ORDER BY vf.viettel_rank, vf.viettel_gia_tri DESC
-                    """
-                },
-                
-                # 4. TOP 3 TỈNH CÓ THỊ PHẦN CAO NHẤT
-                {
-                    "id": "top_provinces",
-                    "description": "Top 3 tỉnh có thị phần Viettel cao nhất",
-                    "sql": """
-                        WITH province_total AS (
-                            SELECT 
-                                "Mã_tỉnh_mới",
-                                SUM("Giá_trúng_thầu") AS tong_tinh
-                            FROM thau_2025
-                            WHERE "Giá_trúng_thầu" > 0
-                                AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                                AND "Mã_tỉnh_mới" IS NOT NULL
-                            GROUP BY "Mã_tỉnh_mới"
-                        ),
-                        viettel_by_province AS (
-                            SELECT 
-                                "Mã_tỉnh_mới",
-                                SUM("Giá_trúng_thầu") AS viettel_gia_tri
-                            FROM thau_2025
-                            WHERE "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                                AND "Giá_trúng_thầu" > 0
-                                AND "Mã_tỉnh_mới" IS NOT NULL
-                            GROUP BY "Mã_tỉnh_mới"
-                        )
-                        SELECT 
-                            vp."Mã_tỉnh_mới" AS tinh,
-                            ROUND(CAST(vp.viettel_gia_tri * 100.0 / pt.tong_tinh AS NUMERIC), 1) AS thi_phan
-                        FROM viettel_by_province vp
-                        LEFT JOIN province_total pt ON vp."Mã_tỉnh_mới" = pt."Mã_tỉnh_mới"
-                        WHERE pt.tong_tinh > 0
-                        ORDER BY thi_phan DESC
-                        LIMIT 3
-                    """
-                },
-                
-                # 5. TOP 5 ĐVKD
-                {
-                    "id": "top_dvkd",
-                    "description": "Top 5 ĐVKD theo giá trị trúng thầu",
-                    "sql": """
-                        SELECT 
-                            "Đơn_vị_kinh_doanh(VTS)" AS dvkd,
-                            COUNT(*) AS so_goi,
-                            SUM("Giá_trúng_thầu") AS gia_tri
-                        FROM thau_2025
-                        WHERE "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                            AND "Giá_trúng_thầu" > 0
-                        GROUP BY dvkd
-                        ORDER BY gia_tri DESC
-                        LIMIT 5
-                    """
-                },
-                
-                # 6. GIÁ TRỊ THEO THÁNG
-                {
-                    "id": "by_month",
-                    "description": "Giá trị Viettel theo từng tháng",
-                    "sql": """
-                        SELECT 
-                            EXTRACT(MONTH FROM "Thoi_gian_phe_duyet") AS thang,
-                            SUM("Giá_trúng_thầu") AS gia_tri,
-                            COUNT(*) AS so_goi
-                        FROM thau_2025
-                        WHERE "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                            AND "Giá_trúng_thầu" > 0
-                        GROUP BY thang
-                        ORDER BY thang
-                    """
-                },
-                
-                # 7. GIÁ TRỊ LŨY KẾ THEO THÁNG
-                {
-                    "id": "by_month_lk",
-                    "description": "Giá trị lũy kế theo tháng",
-                    "sql": """
-                        WITH monthly_data AS (
-                            SELECT 
-                                EXTRACT(MONTH FROM "Thoi_gian_phe_duyet") AS thang,
-                                SUM("Giá_trúng_thầu") AS gia_tri
-                            FROM thau_2025
-                            WHERE "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                                AND "Giá_trúng_thầu" > 0
-                            GROUP BY thang
-                        )
-                        SELECT 
-                            thang,
-                            SUM(gia_tri) OVER (ORDER BY thang) AS gia_tri_luy_ke
-                        FROM monthly_data
-                        ORDER BY thang
-                    """
-                }
-            ]
-        }
-
-    def _extract_scenario3_object_via_llm(self, question: str):
-        """
-        Dùng LLM để trích xuất đối tượng cho scenario_3:
-        - ĐVKD (Đơn vị kinh doanh Viettel)
-        - Tỉnh / Thành phố
-        - Lĩnh vực khách hàng
-
-        Trả về:
-            target_name: tên hiển thị cho user (Hà Nội, TT CQĐT, lĩnh vực YTS, ...)
-            search_field: 'dvkd' | 'province' | 'field' | 'unknown'
-            search_value: giá trị dùng để search (đã lower + escape quote)
-        """
-        import json
-        import re
-
-        system_prompt = """
-Bạn đang hỗ trợ hệ thống phân tích hồ sơ thầu Viettel (HST Agent).
-
-Nhiệm vụ: Từ câu hỏi tiếng Việt của người dùng, hãy xác định ĐỐI TƯỢNG chính
-cho báo cáo scenario_3, thuộc một trong các nhóm:
-
-1. Đơn vị kinh doanh Viettel (ĐVKD)
-   - Lưu trong cột: "Đơn_vị_kinh_doanh(VTS)"
-   - Ví dụ: "TT CQĐT", "TT DTTM", "Trung tâm miền Bắc", ...
-
-2. Tỉnh / Thành phố
-   - Lưu trong cột: "Mã_tỉnh_mới"
-   - Giá trị là mã tỉnh, ví dụ:
-     - Hà Nội  -> HNI
-     - Hồ Chí Minh / TP HCM -> HCM
-     - Đà Nẵng -> DNG
-     - Hải Phòng -> HPG
-     - Cần Thơ -> CTO
-   - Nếu không chắc mã tỉnh, có thể dùng tên thường (không dấu hoặc có dấu),
-     miễn là dễ dùng để search.
-
-3. Lĩnh vực khách hàng
-   - Lưu trong cột: "Lĩnh_vực_Khách_hàng"
-   - Ví dụ: "YTS", "GDS", "CQT", "BQP", "KHDN", ...
-
-Hãy TRẢ VỀ DUY NHẤT một JSON với schema:
-
-{
-  "target_name": "string",    // tên hiển thị cho người dùng: "Hà Nội", "TT CQĐT", "lĩnh vực YTS", ...
-  "search_field": "dvkd" | "province" | "field" | "unknown",
-  "search_value": "string"    // giá trị dùng để search (không cần thêm %)
-}
-
-QUY TẮC:
-- Nếu câu hỏi nói rõ về tỉnh / thành phố:
-  + Ví dụ: "Hà Nội", "TP HCM", "Đà Nẵng", ...
-  => search_field = "province"
-  => search_value = mã tỉnh (HNI, HCM, DNG, ...) nếu bạn biết,
-     nếu không biết thì dùng tên thường (vd: "hà nội" hoặc "ha noi").
-
-- Nếu câu hỏi nói về ĐVKD:
-  + Ví dụ: "TT CQĐT", "trung tâm CQĐT", "ĐVKD miền Nam", ...
-  => search_field = "dvkd"
-  => search_value = tên/viết tắt ĐVKD (vd: "tt cqđt").
-
-- Nếu câu hỏi nói về lĩnh vực khách hàng:
-  + Ví dụ: "lĩnh vực YTS", "lĩnh vực CQT", "phân khúc KHDN", ...
-  => search_field = "field"
-  => search_value = giá trị dùng trong cột "Lĩnh_vực_Khách_hàng" (vd: "yts", "cqt", "khdn").
-
-- Nếu không xác định rõ được loại đối tượng:
-  => search_field = "unknown"
-  => search_value = từ khóa quan trọng nhất liên quan đến đối tượng,
-     ưu tiên từ/cụm từ ở cuối câu.
-
-CHỈ TRẢ VỀ JSON, KHÔNG THÊM GIẢI THÍCH.
-"""
-
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                temperature=0.0,
-                max_tokens=256,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": question},
-                ],
-            )
-            content = resp.choices[0].message.content.strip()
-
-            # Cố gắng bóc riêng phần JSON nếu model lỡ nói thêm
-            m = re.search(r"\{.*\}", content, re.DOTALL)
-            if m:
-                json_str = m.group(0)
+        result = []
+        metadata = None
+
+        for chunk in self.query(user_message):
+            if isinstance(chunk, dict):
+                metadata = chunk
             else:
-                json_str = content
+                result.append(chunk)
 
-            data = json.loads(json_str)
+        return "".join(result)
 
-            target_name = (data.get("target_name") or "").strip()
-            search_field = (data.get("search_field") or "").strip().lower()
-            search_value = (data.get("search_value") or "").strip().lower()
-
-        except Exception as e:
-            logger.error(f"[PLANNER] LLM extract scenario_3 object failed: {e}")
-            # Fallback đơn giản: lấy từ cuối cùng trong câu hỏi
-            words = question.split()
-            target_name = words[-1] if words else ""
-            search_field = "unknown"
-            search_value = target_name.lower()
-
-        if not target_name:
-            target_name = search_value or "đối tượng"
-
-        if search_field not in {"dvkd", "province", "field", "unknown"}:
-            search_field = "unknown"
-
-        # Escape dấu nháy đơn cho an toàn SQL
-        search_value = search_value.replace("'", "''")
-
-        return target_name, search_field, search_value
-    
-    def _plan_scenario_3(self, question: str):
+    def _handle_tool_calls(self, assistant_message, original_question: str) -> Generator[str, None, None]:
         """
-        Scenario 3: Báo cáo theo đối tượng cụ thể (ĐVKD/Tỉnh/Lĩnh vực)
+        Handle SQL query execution from tool calls
 
-        Trả về 4 query:
-        - viettel_overall: Tổng quan Viettel toàn thị trường
-        - obj_overview: Tổng quan riêng cho đối tượng
-        - obj_by_month: Giá trị theo tháng của đối tượng
-        - obj_by_month_lk: Giá trị lũy kế theo tháng của đối tượng
+        Args:
+            assistant_message: OpenAI assistant message with tool calls
+            original_question: Original user question
+
+        Returns:
+            Response text with query results and analysis
         """
+        responses = []
 
-        # 1. Nhờ LLM trích xuất đối tượng
-        target_name, search_field, raw_search_value = self._extract_scenario3_object_via_llm(question)
+        for tool_call in assistant_message.tool_calls:
+            if tool_call.function.name == "execute_sql_query":
+                try:
+                    arguments = json.loads(tool_call.function.arguments)
+                    query = arguments.get("query", "")
 
-        logger.info(
-            f"[PLANNER S3] target_name='{target_name}', "
-            f"search_field='{search_field}', search_value='{raw_search_value}'"
-        )
+                    logger.info(f"🔍 Executing SQL: {query}")
 
-        # 2. Build WHERE clause dựa trên loại đối tượng
-        if search_field == "dvkd":
-            # Đơn vị kinh doanh Viettel
-            where_clause = (
-                f'LOWER("Đơn_vị_kinh_doanh(VTS)") ILIKE \'%{raw_search_value}%\''
-            )
-        elif search_field == "province":
-            # Tỉnh / Thành phố (dùng Mã_tỉnh_mới, nhưng vẫn cho phép ILIKE để linh hoạt)
-            where_clause = (
-                f'LOWER("Mã_tỉnh_mới") ILIKE \'%{raw_search_value}%\''
-            )
-        elif search_field == "field":
-            # Lĩnh vực khách hàng
-            where_clause = (
-                f'LOWER("Lĩnh_vực_Khách_hàng") ILIKE \'%{raw_search_value}%\''
-            )
+                    # Execute query
+                    result_df, error = self._execute_sql(query)
+
+                    if error:
+                        responses.append(f"❌ SQL Error: {error}")
+                        logger.warning(f"SQL execution failed: {error}")
+                    else:
+                        if len(result_df) == 0:
+                            responses.append("✅ Query executed successfully but returned no results")
+                        else:
+                            # Format results
+                            display_df = result_df.head(10)
+                            result_text = f"✅ Query Results ({len(result_df)} rows returned):\n\n{display_df.to_string(index=False)}"
+                            if len(result_df) > 10:
+                                result_text += f"\n\n(Showing first 10 of {len(result_df)} rows)"
+                            responses.append(result_text)
+                            logger.info(f"SQL execution successful: {len(result_df)} rows")
+
+                except Exception as e:
+                    logger.error(f"Tool execution error: {str(e)}")
+                    responses.append(f"❌ Error executing query: {str(e)}")
+
+        # Combine all tool responses
+        if responses:
+            result_summary = "\n\n".join(responses)
+            scenarios_instruction = self._format_scenarios_for_prompt()
+            sys_prompt = self._get_tool_call_system_prompt(scenarios_instruction)
+            try:
+                stream_response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": f"**Original Question:** {original_question}\n\n**Query Results:**\n{result_summary}\n\nPlease interpret these results and answer the question:"}
+                    ],
+                    temperature=0.7,
+                    stream=True,
+                    max_tokens=500
+                )
+                for chunk in stream_response:
+                    if chunk.choices[0].delta.content:
+                        text = chunk.choices[0].delta.content
+                        yield text
+            except Exception as e:
+                logger.error(f"Interpretation streaming error: {str(e)}")
+                yield f"\n\n⚠️ Error generating analysis: {str(e)}\n"
         else:
-            # Fallback: tìm trong cả 3 field
-            where_clause = f"""(
-                LOWER("Đơn_vị_kinh_doanh(VTS)") ILIKE '%{raw_search_value}%'
-                OR LOWER("Mã_tỉnh_mới") ILIKE '%{raw_search_value}%'
-                OR LOWER("Lĩnh_vực_Khách_hàng") ILIKE '%{raw_search_value}%'
-            )"""
+            yield "No results from query execution.\n"
+    def _get_tool_call_system_prompt(self,scenarios_instruction):
+        return f"""You are a data analyst. Interpret SQL query results and provide insights to answer the user's question.
+        You must follow there scenarios {scenarios_instruction}
+        You must be answer in Vietnamese"""
+    def _execute_sql(self, query: str) -> Tuple[pd.DataFrame, Optional[str]]:
+        """
+        Execute SQL query
 
-        # 3. Trả về bộ queries giống logic cũ nhưng không dùng regex nữa
-        return {
-            "scenario": "scenario_3",
-            "queries": [
-                # Query 1: TỔNG QUAN VIETTEL TOÀN THỊ TRƯỜNG
-                {
-                    "id": "viettel_overall",
-                    "description": "Tổng quan Viettel toàn thị trường",
-                    "sql": """
-                        WITH market_total AS (
-                            SELECT 
-                                SUM("Giá_trúng_thầu") AS tong_thi_truong
-                            FROM thau_2025
-                            WHERE "Giá_trúng_thầu" > 0
-                                AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                        ),
-                        viettel_data AS (
-                            SELECT 
-                                COUNT(*) AS so_goi,
-                                SUM("Giá_trúng_thầu") AS gia_tri
-                            FROM thau_2025
-                            WHERE "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                                AND "Giá_trúng_thầu" > 0
-                        ),
-                        vendor_ranking AS (
-                            SELECT 
-                                "Nhóm_trúng_thầu_shortlist",
-                                SUM("Giá_trúng_thầu") AS gia_tri,
-                                RANK() OVER (ORDER BY SUM("Giá_trúng_thầu") DESC) AS rank
-                            FROM thau_2025
-                            WHERE "Giá_trúng_thầu" > 0
-                                AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                            GROUP BY "Nhóm_trúng_thầu_shortlist"
-                        )
-                        SELECT 
-                            vd.so_goi,
-                            vd.gia_tri,
-                            ROUND(
-                                CAST(vd.gia_tri * 100.0 / mt.tong_thi_truong AS NUMERIC),
-                                1
-                            ) AS share,
-                            vr.rank
-                        FROM viettel_data vd
-                        CROSS JOIN market_total mt
-                        LEFT JOIN vendor_ranking vr 
-                            ON vr."Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                    """
-                },
+        Args:
+            query: SQL query string
 
-                # Query 2: TỔNG QUAN RIÊNG CHO ĐỐI TƯỢNG
-                {
-                    "id": "obj_overview",
-                    "description": f"Tổng quan riêng cho {target_name}",
-                    "sql": f"""
-                        WITH obj_total AS (
-                            SELECT 
-                                SUM("Giá_trúng_thầu") AS tong_obj
-                            FROM thau_2025
-                            WHERE "Giá_trúng_thầu" > 0
-                                AND "Nhóm_trúng_thầu_shortlist" != 'Khác'
-                                AND {where_clause}
-                        ),
-                        viettel_obj AS (
-                            SELECT 
-                                COUNT(*) AS so_goi,
-                                SUM("Giá_trúng_thầu") AS gia_tri
-                            FROM thau_2025
-                            WHERE "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                                AND "Giá_trúng_thầu" > 0
-                                AND {where_clause}
-                        )
-                        SELECT 
-                            vo.so_goi,
-                            vo.gia_tri,
-                            CASE 
-                                WHEN ot.tong_obj > 0 THEN 
-                                    ROUND(
-                                        CAST(vo.gia_tri * 100.0 / ot.tong_obj AS NUMERIC),
-                                        1
-                                    )
-                                ELSE 0
-                            END AS share
-                        FROM viettel_obj vo
-                        CROSS JOIN obj_total ot
-                    """
-                },
+        Returns:
+            Tuple of (result DataFrame, error message)
+        """
+        if not self.sql_tool:
+            return pd.DataFrame(), "SQL capability not enabled"
 
-                # Query 3: GIÁ TRỊ THEO THÁNG CỦA ĐỐI TƯỢNG
-                {
-                    "id": "obj_by_month",
-                    "description": f"Giá trị theo tháng của {target_name}",
-                    "sql": f"""
-                        SELECT 
-                            EXTRACT(MONTH FROM "Thoi_gian_phe_duyet") AS thang,
-                            SUM("Giá_trúng_thầu") AS gia_tri,
-                            COUNT(*) AS so_goi
-                        FROM thau_2025
-                        WHERE "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                            AND "Giá_trúng_thầu" > 0
-                            AND {where_clause}
-                        GROUP BY thang
-                        ORDER BY thang
-                    """
-                },
+        try:
+            result_df, error = self.sql_tool.execute_query(query)
+            return result_df, error
+        except Exception as e:
+            logger.error(f"SQL execution failed: {str(e)}")
+            return pd.DataFrame(), str(e)
 
-                # Query 4: GIÁ TRỊ LŨY KẾ THEO THÁNG CỦA ĐỐI TƯỢNG
-                {
-                    "id": "obj_by_month_lk",
-                    "description": f"Giá trị lũy kế theo tháng của {target_name}",
-                    "sql": f"""
-                        WITH monthly_data AS (
-                            SELECT 
-                                EXTRACT(MONTH FROM "Thoi_gian_phe_duyet") AS thang,
-                                SUM("Giá_trúng_thầu") AS gia_tri
-                            FROM thau_2025
-                            WHERE "Nhóm_trúng_thầu_shortlist" = 'Viettel'
-                                AND "Giá_trúng_thầu" > 0
-                                AND {where_clause}
-                            GROUP BY thang
-                        )
-                        SELECT 
-                            thang,
-                            SUM(gia_tri) OVER (ORDER BY thang) AS gia_tri_luy_ke
-                        FROM monthly_data
-                        ORDER BY thang
-                    """
-                },
-            ]
+    def _get_sample_rows(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """
+        Get sample rows from data
+
+        Args:
+            limit: Number of rows to return
+
+        Returns:
+            List of row dicts
+        """
+        if self.df_cleaned is None:
+            return []
+
+        try:
+            sample_df = self.df_cleaned.head(limit)
+            return sample_df.to_dict(orient='records')
+        except Exception as e:
+            logger.error(f"Failed to get sample rows: {str(e)}")
+            return []
+
+    def _get_distinct_values(self, column_name: str, limit: int = 50) -> List[Any]:
+        """
+        Get distinct values for a column
+
+        Args:
+            column_name: Column name
+            limit: Maximum number of values to return
+
+        Returns:
+            List of distinct values
+        """
+        if self.df_cleaned is None:
+            return []
+
+        try:
+            if column_name not in self.df_cleaned.columns:
+                logger.warning(f"Column '{column_name}' not found in data")
+                return []
+
+            distinct_values = self.df_cleaned[column_name].dropna().unique()[:limit]
+            return distinct_values.tolist()
+        except Exception as e:
+            logger.error(f"Failed to get distinct values: {str(e)}")
+            return []
+
+    def get_schema_info(self) -> Dict[str, Any]:
+        """
+        Get schema information
+
+        Returns:
+            Dict with schema information
+        """
+        schema_info = {
+            "table_name": "data",
+            "columns": [],
+            "row_count": 0
         }
+
+        if self.session.schema:
+            for col_name, col_schema in self.session.schema.items():
+                schema_info["columns"].append({
+                    "name": col_name,
+                    "semantic_type": col_schema.semantic_type,
+                    "physical_type": col_schema.physical_type,
+                    "unit": col_schema.unit,
+                    "description": col_schema.description,
+                    "required": col_schema.is_required
+                })
+
+        if self.df_cleaned is not None:
+            schema_info["row_count"] = len(self.df_cleaned)
+
+        return schema_info
+
+    def _get_tools(self) -> List[Dict[str, Any]]:
+        """
+        Define SQL query tool dynamically based on actual schema
+
+        Returns:
+            List of tool definitions for OpenAI function calling
+        """
+        if not self.sql_tool:
+            return []
+
+        # Get schema info
+        schema_info = self.get_schema_info()
+
+        # Build column descriptions from session schema
+        column_descriptions = []
+        if self.session.schema:
+            for col_name, col_schema in list(self.session.schema.items())[:20]:
+                desc = f"{col_name} ({col_schema.semantic_type}, {col_schema.physical_type})"
+                if col_schema.unit:
+                    desc += f" - Unit: {col_schema.unit}"
+                if col_schema.description:
+                    desc += f" - {col_schema.description}"
+                column_descriptions.append(desc)
+
+        columns_desc = "\n".join(column_descriptions) if column_descriptions else "Use PRAGMA table_info(data) to see columns"
+
+        return [{
+            "type": "function",
+            "function": {
+                "name": "execute_sql_query",
+                "description": f"""Execute SQL SELECT query on the data table.
+
+**Table:** {schema_info['table_name']}
+**Rows:** {schema_info['row_count']}
+
+**Available Columns:**
+{columns_desc}
+
+Use this tool to:
+- Analyze data (aggregations, statistics)
+- Filter and search records
+- Count, sum, average values
+- Group by categories
+- Find top/bottom records
+
+Only SELECT queries are allowed.""",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "SQL SELECT query. Use standard SQL syntax. Examples: 'SELECT * FROM data LIMIT 5', 'SELECT AVG(column) FROM data', 'SELECT category, COUNT(*) FROM data GROUP BY category'"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }]
+    def _format_scenarios_for_prompt(self) -> str:
+        """
+        Format scenarios into instructions for the LLM.
+        Handles pattern matching and variable templating instructions.
+        """
+        if not self.session.scenarios:
+            return ""
+
+        prompt_parts = ["**🎯 DEFINED SCENARIOS & OUTPUT PATTERNS:**"]
+        prompt_parts.append("You MUST follow these patterns when the user's question matches the intent of a scenario.")
+        prompt_parts.append("IMPORTANT: These scenarios are EXAMPLES. Apply the same logic/formulas to ANY entity (e.g., if defined for Employee A, apply to Employee B).")
+
+        for idx, sc in enumerate(self.session.scenarios):
+            output_desc = sc.output_format.get("description", "") if sc.output_format else ""
+            
+            scenario_text = f"""
+    [Scenario {idx+1}: {sc.name}]
+    - Intent/Trigger: Questions like {json.dumps(sc.questions)}
+    - Relevant Fields: {', '.join(sc.selected_fields)}
+    - Output Template: "{output_desc}"
+    """
+            prompt_parts.append(scenario_text)
+
+        prompt_parts.append("""
+    **Instructions for Scenarios:**
+    1. **Pattern Matching**: If the user asks about a different person/item than in the scenario example, use the SAME formula and format.
+    2. **Placeholders**: When you see syntax like `{data.ColumnName}` in the Output Template:
+       - First, execute SQL to get the value of 'ColumnName' for the requested entity.
+       - Then, REPLACE `{data.ColumnName}` with the actual value in the response.
+    3. **Calculations**: If the template implies a calculation (e.g., "Salary * 0.9"), perform the calculation using the SQL values.
+    """)
+        
+        return "\n".join(prompt_parts)
+
+    def _build_context(self) -> str:
+        """Build context including Business Logic/Notes and Scenarios"""
+        parts = []
+
+        # 1. Data Source Info
+        if self.session.sources:
+            parts.append(f"**Data Source:** {self.session.sources[0].file_path}")
+
+        # 2. Schema Summary
+        if self.session.schema:
+            schema_lines = []
+            for col, col_schema in list(self.session.schema.items())[:30]: # Limit to avoid context overflow
+                line = f"- {col}: {col_schema.semantic_type} ({col_schema.physical_type})"
+                if col_schema.description:
+                    line += f" | Desc: {col_schema.description}"
+                schema_lines.append(line)
+            
+            parts.append("**Schema Structure:**\n" + "\n".join(schema_lines))
+
+        # 3. Business Rules (General)
+        if self.session.question_set and self.session.question_set.additional_notes:
+            parts.append(f"**⚠️ GLOBAL BUSINESS RULES:**\n{self.session.question_set.additional_notes}")
+
+        # 4. SCENARIOS (New Section)
+        scenario_context = self._format_scenarios_for_prompt()
+        if scenario_context:
+            parts.append(scenario_context)
+
+        return "\n\n".join(parts)
+    
+    def enable_sql(self, df_cleaned: pd.DataFrame, sql_tool: Optional['SQLQueryTool'] = None):
+        """
+        Enable SQL capability
+
+        Args:
+            df_cleaned: Cleaned DataFrame
+            sql_tool: Optional SQL tool to use (will create if not provided)
+        """
+        if sql_tool:
+            self.sql_tool = sql_tool
+            self.df_cleaned = df_cleaned
+            logger.info("✓ SQL capability enabled with provided tool")
+        elif self.sql_tool is None:
+            db_dir = Path("./agent_databases")
+            db_dir.mkdir(exist_ok=True)
+
+            self.db_path = db_dir / f"data_{self.session.session_id}.db"
+            self.sql_tool = SQLQueryTool(str(self.db_path), df_cleaned)
+            self.df_cleaned = df_cleaned
+            logger.info("✓ SQL capability enabled for agent")
+
+    def close(self):
+        """Close database connection"""
+        if self.sql_tool:
+            try:
+                self.sql_tool.close()
+                logger.info("SQL tool closed")
+            except Exception as e:
+                logger.error(f"Error closing SQL tool: {str(e)}")
+
+
+class RefinementEngine:
+    """Handle schema refinement based on user answers"""
+    
+    def __init__(self, session: 'Session'):
+        self.session = session
+    
+
+    def apply_answer(self, answer: Answer) -> bool:
+        """Apply user answer to schema with fallback for general notes"""
+        try:
+            question = next((q for q in self.session.questions if q.id == answer.question_id), None)
+            if not question:
+                return False
+            
+            parts = question.target.split(".")
+            target_col = parts[0]
+            
+            if target_col.lower() == "global" or target_col not in self.session.schema:
+                if self.session.question_set:
+                    timestamp = datetime.now().strftime("%H:%M")
+
+                    new_logic = f"\n- [Business Logic] {question.question} -> Rule: {answer.answer}"
+                    self.session.question_set.additional_notes += new_logic
+                    
+                    logger.info(f"✓ Added business logic: {answer.answer}")
+                    answer.applied = True
+                    return True
+            
+            if target_col in self.session.schema:
+                schema_col = self.session.schema[target_col]
+                field = parts[1] if len(parts) > 1 else "description"
+                
+                if field == "unit":
+                    schema_col.unit = answer.answer
+                elif field in ["description", "calculation", "formula"]:
+                    # Nếu là calculation, cộng dồn vào description
+                    schema_col.description += f" | Calculation: {answer.answer}"
+                elif field == "semantic_type":
+                    schema_col.semantic_type = answer.answer
+                elif field == "physical_type":
+                    schema_col.physical_type = answer.answer
+                elif field == "is_required":
+                    schema_col.is_required = answer.answer.lower() in ('true', 'yes', '1')
+                else:
+                    # Fallback cho trường hợp field lạ cũng đưa vào description
+                    schema_col.description += f" ({field}: {answer.answer})"
+                
+                answer.applied = True
+                
+                # Update history... (giữ nguyên code cũ)
+                self.session.history.append(HistoryEntry(
+                    timestamp=datetime.now().isoformat(),
+                    action="question_answered",
+                    details={
+                        "question_id": answer.question_id,
+                        "answer": answer.answer,
+                        "target": question.target
+                    },
+                    schema_version=self.session.schema_version
+                ))
+                
+                self.session.schema_version += 1
+                return True
+            
+        except Exception as e:
+            logger.error(f"Failed to apply answer: {str(e)}")
+            return False
+
+
+# ============================================================================
+# Session Management (Enhanced with Cleaning)
+# ============================================================================
+
+class SessionManager:
+    """Manage session state and checkpoints"""
+    
+    def __init__(self, output_dir: str):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.checkpoints_dir = self.output_dir / "checkpoints"
+        self.checkpoints_dir.mkdir(exist_ok=True)
+    
+    def create_session(
+        self,
+        sources: List[DataSource],
+        current_source_id: str
+    ) -> Session:
+        """Create new session"""
+        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        session = Session(
+            session_id=session_id,
+            created_at=datetime.now().isoformat(),
+            sources=sources,
+            current_source_id=current_source_id,
+            raw_structure_info={},
+            transformations=[],
+            applied_transformations=[],
+            cleaning_rules=[],
+            applied_cleaning_rules=[],
+            schema={},
+            profiles={},
+            questions=[],
+            answers=[],
+            agent_conversations=[],
+            history=[],
+            checkpoints=[]
+        )
+        
+        logger.info(f"✓ Created session: {session_id}")
+        return session
+    
+    def save_checkpoint(
+        self,
+        session: Session,
+        df: pd.DataFrame,
+        stage: str,
+        description: str
+    ) -> DataFrameCheckpoint:
+        """Save DataFrame checkpoint"""
+        checkpoint_id = f"{session.session_id}_{stage}_{len(session.checkpoints)}"
+        timestamp = datetime.now().isoformat()
+        
+        checkpoint_file = self.checkpoints_dir / f"{checkpoint_id}.parquet"
+
+        df_save = df.copy()
+        df_save.columns = df_save.columns.astype(str)
+        if not df_save.columns.is_unique:
+            new_columns = []
+            seen = {}
+            for col in df_save.columns:
+                if col in seen:
+                    seen[col] += 1
+                    new_columns.append(f"{col}.{seen[col]}")
+                else:
+                    seen[col] = 0
+                    new_columns.append(col)
+            df_save.columns = new_columns
+        for col in df_save.columns:
+            if df_save[col].dtype == 'object':
+                df_save[col] = df_save[col].astype(str)
+        try:
+            df.to_parquet(checkpoint_file, index=False)
+        except Exception as e:
+            logger.warning(f"Parquet save failed: {e}. Falling back to CSV")
+            checkpoint_file = self.checkpoints_dir / f"{checkpoint_id}.csv"
+            df.to_csv(checkpoint_file,index=False)
+        checkpoint = DataFrameCheckpoint(
+            checkpoint_id=checkpoint_id,
+            stage=stage,
+            timestamp=timestamp,
+            shape=(len(df), len(df.columns)),
+            description=description,
+            file_path=str(checkpoint_file)
+        )
+        
+        session.checkpoints.append(checkpoint)
+        
+        logger.info(f"✓ Checkpoint: {stage} ({checkpoint.shape[0]}×{checkpoint.shape[1]})")
+        return checkpoint
+    
+    def load_checkpoint(self, checkpoint: DataFrameCheckpoint) -> pd.DataFrame:
+        """Load DataFrame from checkpoint"""
+        if not checkpoint.file_path:
+            raise ValueError("No file path")
+        path = Path(checkpoint.file_path)
+        
+        if path.suffix == '.parquet':
+            df = pd.read_parquet(path)
+        elif path.suffix == '.csv':
+            df = pd.read_csv(path)
+        else:
+            raise ValueError(f"Unsupported checkpoint format: {path.suffix}")
+        logger.info(f"✓ Loaded: {checkpoint.stage}")
+        return df
+    
+    def save_session(self, session: Session):
+        """Save session to JSON"""
+        session_file = self.output_dir / f"session_{session.session_id}.json"
+        
+        with open(session_file, 'w', encoding='utf-8') as f:
+            json.dump(session.to_dict(), f, indent=2, ensure_ascii=False, default=str)
+        
+        logger.info(f"✓ Session saved: {session_file}")
+
+
+# ============================================================================
+# CLI Interface (Enhanced)
+# ============================================================================
+
+class CLI:
+    """Command-line interface"""
+    
+    def __init__(self, args):
+        self.args = args
+        self.session_manager = SessionManager(args.output_dir)
+    
+    def run(self):
+        """Execute pipeline"""
+        
+        logger.info("="*70)
+        logger.info("Enhanced Data Schema Analysis Pipeline V4")
+        logger.info("="*70)
+        
+        # Discover sources
+        logger.info("\nStep 1: Discovering data sources...")
+        file_paths = self.args.file_paths if isinstance(self.args.file_paths, list) else [self.args.file_paths]
+        sources = DataIngestor.discover_sources(file_paths)
+        
+        if not sources:
+            raise ValueError("No valid sources found")
+        
+        # Create session
+        session = self.session_manager.create_session(
+            sources=sources,
+            current_source_id=sources[0].source_id
+        )
+        
+        # Process each source
+        for source in sources:
+            logger.info(f"\n{'='*70}")
+            logger.info(f"Processing: {source.source_id}")
+            logger.info(f"{'='*70}")
+            
+            self._process_source(session, source)
+        
+        # Agent Q&A
+        if not self.args.skip_agent and session.schema:
+            logger.info("\n" + "="*70)
+            logger.info("Agent Q&A: Ask questions about your data schema")
+            logger.info("="*70)
+            self._agent_chat(session)
+        
+        # Save
+        self.session_manager.save_session(session)
+        
+        logger.info("\n" + "="*70)
+        logger.info(f"✓ Complete! Session: {session.session_id}")
+        logger.info(f"✓ Output: {self.args.output_dir}")
+        logger.info("="*70 + "\n")
+    
+    def _process_source(self, session: Session, source: DataSource):
+        """Process single source"""
+        
+        # Load raw
+        logger.info(f"\nLoading raw data...")
+        df_raw = DataIngestor.load_raw(source)
+        
+        checkpoint_raw = self.session_manager.save_checkpoint(
+            session, df_raw, "raw", f"Raw: {source.source_id}"
+        )
+        
+        logger.info("\nAnalyzing structure...")
+        analyzer = StructureAnalyzer(api_key=self.args.api_key, model=self.args.model)
+        
+        structure_info, transformations, structural_qs, is_clean = analyzer.analyze_structure(df_raw)
+        
+        session.raw_structure_info[source.source_id] = structure_info
+        session.is_clean_structure = is_clean
+        
+        df_clean = df_raw.copy()
+        applied_trans = []
+        
+        if transformations and not self.args.skip_interactive:
+            df_clean, applied_trans = self._handle_transformations(df_clean, transformations, session)
+        elif transformations and self.args.auto_transform:
+            for t in transformations:
+                if t.confidence >= 0.9:
+                    logger.info(f"Auto-applying: {t.description}")
+                    df_clean = StructureAnalyzer.apply_transformation(df_clean, t)
+                    applied_trans.append(t.id)
+        
+        session.transformations.extend(transformations)
+        session.applied_transformations.extend(applied_trans)
+        
+        checkpoint_clean = self.session_manager.save_checkpoint(
+            session, df_clean, "after_structure", "After structure transforms"
+        )
+        
+        # Generate profiles with type inference
+        logger.info("\nGenerating profiles with type inference...")
+        profiles = ProfileGenerator.generate_profiles(df_clean)
+        
+        # Show type inference results
+        for col_name, profile in profiles.items():
+            if profile.inferred_type != 'string' and df_clean[col_name].dtype == 'object':
+                logger.info(f"  Column '{col_name}': {profile.pandas_dtype} → {profile.inferred_type}")
+                if profile.has_thousand_separator:
+                    logger.info(f"    Example: {profile.sample_raw_values[0]!r}")
+        
+        # Generate cleaning rules
+        logger.info("\nGenerating data cleaning rules...")
+        cleaning_rules = TypeInferenceEngine.generate_cleaning_rules(df_clean, profiles)
+        session.cleaning_rules.extend(cleaning_rules)
+        
+        if cleaning_rules:
+            logger.info(f"Found {len(cleaning_rules)} cleaning rule(s)")
+            
+            # Apply cleaning
+            df_cleaned = df_clean.copy()
+            applied_cleaning = []
+            
+            if not self.args.skip_interactive:
+                df_cleaned, applied_cleaning = self._handle_cleaning(df_cleaned, cleaning_rules, session)
+            elif self.args.auto_clean:
+                for rule in cleaning_rules:
+                    df_cleaned = TypeInferenceEngine.apply_cleaning_rule(df_cleaned, rule)
+                    applied_cleaning.append(rule.id)
+            
+            session.applied_cleaning_rules.extend(applied_cleaning)
+            
+            # Save checkpoint after cleaning
+            checkpoint_cleaned = self.session_manager.save_checkpoint(
+                session, df_cleaned, "cleaned", "After data cleaning"
+            )
+            
+            # Regenerate profiles after cleaning
+            profiles = ProfileGenerator.generate_profiles(df_cleaned)
+            
+            df_final = df_cleaned
+            
+        else:
+            logger.info("No cleaning needed")
+            df_final = df_clean
+        self._final_df = df_final  # Save for agent
+        sample_rows = ProfileGenerator.get_sample_rows(df_final)
+        
+        # Generate schema
+        logger.info("\nGenerating semantic schema...")
+        schema_gen = SchemaGenerator(api_key=self.args.api_key, model=self.args.model)
+        schema, semantic_qs = schema_gen.generate_schema(profiles, sample_rows)
+        
+        session.profiles.update(profiles)
+        session.schema.update(schema)
+        session.questions.extend(structural_qs + semantic_qs)
+        
+        # Interactive refinement
+        if semantic_qs and not self.args.skip_interactive:
+            logger.info("\nInteractive refinement...")
+            self._interactive_refinement(session, semantic_qs)
+    
+    def _handle_transformations(
+        self,
+        df: pd.DataFrame,
+        transformations: List[Transformation],
+        session: Session
+    ) -> Tuple[pd.DataFrame, List[str]]:
+        """Handle transformations interactively"""
+        df_result = df.copy()
+        applied = []
+        
+        logger.info(f"\nFound {len(transformations)} transformation(s):\n")
+        
+        for i, trans in enumerate(transformations, 1):
+            logger.info(f"[{i}/{len(transformations)}] {trans.description}")
+            logger.info(f"    Confidence: {trans.confidence:.2%}")
+            
+            user_input = input(f"    Apply? [y/N]: ").strip().lower()
+            
+            if user_input in ('y', 'yes'):
+                df_result = StructureAnalyzer.apply_transformation(df_result, trans)
+                applied.append(trans.id)
+                
+                self.session_manager.save_checkpoint(
+                    session, df_result, f"trans_{trans.id}", trans.description
+                )
+            
+            print()
+        
+        return df_result, applied
+    
+    def _handle_cleaning(
+        self,
+        df: pd.DataFrame,
+        rules: List[CleaningRule],
+        session: Session
+    ) -> Tuple[pd.DataFrame, List[str]]:
+        """Handle cleaning rules interactively"""
+        df_result = df.copy()
+        applied = []
+        
+        logger.info(f"\nFound {len(rules)} cleaning rule(s):\n")
+        
+        for i, rule in enumerate(rules, 1):
+            logger.info(f"[{i}/{len(rules)}] {rule.description}")
+            logger.info(f"    Column: {rule.column}")
+            logger.info(f"    Action: {rule.action}")
+            
+            user_input = input(f"    Apply? [y/N]: ").strip().lower()
+            
+            if user_input in ('y', 'yes'):
+                df_result = TypeInferenceEngine.apply_cleaning_rule(df_result, rule)
+                applied.append(rule.id)
+                
+                self.session_manager.save_checkpoint(
+                    session, df_result, f"clean_{rule.id}", rule.description
+                )
+            
+            print()
+        
+        return df_result, applied
+    
+    def _interactive_refinement(self, session: Session, questions: List[Question]):
+        """Handle Q&A"""
+        engine = RefinementEngine(session)
+        
+        semantic_qs = [q for q in questions if q.question_type == "semantic"]
+        
+        if not semantic_qs:
+            return
+        
+        logger.info(f"\nFound {len(semantic_qs)} question(s):\n")
+        
+        for i, question in enumerate(semantic_qs, 1):
+            logger.info(f"[{i}/{len(semantic_qs)}] {question.question}")
+            if question.suggested_answer:
+                logger.info(f"    Suggested: {question.suggested_answer}")
+            
+            user_input = input(f"    Answer (or Enter for suggestion): ").strip()
+            
+            if not user_input and question.suggested_answer:
+                user_input = question.suggested_answer
+            
+            if user_input:
+                answer = Answer(
+                    question_id=question.id,
+                    answer=user_input,
+                    timestamp=datetime.now().isoformat()
+                )
+                session.answers.append(answer)
+                engine.apply_answer(answer)
+            
+            print()
+    
+    def _agent_chat(self, session: Session):
+        """Interactive agent Q&A with SQL capability"""
+        
+        # Get the final cleaned DataFrame
+        df_final = None
+        if hasattr(self, '_final_df'):
+            df_final = self._final_df
+        else:
+            # Try to load from latest checkpoint
+            if session.checkpoints:
+                latest_cp = session.checkpoints[-1]
+                try:
+                    df_final = self.session_manager.load_checkpoint(latest_cp)
+                except:
+                    pass
+        
+        # Initialize or enable SQL for agent
+        agent = DataSchemaAgent(session, api_key=self.args.api_key, model=self.args.model)
+        
+        if df_final is not None:
+            agent.enable_sql(df_final)
+            logger.info("\n✓ Agent ready with SQL query capability!")
+            logger.info("  You can ask questions that require data analysis")
+            logger.info("  Examples:")
+            logger.info("    - 'What is the average price?'")
+            logger.info("    - 'How many items per category?'")
+            logger.info("    - 'Show me the top 5 most expensive items'")
+        else:
+            logger.info("\n✓ Agent ready (schema questions only)")
+        
+        logger.info("\nAsk me anything! (Type 'exit' to quit)\n")
+        
+        while True:
+            try:
+                user_input = input("You: ").strip()
+                
+                if not user_input:
+                    continue
+                
+                if user_input.lower() in ('exit', 'quit', 'q'):
+                    logger.info("\nAgent session ended.\n")
+                    break
+                
+                response = agent.chat(user_input)
+                print(f"\nAgent: {response}\n")
+                
+            except KeyboardInterrupt:
+                logger.info("\n\nAgent session ended.\n")
+                break
+            except Exception as e:
+                logger.error(f"\nError: {str(e)}\n")
+        
+        agent.close()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Enhanced Data Schema Analysis Pipeline V4"
+    )
+    parser.add_argument(
+        "file_paths",
+        nargs='+',
+        type=str,
+        help="CSV or XLSX file(s)"
+    )
+    parser.add_argument("--model", type=str, default="gpt-4o-mini")
+    parser.add_argument("--output-dir", type=str, default="./output")
+    parser.add_argument("--api-key", type=str, default=None)
+    parser.add_argument("--skip-interactive", action="store_true")
+    parser.add_argument("--auto-transform", action="store_true")
+    parser.add_argument("--auto-clean", action="store_true", help="Auto-apply cleaning rules")
+    parser.add_argument("--skip-agent", action="store_true", help="Skip agent Q&A")
+    
+    args = parser.parse_args()
+    
+    if not args.api_key:
+        args.api_key = os.getenv("OPENAI_API_KEY")
+    
+    if not args.api_key:
+        logger.error("Error: OpenAI API key required")
+        sys.exit(1)
+    
+    try:
+        cli = CLI(args)
+        cli.run()
+    except Exception as e:
+        logger.error(f"\n✗ Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
