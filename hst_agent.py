@@ -613,7 +613,7 @@ class TypeInferenceEngine:
             })
 
         # 7. Null placeholders
-        null_placeholders_found = unique_lower & TypeInferenceEngine.NULL_PLACEHOLDERS
+        null_placeholders_found = (unique_lower & TypeInferenceEngine.NULL_PLACEHOLDERS)/len(unique_lower) < 1
         if null_placeholders_found:
             issues.append({
                 'type': 'null_placeholders',
@@ -1299,7 +1299,7 @@ Be precise and confident in your assessment. Always respond in valid JSON format
         try:
             if trans.type == TransformationType.USE_ROW_AS_HEADER:
                 row_idx = trans.params["row_index"]
-                df_result.columns = df_result.iloc[row_idx].astype(str).togilist()
+                df_result.columns = df_result.iloc[row_idx].astype(str).tolist()
                 df_result = df_result.iloc[row_idx + 1:].reset_index(drop=True)
                 df_result = StructureAnalyzer.validate_and_fix_columns(df_result, f"[{trans.id}] ")
                 

@@ -1658,28 +1658,6 @@ def tab_agent_qa():
 
     sql_tool = st.session_state.get('sql_tool')
     
-    # Info banner
-    if sql_tool:
-        schema_info = sql_tool.get_schema_info()
-        if schema_info and 'table_name' in schema_info and 'error' not in schema_info:
-            st.info(f"""
-            💡 **SQL Capability Enabled!**
-            - Table: `{schema_info['table_name']}`
-            - Rows: {schema_info['row_count']}
-            - Columns: {len(schema_info['columns'])}
-
-            You can ask questions like:
-            - "What is the average price?"
-            - "Show me the top 5 most expensive properties"
-            - "How many properties per district?"
-            """)
-        elif 'error' in schema_info:
-            st.error(f"⚠️ SQL database error: {schema_info['error']}")
-        else:
-            st.warning("⚠️ SQL tool initialized but schema info not available")
-    else:
-        st.info("💬 Ask questions about your schema (SQL queries not yet available)")
-    
     # Display conversation
     st.divider()
     st.subheader("💬 Conversation")
@@ -1715,12 +1693,9 @@ def tab_agent_qa():
             height=100
         )
         
-        col1, col2, col3 = st.columns([1, 1, 4])
+        col1, col3 = st.columns([1, 4])
         with col1:
             submitted = st.form_submit_button("📤 Send", type="primary")
-        with col2:
-            if sql_tool:
-                show_sql = st.form_submit_button("🔍 View SQL")
         if submitted and user_input:
             with st.spinner("Agent is thinking..."):
                 # Call agent with SQL capability
@@ -1751,45 +1726,7 @@ def tab_agent_qa():
     st.divider()
     st.subheader("💡 Quick Questions")
     
-    if sql_tool:
-        quick_questions = [
-            ("📊 Data Overview", "Summarize the data for me"),
-            ("💰 Average Price", "What is the average price?"),
-            ("📈 Top 5 Items", "Show me the top 5 most expensive items"),
-            ("🏘️ Count by Category", "How many items in each category?"),
-            ("🔍 Missing Values", "Which columns have missing values?"),
-            ("💡 Insights", "What are key insights about this dataset?")
-        ]
-    else:
-        quick_questions = [
-            ("📋 Schema Summary", "Summarize the schema"),
-            ("❓ Missing Values", "Which columns have missing values?"),
-            ("🧹 Cleaning Done", "What cleaning was applied?"),
-            ("💡 Improvements", "Suggest improvements")
-        ]
-    
     cols = st.columns(3)
-    for i, (label, question) in enumerate(quick_questions):
-        with cols[i % 3]:
-            if st.button(label, key=f"qq_{i}", width='stretch'):
-                with st.spinner("Thinking..."):
-                    agent = st.session_state.get('agent')
-                    if not agent:
-                        agent = DataSchemaAgent(
-                            session,
-                            st.session_state.api_key,
-                            st.session_state.model
-                        )
-                        st.session_state.agent = agent
-                    
-                    if sql_tool:
-                        agent.sql_tool = sql_tool
-                        agent.df_cleaned = df_cleaned
-                        agent.db_path = sql_tool.db_path
-                    
-                    agent.chat(question)
-                    st.rerun()
-    
     # SQL Query section
     if sql_tool:
         st.divider()
