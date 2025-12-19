@@ -13,7 +13,9 @@ from openai import OpenAI
 import logging
 import sys
 import sqlite3
-
+import redis
+import hashlib
+import time 
 
 logging.basicConfig(level=os.getenv('LOGLEVEL','INFO').upper())
 logger = logging.getLogger(__name__)
@@ -347,7 +349,83 @@ class Session(BaseModel):
             "structure_issues": self.structure_issues
         }
 
+class StreamBuffer:
+    """Buffer chunks for optimized streaming"""
+    def __init__(self, buffer_size: int = 5):
+        self.buffer = []
+        self.buffer_size = buffer_size
 
+    def add(self, chunk: str) -> Optional[str]:
+        """Add chunk, return combined if buffer full"""
+        self.buffer.append(chunk)
+        if len(self.buffer) >= self.buffer_size:
+            result = "".join(self.buffer)
+            self.buffer = []
+            return result
+        return None
+
+    def flush(self) -> str:
+        """Flush remaining buffer"""
+        result = "".join(self.buffer)
+        self.buffer = []
+        return result
+
+class QueryCache:
+    """Semantic query result cache"""
+    
+    def __init__(self, redis_client: redis.Redis):
+        self.redis = redis_client
+        
+    def _cache_key(self, source_name: str, question: str, model: str) -> str:
+        """Generate cache key from question semantics"""
+        normalized = question.lower().strip()
+        hash_input = f"{source_name}:{normalized}:{model}"
+        hash_val = hashlib.md5(hash_input.encode()).hexdigest()
+        return f"query_cache:{source_name}:{hash_val}"
+    
+    def get(self, source_name: str, question: str, model: str) -> Optional[Dict]:
+        """Get cached query result"""
+        key = self._cache_key(source_name, question, model)
+        try:
+            cached = self.redis.get(key)
+            if cached:
+                data = json.loads(cached)
+                logger.info(f"Query cache HIT for {source_name}")
+                return data
+        except Exception as e:
+            logger.warning(f"Query cache read error: {e}")
+        return None
+    
+    def set(self, source_name: str, question: str, model: str, 
+            response_text: str, response_id: str, usage: Any):
+        """Cache query result"""
+        key = self._cache_key(source_name, question, model)
+        try:
+            data = {
+                "response_text": response_text,
+                "response_id": response_id,
+                "usage": {
+                    "prompt_tokens": getattr(usage, 'prompt_tokens', 0),
+                    "completion_tokens": getattr(usage, 'completion_tokens', 0),
+                    "total_tokens": getattr(usage, 'total_tokens', 0)
+                },
+                "cached_at": int(time.time())
+            }
+            self.redis.set(key, json.dumps(data))
+            logger.debug(f"Cached query result for {source_name}")
+        except Exception as e:
+            logger.warning(f"Query cache write error: {e}")
+    
+    def invalidate_source(self, source_name: str):
+        """Invalidate all cached queries for a source"""
+        try:
+            pattern = f"query_cache:{source_name}:*"
+            keys = list(self.redis.scan_iter(match=pattern, count=100))
+            if keys:
+                self.redis.delete(*keys)
+                logger.info(f"Invalidated {len(keys)} cached queries for {source_name}")
+        except Exception as e:
+            logger.warning(f"Query cache invalidation error: {e}")
 
 
 class SQLQueryTool:
@@ -613,8 +691,10 @@ class TypeInferenceEngine:
             })
 
         # 7. Null placeholders
-        null_placeholders_found = (unique_lower & TypeInferenceEngine.NULL_PLACEHOLDERS)/len(unique_lower) < 1
-        if null_placeholders_found:
+        all_null_found = len(unique_lower & TypeInferenceEngine.NULL_PLACEHOLDERS) == len(unique_lower)
+
+        null_placeholders_found = unique_lower & TypeInferenceEngine.NULL_PLACEHOLDERS
+        if all_null_found:
             issues.append({
                 'type': 'null_placeholders',
                 'action': DataCleaningAction.REPLACE_PLACEHOLDERS_WITH_NAN,
@@ -1016,7 +1096,7 @@ class StructureAnalyzer:
     Store result in 'df_result'.
     """}
                 ],
-                temperature=0.3
+                temperature=0
             )
             
             # Extract and clean the code
@@ -2189,7 +2269,7 @@ When you need to query data, use the execute_sql_query tool."""
         """
         import time
         start_time = time.time()
-
+        buffer = StreamBuffer(buffer_size=5)
         try:
             # Build context
             context = self._build_context()
@@ -2223,23 +2303,27 @@ When you need to query data, use the execute_sql_query tool."""
                 )
 
                 assistant_msg = response.choices[0].message
-
-                # Handle tool calls
+                final_text = ""
                 if assistant_msg.tool_calls:
-                    # Execute tools and get results
-                    tool_results = self._handle_tool_calls(assistant_msg, question)
+                    for chunk in self._handle_tool_calls(assistant_msg, question):
+                        final_text += chunk
+                        buffered = buffer.add(char)
+                        if buffered:
+                            yield chunk
+                    remaining = buffer.flush()
+                    if remaining:
+                        yield remaining
 
-                    # Stream tool results
-                    for char in tool_results:
-                        yield char
-
-                    final_text = tool_results
                 else:
                     # No tools called, stream response
                     final_text = assistant_msg.content or ""
                     for char in final_text:
-                        yield char
-
+                        buffered = buffer.add(char)
+                        if buffered:
+                            yield char
+                        remaining = buffer.flush()
+                        if remaining:
+                            yield remaining
                 # Calculate usage
                 usage = {
                     "prompt_tokens": response.usage.prompt_tokens,
@@ -2297,7 +2381,35 @@ When you need to query data, use the execute_sql_query tool."""
                 "duration": time.time() - start_time,
                 "model": model or self.model
             }
+    # def _streaming_query(
+    #     self,
+    #     question: str,
+    #     chat_history: List[Dict[str, Any]],
+    #     model: str,
+    #     max_results: int,
+    #     response_id: str = None,
+    #     previous_response_id: str = None,
+    #     user_prompt: str = "",
+    #     orchestrator_request_id: str = None 
+    # ) -> Generator[Dict[str, Any], None, None]:
+        
 
+
+    #     conversation_messages = []
+    #     for turn in chat_history[-3:]:
+    #         role = "user" if turn.get("role") == "user" else "assistant"
+    #         conversation_messages.append({"role": role, "content": turn.get("content", "")})
+        
+    #     tools = self._get_tools() if self.sql_tool else None
+
+    #     request_params = {
+    #         "model": model.split("/")[-1] if '/' in model else model,
+    #         "input": question,
+    #         "tools": tools,
+    #         "stream": True,
+    #         "include": ["file_search_call.results"],
+    #     }
+    #     pass
     def chat(self, user_message: str) -> str:
         """
         Simple chat interface (non-streaming)
@@ -2319,7 +2431,7 @@ When you need to query data, use the execute_sql_query tool."""
 
         return "".join(result)
 
-    def _handle_tool_calls(self, assistant_message, original_question: str) -> str:
+    def _handle_tool_calls(self, assistant_message, original_question: str) -> Generator[str, None, None]:
         """
         Handle SQL query execution from tool calls
 
@@ -2366,24 +2478,31 @@ When you need to query data, use the execute_sql_query tool."""
         if responses:
             result_summary = "\n\n".join(responses)
             scenarios_instruction = self._format_scenarios_for_prompt()
+            sys_prompt = self._get_tool_call_system_prompt(scenarios_instruction)
             try:
-                interp_response = self.client.chat.completions.create(
+                stream_response = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": "You are a data analyst. Interpret SQL query results and provide insights to answer the user's question."},
-                        {"role": "user", "content": f"**Original Question:** {original_question}\n\n**Query Results:**\n{result_summary}\n\n**Scenarios:**{scenarios_instruction}\n\nPlease interpret these results and answer the question:"}
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": f"**Original Question:** {original_question}\n\n**Query Results:**\n{result_summary}\n\nPlease interpret these results and answer the question:"}
                     ],
                     temperature=0.7,
+                    stream=True,
                     max_tokens=500
                 )
-                interpretation = interp_response.choices[0].message.content
-                return f"{result_summary}\n\n**Analysis:**\n{interpretation}"
+                for chunk in stream_response:
+                    if chunk.choices[0].delta.content:
+                        text = chunk.choices[0].delta.content
+                        yield text
             except Exception as e:
-                logger.error(f"Interpretation error: {str(e)}")
-                return result_summary
-
-        return "No results from query execution."
-
+                logger.error(f"Interpretation streaming error: {str(e)}")
+                yield f"\n\n⚠️ Error generating analysis: {str(e)}\n"
+        else:
+            yield "No results from query execution.\n"
+    def _get_tool_call_system_prompt(self,scenarios_instruction):
+        return f"""You are a data analyst. Interpret SQL query results and provide insights to answer the user's question.
+        You must follow there scenarios {scenarios_instruction}
+        You must be answer in Vietnamese"""
     def _execute_sql(self, query: str) -> Tuple[pd.DataFrame, Optional[str]]:
         """
         Execute SQL query

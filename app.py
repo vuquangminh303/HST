@@ -16,7 +16,17 @@ from hst_agent import (
     TypeInferenceEngine, CleaningRule, DataSchemaAgent, AgentMessage,
     UserQuestion, OutputField, QuestionSet, SchemaValidator, Scenario
 )
-
+# Import chat validation extension
+from validation_chat_extension import (
+    SQLQueryTool,
+    setup_sql_tool,
+    add_chat_validation_to_questions_tab,
+    add_chat_validation_to_scenarios_tab,
+    render_export_chat_button,
+    render_chat_statistics
+)
+from dotenv import load_dotenv
+load_dotenv()
 logging.basicConfig(level=os.getenv("LOGLEVEL","INFO").upper())
 logger = logging.getLogger(__name__)
 # Page config
@@ -59,6 +69,20 @@ st.markdown("""
         border-radius: 0.5rem;
         border: 1px solid #e0e0e0;
         text-align: center;
+    }
+    .validation-success {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border: 2px solid #4CAF50;
+        background-color: #e8f5e9;
+        margin: 0.5rem 0;
+    }
+    .validation-error {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border: 2px solid #f44336;
+        background-color: #ffebee;
+        margin: 0.5rem 0;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -113,8 +137,39 @@ def initialize_session_state():
         st.session_state.cleaned_dfs = {}
     if 'agent' not in st.session_state:
         st.session_state.agent = None
-
-
+    if 'validation_agent' not in st.session_state:
+        st.session_state.validation_agent = None
+def setup_sql_tool(session, df_cleaned):
+    """Setup or update SQL tool for validation"""
+    current_df_hash = hash(str(df_cleaned.values.tobytes()))
+    
+    need_recreate = False
+    if 'sql_tool' not in st.session_state or st.session_state.sql_tool is None:
+        need_recreate = True
+    elif 'sql_tool_df_hash' not in st.session_state:
+        need_recreate = True
+    elif st.session_state.sql_tool_df_hash != current_df_hash:
+        need_recreate = True
+    
+    if need_recreate:
+        from pathlib import Path
+        db_dir = Path("./agent_databases")
+        db_dir.mkdir(exist_ok=True)
+        db_path = db_dir / f"data_{session.session_id}.db"
+        
+        if 'sql_tool' in st.session_state and st.session_state.sql_tool:
+            try:
+                st.session_state.sql_tool.close()
+            except:
+                pass
+        
+        sql_tool = SQLQueryTool(str(db_path), df_cleaned)
+        st.session_state.sql_tool = sql_tool
+        st.session_state.sql_tool_df_hash = current_df_hash
+        
+        return sql_tool, True
+    
+    return st.session_state.sql_tool, False
 # ============================================================================
 # Tab 1: Data Ingestion
 # ============================================================================
@@ -312,13 +367,6 @@ def tab_structure_analysis():
             st.metric("Questions", len(results['questions']))
         
         st.divider()
-        
-        # Issues
-        if not results['is_clean'] and session.structure_issues:
-            st.subheader("⚠️ Detected Issues")
-            for issue in session.structure_issues:
-                st.warning(f"• {issue}")
-            st.divider()
         
         # Transformations
         if results['transformations']:
@@ -1118,13 +1166,46 @@ def tab_question_collection():
                                 del st.session_state.validation_result
                             if "refinement_answers" in st.session_state:
                                 del st.session_state.refinement_answers
+                            
                             st.rerun()
                         else:
                             st.warning("No changes applied. Please check your answers.")
 
         else:
             st.info("Enter questions and click Validate to see the report.")
-
+    # ============================================================================
+    # CHAT VALIDATION FOR QUESTIONS
+    # ============================================================================
+    if session.question_set and session.question_set.user_questions:
+        # Get cleaned DataFrame
+        selected_source_id = session.current_source_id
+        df_cleaned = st.session_state.cleaned_dfs.get(
+            selected_source_id,
+            st.session_state.clean_dfs.get(
+                selected_source_id,
+                st.session_state.raw_dfs.get(selected_source_id)
+            )
+        )
+        
+        if df_cleaned is not None and session.schema:
+            # Setup SQL tool
+            sql_tool, recreated = setup_sql_tool(session, df_cleaned)
+            if recreated:
+                st.success("✅ SQL database sẵn sàng cho chat!")
+            
+            # Add chat interface
+            add_chat_validation_to_questions_tab(session, df_cleaned, sql_tool)
+            
+            # Optional: Add statistics and export
+            st.divider()
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                render_chat_statistics("questions_validation")
+            with col2:
+                render_export_chat_button("questions_validation")
+        else:
+            st.divider()
+            st.warning("⚠️ Vui lòng hoàn thành Schema Generation (Tab 4) trước khi test")
     st.divider()
     with st.expander("👀 View Current Schema Summary"):
         if session.schema:
@@ -1428,12 +1509,8 @@ def tab_schema_generation():
                     st.success(f"✅ Generated schema for {len(schema)} columns!")
                     st.rerun()
 
-    # ============================================================================
-    # Display Generated Schema
-    # ============================================================================
     if hasattr(st.session_state, 'schema_results') and selected_source_id in st.session_state.schema_results:
         results = st.session_state.schema_results[selected_source_id]
-        # logger.info(f'SCHEMA: {st.session_state.schema_results[selected_source_id]}')
         st.divider()
         st.subheader("📊 Generated Schema")
         def normalize_key(s):
@@ -1443,7 +1520,6 @@ def tab_schema_generation():
             return s.replace('\xa0', ' ').replace(' ', '').lower()
         # Create tabs for each column
         column_names = list(results['schema'].keys())
-        logger.info(f'AVAILIBLE COL NAME IN PROFILES: {results["profiles"].keys()}')
         if column_names:
             tabs = st.tabs(column_names)
             for tab, col_name in zip(tabs, column_names):
@@ -1499,41 +1575,6 @@ def tab_schema_generation():
                     st.subheader("Sample Values")
                     st.write(profile.sample_values[:10])
 
-        # Additional refinement questions (if any)
-        if results.get('questions'):
-            st.divider()
-            st.subheader("💡 Additional Refinement Questions")
-            st.info("These are optional follow-up questions for further refinement")
-
-            for q in results['questions']:
-                with st.expander(f"**{q.question}**"):
-                    st.write(f"**Target:** `{q.target}`")
-                    st.write(f"**Suggested Answer:** {q.suggested_answer or 'N/A'}")
-
-                    # Answer input
-                    answer_key = f"refine_answer_{q.id}"
-                    user_answer = st.text_input(
-                        "Your answer",
-                        value=q.suggested_answer or "",
-                        key=answer_key
-                    )
-
-                    if st.button("✅ Submit Answer", key=f"submit_refine_{q.id}"):
-                        answer = Answer(
-                            question_id=q.id,
-                            answer=user_answer,
-                            timestamp=datetime.now().isoformat()
-                        )
-                        session.answers.append(answer)
-
-                        # Apply answer
-                        engine = RefinementEngine(session)
-                        if engine.apply_answer(answer):
-                            st.success(f"✅ Applied: {user_answer}")
-                            st.rerun()
-# ============================================================================
-# Tab 5: Agent Q&A
-# ============================================================================
 class SQLQueryTool:
     """Tool to execute SQL queries - thread-safe for Streamlit"""
 
@@ -1715,9 +1756,16 @@ def tab_agent_qa():
                     agent.df_cleaned = df_cleaned
                     agent.db_path = sql_tool.db_path
                 
-                # Get response
                 try:
-                    response = agent.chat(user_input)
+                    message_placeholder = st.empty()
+                    full_response = ""
+                    for chunk in agent.query(user_input):
+                        if isinstance(chunk, str):
+                            full_response += chunk
+                            message_placeholder.markdown(full_response + "▌")
+                        
+                    message_placeholder.markdown(full_response)
+                    
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {str(e)}")
@@ -1980,7 +2028,28 @@ def tab_scenario_definition():
                 st.session_state.editing_scenario = False
                 st.session_state.current_scenario = None
                 st.rerun()
-
+    if session.scenarios:
+        selected_source_id = session.current_source_id
+        df_cleaned = st.session_state.cleaned_dfs.get(
+            selected_source_id,
+            st.session_state.clean_dfs.get(
+                selected_source_id,
+                st.session_state.raw_dfs.get(selected_source_id)
+            )
+        )
+        
+        if df_cleaned is not None and session.schema:
+            sql_tool, recreated = setup_sql_tool(session, df_cleaned)
+            if recreated:
+                st.success("✅ SQL database sẵn sàng cho chat!")
+            
+            # Add chat interface
+            add_chat_validation_to_scenarios_tab(session, df_cleaned, sql_tool)
+            
+            st.divider()
+        else:
+            st.divider()
+            st.warning("⚠️ Vui lòng hoàn thành Schema Generation và Data Cleaning trước khi test")
     # Display existing scenarios
     st.divider()
     st.subheader("📚 Saved Scenarios")
@@ -2024,16 +2093,6 @@ def tab_scenario_definition():
         st.divider()
         scenarios_json = {"scenarios": [s.to_dict() for s in session.scenarios]}
         st.download_button("⬇️ Download Scenarios", data=json.dumps(scenarios_json, indent=2), file_name="scenarios.json", mime="application/json")
-
-
-# ============================================================================
-# Tab 8: Export
-# ============================================================================
-
-
-# ============================================================================
-# Main App
-# ============================================================================
 
 def main():
     initialize_session_state()
