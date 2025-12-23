@@ -1019,7 +1019,7 @@ class StructureAnalyzer:
             )
             
             result = json.loads(response.choices[0].message.content)
-            
+            logger.info(f'RESULT: {result}')
             is_clean = result.get("is_clean", False)
             transformations = [Transformation(**t) for t in result.get("transformations", [])]
             questions = [Question(**q) for q in result.get("questions", [])]
@@ -1308,9 +1308,9 @@ class StructureAnalyzer:
   "transformations": [
     {{
       "id": "unique_id",
-      "type": "use_row_as_header",
+      "type": "use_row_as_header" | "rename_columns" | "drop_rows",
       "description": "Human-readable description",
-      "params": {{"row_index": 0}},
+      "params": {{"row_index": 0}}, {{"old": "new"}}, {{"indicies": 2}}
       "confidence": 0.95
     }}
   ],

@@ -1533,7 +1533,6 @@ def tab_schema_generation():
                                 break
                     
                     if profile is None:
-                        from schema_pipeline import ColumnProfile
                         profile = ColumnProfile(
                             name=col_name, pandas_dtype="unknown", inferred_type="unknown",
                             non_null_count=0, null_count=0, null_ratio=0.0, n_unique=0,
