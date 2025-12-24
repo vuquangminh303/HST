@@ -1308,10 +1308,9 @@ class StructureAnalyzer:
   "transformations": [
     {{
       "id": "unique_id",
-      "type": "use_row_as_header" | "rename_columns" | "drop_rows",
+      "type": "use_row_as_header" | "skip_rows" | "drop_columns" | "rename_columns" | "drop_rows",
       "description": "Human-readable description",
-      "params": {{"row_index": 0}}, {{"old": "new"}}, {{"indicies": 2}}
-      "confidence": 0.95
+      "params": {{"row_index": 0}} or {{"rows_to_skip": 2}} or {{"columns": [...]}} or {{"mapping": {{"col_name_pre":"col_name_post"}}}} or {{"indices": 1}} etc,      "confidence": 0.95
     }}
   ],
   "questions": [
@@ -1330,6 +1329,7 @@ class StructureAnalyzer:
 - Look at column names, first row, data types, and null patterns
 - If everything looks good, confidently mark as clean
 - Don't propose unnecessary transformations
+- It's force to have return param related to each transformations such as use_row_as_header must return "row_index"
 """
     
     def _get_structure_system_prompt(self) -> str:
@@ -1382,7 +1382,13 @@ Be precise and confident in your assessment. Always respond in valid JSON format
                 df_result.columns = df_result.iloc[row_idx].astype(str).tolist()
                 df_result = df_result.iloc[row_idx + 1:].reset_index(drop=True)
                 df_result = StructureAnalyzer.validate_and_fix_columns(df_result, f"[{trans.id}] ")
+                for col in df_result.columns:
+                    try:
+                        df_result[col] = pd.to_numeric(df_result[col])
+                    except (ValueError, TypeError):
+                        pass
                 
+                logger.info(f"✓ Applied & Re-inferred types for: {trans.description}")
             elif trans.type == TransformationType.SKIP_ROWS:
                 rows_to_skip = trans.params["rows_to_skip"]
                 df_result = df_result.iloc[rows_to_skip:].reset_index(drop=True)
@@ -1625,7 +1631,13 @@ Always respond in valid JSON format."""
 
 class ProfileGenerator:
     """Generate statistical profiles with smart type inference"""
-    
+    mapping = {
+        'object': 'string',
+        'float32': 'float',
+        'float64': 'float',
+        'int64': 'int',
+        'int32': 'int'
+    }
     @staticmethod
     def generate_profiles(
         df: pd.DataFrame, 
@@ -1665,10 +1677,11 @@ class ProfileGenerator:
 
             # Detect data issues
             data_issues = TypeInferenceEngine.detect_data_issues(series)
-
+            pandas_dtype = str(series.dtype)
+            pandas_dtype = ProfileGenerator.mapping[pandas_dtype]
             profile = ColumnProfile(
                 name=str(col),
-                pandas_dtype=str(series.dtype),
+                pandas_dtype=pandas_dtype,
                 inferred_type=inferred_type,
                 non_null_count=int(non_null),
                 null_count=int(null),
@@ -1856,20 +1869,43 @@ Always respond in valid JSON format. Response in Vietnamese
             result = json.loads(response.choices[0].message.content)
 
             # Create case-insensitive mapping for column names
-            profile_mapping = {col.lower(): col for col in profiles.keys()}
+            import unicodedata
+
+            def normalize_col_name(name):
+                '''Normalize column name for matching'''
+                normalized = unicodedata.normalize('NFKC', str(name))
+                return ' '.join(normalized.lower().split())
+
+            profile_mapping = {normalize_col_name(col): col for col in profiles.keys()}
 
             schema = {}
             for col, spec in result["schema"].items():
-                # Try to find matching column in profiles (case-insensitive)
-                col_lower = col.lower()
-                original_col = profile_mapping.get(col_lower, col)
+                normalized_col = normalize_col_name(col)
+                original_col = profile_mapping.get(normalized_col)
+                
+                if original_col is None:
+                    for profile_col in profiles.keys():
+                        if normalize_col_name(profile_col) == normalized_col:
+                            original_col = profile_col
+                            break
+                        if len(set(normalize_col_name(profile_col)) & set(normalized_col)) > len(normalized_col) * 0.7:
+                            original_col = profile_col
+                            break
+                
+                if original_col is None:
+                    logger.warning(f"Column '{col}' not found in profiles, using default 'object' type")
+                    original_col = col
+                    spec['original_type'] = 'object'
+                else:
+                    spec['original_type'] = profiles[original_col].pandas_dtype
+                
+                spec['name'] = original_col
+                schema[original_col] = ColumnSchema(**spec)
 
-                # Add original_type from profile if found
                 if original_col in profiles:
                     original_type = profiles[original_col].pandas_dtype
                     spec['original_type'] = original_type
                 else:
-                    # Fallback: try to find best match or use 'object' as default
                     logger.warning(f"Column '{col}' not found in profiles, using default 'object' type")
                     spec['original_type'] = 'object'
 

@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 import sqlite3
+import re
 import logging
 
 # Import from pipeline
@@ -19,12 +20,13 @@ from hst_agent import (
 # Import chat validation extension
 from validation_chat_extension import (
     SQLQueryTool,
-    setup_sql_tool,
     add_chat_validation_to_questions_tab,
     add_chat_validation_to_scenarios_tab,
     render_export_chat_button,
     render_chat_statistics
 )
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, message='Could not infer format')
 from dotenv import load_dotenv
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOGLEVEL","INFO").upper())
@@ -139,6 +141,176 @@ def initialize_session_state():
         st.session_state.agent = None
     if 'validation_agent' not in st.session_state:
         st.session_state.validation_agent = None
+    # Multi-table state
+    if 'multi_sql_tool' not in st.session_state:
+        st.session_state.multi_sql_tool = None
+    if 'selected_tables_for_query' not in st.session_state:
+        st.session_state.selected_tables_for_query = []
+
+
+# ============================================================================
+# Multi-Table SQL Query Tool - HỖ TRỢ QUERY NHIỀU BẢNG
+# ============================================================================
+
+class MultiTableSQLQueryTool:
+    """
+    SQL Query Tool hỗ trợ nhiều bảng.
+    Cho phép người dùng query trên nhiều DataFrame/bảng cùng lúc.
+    """
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.tables: Dict[str, Dict[str, Any]] = {}
+        self.conn = None
+        self._create_connection()
+    
+    def _create_connection(self):
+        try:
+            if self.conn:
+                self.conn.close()
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        except Exception as e:
+            raise RuntimeError(f"Failed to create database connection: {str(e)}")
+    
+    def _ensure_connection(self):
+        try:
+            if not self.conn:
+                self._create_connection()
+            self.conn.execute("SELECT 1")
+        except:
+            self._create_connection()
+    
+    def _sanitize_table_name(self, name: str) -> str:
+        """Sanitize table name for SQL"""
+        safe_name = re.sub(r'[^\w]', '_', str(name))
+        if safe_name and safe_name[0].isdigit():
+            safe_name = 't_' + safe_name
+        return safe_name or 'data'
+    
+    def add_table(self, table_name: str, df: pd.DataFrame, schema_info: Dict = None) -> bool:
+        """Thêm hoặc cập nhật một bảng vào database"""
+        try:
+            safe_name = self._sanitize_table_name(table_name)
+            df_hash = hash(str(df.values.tobytes()))
+            
+            self._ensure_connection()
+            df.to_sql(safe_name, self.conn, if_exists='replace', index=False)
+            
+            self.tables[safe_name] = {
+                "df_hash": df_hash,
+                "columns": list(df.columns),
+                "row_count": len(df),
+                "original_name": table_name,
+                "schema_info": schema_info or {}
+            }
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add table '{table_name}': {str(e)}")
+            return False
+    
+    def remove_table(self, table_name: str) -> bool:
+        """Xóa một bảng khỏi database"""
+        try:
+            safe_name = self._sanitize_table_name(table_name)
+            if safe_name not in self.tables:
+                return False
+            self._ensure_connection()
+            self.conn.execute(f"DROP TABLE IF EXISTS [{safe_name}]")
+            del self.tables[safe_name]
+            return True
+        except Exception as e:
+            return False
+    
+    def execute_query(self, query: str) -> tuple:
+        """Thực thi SQL query"""
+        try:
+            if not query.upper().strip().startswith('SELECT'):
+                return pd.DataFrame(), "Chỉ cho phép SELECT queries"
+            self._ensure_connection()
+            result_df = pd.read_sql_query(query, self.conn)
+            return result_df, None
+        except Exception as e:
+            return pd.DataFrame(), f"SQL Error: {str(e)}"
+    
+    def get_tables_info(self) -> Dict[str, Any]:
+        """Lấy thông tin tất cả các bảng"""
+        return {
+            "tables": [
+                {
+                    "name": name,
+                    "original_name": info.get("original_name", name),
+                    "columns": info.get("columns", []),
+                    "row_count": info.get("row_count", 0),
+                }
+                for name, info in self.tables.items()
+            ],
+            "total_tables": len(self.tables)
+        }
+    
+    def close(self):
+        if self.conn:
+            try:
+                self.conn.close()
+            except:
+                pass
+            self.conn = None
+
+
+def setup_multi_table_sql_tool(session, sources_dfs: Dict[str, pd.DataFrame], 
+                                schemas: Dict[str, Dict] = None) -> MultiTableSQLQueryTool:
+    """
+    Setup hoặc cập nhật multi-table SQL tool.
+    
+    Args:
+        session: Session hiện tại
+        sources_dfs: Dict mapping source_id -> DataFrame
+        schemas: Dict mapping source_id -> schema dict (optional)
+    """
+    combined_hash = hash(tuple(
+        hash(str(df.values.tobytes())) 
+        for df in sources_dfs.values()
+    ))
+    
+    need_recreate = False
+    if 'multi_sql_tool' not in st.session_state or st.session_state.multi_sql_tool is None:
+        need_recreate = True
+    elif 'multi_sql_tool_hash' not in st.session_state:
+        need_recreate = True
+    elif st.session_state.multi_sql_tool_hash != combined_hash:
+        need_recreate = True
+    
+    if need_recreate:
+        db_dir = Path("./agent_databases")
+        db_dir.mkdir(exist_ok=True)
+        db_path = db_dir / f"multi_data_{session.session_id}.db"
+        
+        if 'multi_sql_tool' in st.session_state and st.session_state.multi_sql_tool:
+            try:
+                st.session_state.multi_sql_tool.close()
+            except:
+                pass
+        
+        sql_tool = MultiTableSQLQueryTool(str(db_path))
+        
+        for source_id, df in sources_dfs.items():
+            schema_info = {}
+            if schemas and source_id in schemas:
+                schema_info = {
+                    col: {
+                        "description": col_schema.description if hasattr(col_schema, 'description') else "",
+                        "semantic_type": col_schema.semantic_type if hasattr(col_schema, 'semantic_type') else "",
+                    }
+                    for col, col_schema in schemas[source_id].items()
+                }
+            sql_tool.add_table(source_id, df, schema_info)
+        
+        st.session_state.multi_sql_tool = sql_tool
+        st.session_state.multi_sql_tool_hash = combined_hash
+        
+        return sql_tool
+    
+    return st.session_state.multi_sql_tool
+
 def setup_sql_tool(session, df_cleaned):
     """Setup or update SQL tool for validation"""
     current_df_hash = hash(str(df_cleaned.values.tobytes()))
@@ -2093,6 +2265,407 @@ def tab_scenario_definition():
         scenarios_json = {"scenarios": [s.to_dict() for s in session.scenarios]}
         st.download_button("⬇️ Download Scenarios", data=json.dumps(scenarios_json, indent=2), file_name="scenarios.json", mime="application/json")
 
+
+# ============================================================================
+# Tab 7: Multi-Table Agent Q&A - HỖ TRỢ QUERY NHIỀU BẢNG
+# ============================================================================
+
+def tab_agent_qa_multitable():
+    """
+    Enhanced Agent Q&A với khả năng query nhiều bảng.
+    Cho phép người dùng hỏi đáp trên nhiều bảng dữ liệu khác nhau.
+    """
+    st.header("🤖 Agent Q&A - Multi-Table Query")
+    
+    if not st.session_state.session:
+        st.warning("⚠️ Chưa có session. Vui lòng vào tab 'Ingestion' trước.")
+        return
+    
+    session = st.session_state.session
+    
+    # =========================================================================
+    # Phần chọn bảng
+    # =========================================================================
+    st.subheader("📊 Chọn các bảng để Query")
+    
+    available_sources = [s.source_id for s in session.sources]
+    
+    if not available_sources:
+        st.warning("⚠️ Chưa có dữ liệu. Vui lòng import dữ liệu trước.")
+        return
+    
+    # Hiển thị thông tin các bảng có sẵn
+    st.markdown("**Các nguồn dữ liệu có sẵn:**")
+    cols = st.columns(min(len(available_sources), 4))
+    for idx, source_id in enumerate(available_sources):
+        df = st.session_state.cleaned_dfs.get(
+            source_id,
+            st.session_state.clean_dfs.get(
+                source_id,
+                st.session_state.raw_dfs.get(source_id)
+            )
+        )
+        with cols[idx % 4]:
+            if df is not None:
+                st.info(f"**{source_id}**\n\n{len(df)} rows × {len(df.columns)} cols")
+    
+    # Multi-select để chọn bảng
+    selected_tables = st.multiselect(
+        "🔍 Chọn bảng để đưa vào query",
+        options=available_sources,
+        default=available_sources,
+        help="Chọn một hoặc nhiều bảng. Agent có thể query và JOIN chúng."
+    )
+    
+    if not selected_tables:
+        st.warning("⚠️ Vui lòng chọn ít nhất một bảng.")
+        return
+    
+    # =========================================================================
+    # Thu thập DataFrames cho các bảng đã chọn
+    # =========================================================================
+    sources_dfs = {}
+    schemas_dict = {}
+    
+    for source_id in selected_tables:
+        df = st.session_state.cleaned_dfs.get(
+            source_id,
+            st.session_state.clean_dfs.get(
+                source_id,
+                st.session_state.raw_dfs.get(source_id)
+            )
+        )
+        if df is not None:
+            sources_dfs[source_id] = df
+            if session.schema:
+                schemas_dict[source_id] = session.schema
+    
+    if not sources_dfs:
+        st.warning("⚠️ Không có dữ liệu cho các bảng đã chọn.")
+        return
+    
+    # =========================================================================
+    # Hiển thị chi tiết các bảng đã chọn
+    # =========================================================================
+    with st.expander(f"📋 Chi tiết các bảng đã chọn ({len(sources_dfs)} bảng)", expanded=False):
+        for source_id, df in sources_dfs.items():
+            st.markdown(f"**📊 {source_id}**")
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                st.metric("Rows", len(df))
+                st.metric("Columns", len(df.columns))
+            with col2:
+                st.caption(f"Columns: {', '.join(map(str, df.columns[:8]))}{'...' if len(df.columns) > 8 else ''}")
+                safe_display_dataframe(df.head(3), width="stretch")
+            st.markdown("---")
+    
+    # =========================================================================
+    # Setup Multi-Table SQL Tool
+    # =========================================================================
+    with st.spinner("Đang thiết lập SQL database cho nhiều bảng..."):
+        sql_tool = setup_multi_table_sql_tool(session, sources_dfs, schemas_dict)
+    
+    tables_info = sql_tool.get_tables_info()
+    st.success(f"✅ {tables_info['total_tables']} bảng sẵn sàng để query!")
+    
+    # =========================================================================
+    # Hiển thị lịch sử hội thoại
+    # =========================================================================
+    st.divider()
+    st.subheader("💬 Hội thoại")
+    
+    if not session.agent_conversations:
+        st.caption("👋 Bắt đầu bằng cách đặt câu hỏi bên dưới!")
+        st.info("""
+        💡 **Gợi ý cho Multi-Table Query:**
+        
+        - **Một bảng**: "Hiển thị 10 dòng đầu từ [tên_bảng]"
+        - **Join bảng**: "Join bảng employees và departments theo department_id"
+        - **So sánh**: "So sánh tổng doanh thu giữa bảng 1 và bảng 2"
+        - **Tổng hợp**: "Tổng hợp dữ liệu theo category từ tất cả các bảng"
+        """)
+    else:
+        for msg in session.agent_conversations:
+            if msg.role == "user":
+                st.markdown(f"""
+                <div class="chat-message user-message">
+                    <strong>Bạn:</strong><br>{msg.content}
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                badges = ""
+                if msg.context:
+                    if msg.context.get('multi_table'):
+                        badges += " 📊"
+                    if msg.context.get('used_sql'):
+                        badges += " 🔍"
+                
+                st.markdown(f"""
+                <div class="chat-message assistant-message">
+                    <strong>Agent{badges}:</strong><br>{msg.content}
+                </div>
+                """, unsafe_allow_html=True)
+    
+    # =========================================================================
+    # Form nhập câu hỏi
+    # =========================================================================
+    st.divider()
+    
+    with st.form("multi_chat_form", clear_on_submit=True):
+        user_input = st.text_area(
+            "Câu hỏi của bạn:",
+            placeholder="""Ví dụ:
+- Hiển thị 5 dòng đầu từ mỗi bảng
+- Mỗi bảng có bao nhiêu dòng?
+- Các bảng có cột nào chung?
+- Join bảng A và bảng B theo cột X
+- So sánh tổng giữa các bảng""",
+            height=100
+        )
+        
+        col1, col2, col3 = st.columns([1, 1, 3])
+        with col1:
+            submitted = st.form_submit_button("📤 Gửi", type="primary")
+        with col2:
+            clear_chat = st.form_submit_button("🗑️ Xóa chat")
+    
+    if clear_chat:
+        session.agent_conversations = []
+        st.rerun()
+    
+    if submitted and user_input:
+        with st.spinner("Agent đang phân tích câu hỏi của bạn..."):
+            try:
+                response = _query_multi_table_agent(user_input, sql_tool, session)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Lỗi: {str(e)}")
+    
+    # =========================================================================
+    # Quick Queries
+    # =========================================================================
+    st.divider()
+    st.subheader("💡 Query nhanh")
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        if st.button("📊 Danh sách bảng"):
+            st.markdown("**Các bảng có sẵn:**")
+            for table in sql_tool.tables.keys():
+                info = sql_tool.tables[table]
+                st.markdown(f"- **{table}**: {info['row_count']} rows")
+    
+    with col2:
+        if st.button("📈 Số dòng mỗi bảng"):
+            queries = [f"SELECT '{t}' as table_name, COUNT(*) as row_count FROM [{t}]" 
+                      for t in sql_tool.tables.keys()]
+            if queries:
+                result_df, error = sql_tool.execute_query(" UNION ALL ".join(queries))
+                if error:
+                    st.error(error)
+                else:
+                    st.dataframe(result_df, width="stretch")
+    
+    with col3:
+        if st.button("🔍 Xem trước dữ liệu"):
+            for table_name in list(sql_tool.tables.keys())[:3]:
+                result_df, error = sql_tool.execute_query(f"SELECT * FROM [{table_name}] LIMIT 5")
+                if not error:
+                    st.write(f"**{table_name}:**")
+                    st.dataframe(result_df, width="stretch")
+    
+    with col4:
+        if st.button("📋 Danh sách cột"):
+            for table_name, info in sql_tool.tables.items():
+                st.markdown(f"**{table_name}:**")
+                st.code(", ".join(map(str, info['columns'])))
+    
+    # =========================================================================
+    # Direct SQL Query Section
+    # =========================================================================
+    st.divider()
+    st.subheader("🔍 SQL Query trực tiếp")
+    
+    with st.expander("Thực thi SQL tùy chỉnh (Nâng cao)", expanded=False):
+        st.markdown("**📊 Các bảng có sẵn:**")
+        for table_name, info in sql_tool.tables.items():
+            cols_preview = ', '.join(map(str, info['columns'][:6]))
+            if len(info['columns']) > 6:
+                cols_preview += f" ... (+{len(info['columns']) - 6} cột nữa)"
+            st.caption(f"• `{table_name}` ({info['row_count']} rows): {cols_preview}")
+        
+        st.markdown("---")
+        
+        default_query = f"SELECT * FROM [{list(sql_tool.tables.keys())[0]}] LIMIT 10" if sql_tool.tables else "SELECT 1"
+        
+        sql_query = st.text_area(
+            "SQL Query",
+            value=default_query,
+            height=150,
+            help="""
+            Tips:
+            - Dùng [table_name] cho tên bảng có ký tự đặc biệt
+            - JOIN: SELECT * FROM [t1] JOIN [t2] ON t1.id = t2.ref_id
+            - UNION: SELECT * FROM [t1] UNION SELECT * FROM [t2]
+            """
+        )
+        
+        if st.button("▶️ Thực thi SQL", type="primary"):
+            result_df, error = sql_tool.execute_query(sql_query)
+            
+            if error:
+                st.error(error)
+            else:
+                st.success(f"✅ Query trả về {len(result_df)} dòng")
+                safe_display_dataframe(result_df, width="stretch")
+                
+                csv = result_df.to_csv(index=False)
+                st.download_button("📥 Tải CSV", csv, "query_result.csv", "text/csv")
+
+
+def _query_multi_table_agent(question: str, sql_tool: MultiTableSQLQueryTool, session) -> str:
+    """Query agent với multi-table context"""
+    from openai import OpenAI
+    
+    client = OpenAI(api_key=st.session_state.api_key)
+    
+    # Build context
+    context_parts = ["**📊 Các bảng có sẵn:**"]
+    for table_name, info in sql_tool.tables.items():
+        cols_preview = ', '.join(map(str, info['columns'][:10]))
+        if len(info['columns']) > 10:
+            cols_preview += f", ... (+{len(info['columns']) - 10} cột)"
+        context_parts.append(f"- **{table_name}** ({info['row_count']} rows): {cols_preview}")
+    
+    if session.schema:
+        context_parts.append("\n**📋 Chi tiết schema:**")
+        for col_name, col_schema in list(session.schema.items())[:15]:
+            if hasattr(col_schema, 'semantic_type') and hasattr(col_schema, 'description'):
+                desc = col_schema.description[:50] if col_schema.description else ''
+                context_parts.append(f"- {col_name}: {col_schema.semantic_type} - {desc}")
+    
+    if session.question_set and session.question_set.additional_notes:
+        context_parts.append(f"\n**⚠️ Business Rules:**\n{session.question_set.additional_notes}")
+    
+    # Add scenarios if available
+    if session.scenarios:
+        scenarios_text = "\n**🎯 Defined Scenarios:**"
+        for sc in session.scenarios:
+            scenarios_text += f"\n- {sc.name}: {', '.join(sc.questions[:2])}..."
+        context_parts.append(scenarios_text)
+    
+    context = "\n".join(context_parts)
+    
+    # System prompt
+    system_prompt = """Bạn là một data analyst thông minh với khả năng query SQL trên NHIỀU BẢNG.
+
+🚨 **MULTI-TABLE SUPPORT** 🚨
+
+Bạn có thể:
+- Query từng bảng riêng lẻ
+- JOIN nhiều bảng với nhau
+- UNION để gộp kết quả
+- So sánh dữ liệu giữa các bảng
+
+**SQL Guidelines:**
+- Dùng [table_name] cho tên bảng
+- Dùng table.column khi JOIN để tránh nhầm lẫn
+- Chỉ SELECT queries được phép
+
+**Ví dụ:**
+- `SELECT * FROM [employees] LIMIT 5`
+- `SELECT * FROM [t1] JOIN [t2] ON t1.id = t2.ref_id`
+- `SELECT 'T1' as src, COUNT(*) FROM [t1] UNION SELECT 'T2', COUNT(*) FROM [t2]`
+
+LUÔN TRẢ LỜI BẰNG TIẾNG VIỆT.
+Khi cần dữ liệu, hãy dùng tool execute_sql_query."""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": f"**Context:**\n{context}\n\n**Câu hỏi:**\n{question}"}
+    ]
+    
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "execute_sql_query",
+            "description": f"Thực thi SQL SELECT query. Các bảng: {', '.join(sql_tool.tables.keys())}",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "SQL SELECT query"}
+                },
+                "required": ["query"]
+            }
+        }
+    }]
+    
+    response = client.chat.completions.create(
+        model=st.session_state.get('model', 'gpt-4o-mini'),
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        temperature=0.7,
+        max_tokens=1500
+    )
+    
+    assistant_msg = response.choices[0].message
+    
+    if assistant_msg.tool_calls:
+        sql_results = []
+        
+        for tool_call in assistant_msg.tool_calls:
+            if tool_call.function.name == "execute_sql_query":
+                args = json.loads(tool_call.function.arguments)
+                query = args.get("query", "")
+                
+                logger.info(f"Executing SQL: {query}")
+                result_df, error = sql_tool.execute_query(query)
+                
+                if error:
+                    sql_results.append(f"❌ SQL Error: {error}")
+                else:
+                    if len(result_df) == 0:
+                        sql_results.append("Query không trả về kết quả")
+                    else:
+                        result_text = f"Kết quả ({len(result_df)} dòng):\n```\n{result_df.head(20).to_string(index=False)}\n```"
+                        if len(result_df) > 20:
+                            result_text += f"\n(Hiển thị 20/{len(result_df)} dòng)"
+                        sql_results.append(result_text)
+        
+        result_summary = "\n\n".join(sql_results)
+        
+        final_response = client.chat.completions.create(
+            model=st.session_state.get('model', 'gpt-4o-mini'),
+            messages=[
+                {"role": "system", "content": "Bạn là data analyst. Phân tích kết quả SQL và trả lời bằng tiếng Việt. Hãy ngắn gọn nhưng đầy đủ."},
+                {"role": "user", "content": f"Câu hỏi: {question}\n\nKết quả:\n{result_summary}\n\nHãy phân tích và trả lời:"}
+            ],
+            temperature=0.7,
+            max_tokens=1000
+        )
+        
+        final_text = final_response.choices[0].message.content
+    else:
+        final_text = assistant_msg.content or ""
+    
+    # Ghi vào session
+    session.agent_conversations.append(AgentMessage(
+        role="user",
+        content=question,
+        timestamp=datetime.now().isoformat()
+    ))
+    session.agent_conversations.append(AgentMessage(
+        role="assistant",
+        content=final_text,
+        timestamp=datetime.now().isoformat(),
+        context={"used_sql": bool(assistant_msg.tool_calls), "multi_table": True}
+    ))
+    
+    return final_text
+
+
 def main():
     initialize_session_state()
     
@@ -2103,7 +2676,7 @@ def main():
         "📋 Schema Generation",
         "❓ Question Collection",
         "🎯 Scenarios",
-        "🤖 Agent Q&A"
+        "🤖 Agent Q&A (Multi-Table)"
     ])
 
     with tabs[0]:
@@ -2125,6 +2698,7 @@ def main():
         tab_scenario_definition()
 
     with tabs[6]:
-        tab_agent_qa()
+        tab_agent_qa_multitable()
+
 if __name__ == "__main__":
     main()
