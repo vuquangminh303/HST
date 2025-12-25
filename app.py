@@ -20,13 +20,12 @@ from hst_agent import (
 # Import chat validation extension
 from validation_chat_extension import (
     SQLQueryTool,
+    setup_sql_tool,
     add_chat_validation_to_questions_tab,
     add_chat_validation_to_scenarios_tab,
     render_export_chat_button,
     render_chat_statistics
 )
-import warnings
-warnings.filterwarnings('ignore', category=UserWarning, message='Could not infer format')
 from dotenv import load_dotenv
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOGLEVEL","INFO").upper())
@@ -312,6 +311,7 @@ def setup_multi_table_sql_tool(session, sources_dfs: Dict[str, pd.DataFrame],
     return st.session_state.multi_sql_tool
 
 def setup_sql_tool(session, df_cleaned):
+
     """Setup or update SQL tool for validation"""
     current_df_hash = hash(str(df_cleaned.values.tobytes()))
     
@@ -2233,7 +2233,7 @@ def tab_scenario_definition():
                 col_info, col_actions = st.columns([3, 1])
                 with col_info:
                     st.write(f"**Description:** {scenario.description or 'N/A'}")
-                    st.write(f"**Selected Fields:** `{', '.join(scenario.selected_fields)}`")
+                    st.write(f"**Selected Fields:** `{', '.join(str(f) for f in scenario.selected_fields)}`")
                     
                     st.write("**Questions:**")
                     for q in scenario.questions:
@@ -2355,8 +2355,9 @@ def tab_agent_qa_multitable():
                 st.metric("Rows", len(df))
                 st.metric("Columns", len(df.columns))
             with col2:
-                st.caption(f"Columns: {', '.join(map(str, df.columns[:8]))}{'...' if len(df.columns) > 8 else ''}")
-                safe_display_dataframe(df.head(3), width="stretch")
+                cols_str = [str(c) for c in df.columns[:8]]
+                st.caption(f"Columns: {', '.join(cols_str)}{'...' if len(df.columns) > 8 else ''}")
+                safe_display_dataframe(df.head(3), use_container_width=True)
             st.markdown("---")
     
     # =========================================================================
@@ -2465,7 +2466,7 @@ def tab_agent_qa_multitable():
                 if error:
                     st.error(error)
                 else:
-                    st.dataframe(result_df, width="stretch")
+                    st.dataframe(result_df, use_container_width=True)
     
     with col3:
         if st.button("🔍 Xem trước dữ liệu"):
@@ -2473,13 +2474,72 @@ def tab_agent_qa_multitable():
                 result_df, error = sql_tool.execute_query(f"SELECT * FROM [{table_name}] LIMIT 5")
                 if not error:
                     st.write(f"**{table_name}:**")
-                    st.dataframe(result_df, width="stretch")
+                    st.dataframe(result_df, use_container_width=True)
     
     with col4:
         if st.button("📋 Danh sách cột"):
             for table_name, info in sql_tool.tables.items():
                 st.markdown(f"**{table_name}:**")
-                st.code(", ".join(map(str, info['columns'])))
+                st.code(", ".join(str(c) for c in info['columns']))
+    
+    # =========================================================================
+    # Câu hỏi từ Question Collection và Scenarios
+    # =========================================================================
+    
+    # Hiển thị câu hỏi từ Question Collection
+    if session.question_set and session.question_set.user_questions:
+        st.divider()
+        st.subheader("❓ Câu hỏi từ Question Collection")
+        st.caption("Click vào câu hỏi để test ngay")
+        
+        user_questions = [q.question for q in session.question_set.user_questions]
+        cols = st.columns(min(3, len(user_questions)))
+        
+        for i, q in enumerate(user_questions[:9]):  # Max 9 questions
+            with cols[i % 3]:
+                btn_label = q[:40] + "..." if len(q) > 40 else q
+                if st.button(f"💬 {btn_label}", key=f"qc_q_{i}"):
+                    with st.spinner("Agent đang xử lý..."):
+                        try:
+                            response = _query_multi_table_agent(q, sql_tool, session)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Lỗi: {str(e)}")
+    
+    # Hiển thị câu hỏi từ Scenarios
+    if session.scenarios:
+        st.divider()
+        st.subheader("🎯 Câu hỏi từ Scenarios")
+        
+        # Select scenario
+        scenario_names = [s.name for s in session.scenarios]
+        selected_scenario_name = st.selectbox(
+            "Chọn scenario:",
+            options=scenario_names,
+            key="qa_scenario_select"
+        )
+        
+        selected_scenario = next(
+            (s for s in session.scenarios if s.name == selected_scenario_name),
+            None
+        )
+        
+        if selected_scenario:
+            st.caption(f"📋 {selected_scenario.description or 'Không có mô tả'}")
+            st.caption(f"📊 Các trường: {', '.join(selected_scenario.selected_fields[:5])}...")
+            
+            # Display scenario questions
+            cols = st.columns(min(3, len(selected_scenario.questions)))
+            for i, q in enumerate(selected_scenario.questions[:9]):
+                with cols[i % 3]:
+                    btn_label = q[:40] + "..." if len(q) > 40 else q
+                    if st.button(f"🎯 {btn_label}", key=f"sc_q_{selected_scenario.id}_{i}"):
+                        with st.spinner("Agent đang xử lý theo scenario..."):
+                            try:
+                                response = _query_multi_table_agent(q, sql_tool, session)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Lỗi: {str(e)}")
     
     # =========================================================================
     # Direct SQL Query Section
@@ -2490,7 +2550,7 @@ def tab_agent_qa_multitable():
     with st.expander("Thực thi SQL tùy chỉnh (Nâng cao)", expanded=False):
         st.markdown("**📊 Các bảng có sẵn:**")
         for table_name, info in sql_tool.tables.items():
-            cols_preview = ', '.join(map(str, info['columns'][:6]))
+            cols_preview = ', '.join(str(c) for c in info['columns'][:6])
             if len(info['columns']) > 6:
                 cols_preview += f" ... (+{len(info['columns']) - 6} cột nữa)"
             st.caption(f"• `{table_name}` ({info['row_count']} rows): {cols_preview}")
@@ -2518,67 +2578,118 @@ def tab_agent_qa_multitable():
                 st.error(error)
             else:
                 st.success(f"✅ Query trả về {len(result_df)} dòng")
-                safe_display_dataframe(result_df, width="stretch")
+                safe_display_dataframe(result_df, use_container_width=True)
                 
                 csv = result_df.to_csv(index=False)
                 st.download_button("📥 Tải CSV", csv, "query_result.csv", "text/csv")
 
 
 def _query_multi_table_agent(question: str, sql_tool: MultiTableSQLQueryTool, session) -> str:
-    """Query agent với multi-table context"""
+    """Query agent với multi-table context, bao gồm scenarios và question sets"""
     from openai import OpenAI
     
     client = OpenAI(api_key=st.session_state.api_key)
     
-    # Build context
-    context_parts = ["**📊 Các bảng có sẵn:**"]
+    # =========================================================================
+    # Build comprehensive context
+    # =========================================================================
+    context_parts = []
+    
+    # 1. Tables info
+    context_parts.append("**📊 CÁC BẢNG DỮ LIỆU:**")
     for table_name, info in sql_tool.tables.items():
-        cols_preview = ', '.join(map(str, info['columns'][:10]))
+        cols_preview = ', '.join(str(c) for c in info['columns'][:10])
         if len(info['columns']) > 10:
             cols_preview += f", ... (+{len(info['columns']) - 10} cột)"
         context_parts.append(f"- **{table_name}** ({info['row_count']} rows): {cols_preview}")
     
+    # 2. Schema details
     if session.schema:
-        context_parts.append("\n**📋 Chi tiết schema:**")
-        for col_name, col_schema in list(session.schema.items())[:15]:
+        context_parts.append("\n**📋 CHI TIẾT SCHEMA:**")
+        for col_name, col_schema in list(session.schema.items())[:20]:
             if hasattr(col_schema, 'semantic_type') and hasattr(col_schema, 'description'):
-                desc = col_schema.description[:50] if col_schema.description else ''
-                context_parts.append(f"- {col_name}: {col_schema.semantic_type} - {desc}")
+                desc = col_schema.description[:80] if col_schema.description else ''
+                unit = f" (đơn vị: {col_schema.unit})" if hasattr(col_schema, 'unit') and col_schema.unit else ''
+                context_parts.append(f"- {col_name}: {col_schema.semantic_type}{unit} - {desc}")
     
+    # 3. Business Rules / Additional Notes (QUAN TRỌNG)
     if session.question_set and session.question_set.additional_notes:
-        context_parts.append(f"\n**⚠️ Business Rules:**\n{session.question_set.additional_notes}")
+        context_parts.append(f"\n**⚠️ QUY TẮC NGHIỆP VỤ (BẮT BUỘC TUÂN THEO):**\n{session.question_set.additional_notes}")
     
-    # Add scenarios if available
+    # 4. User Questions từ Question Collection
+    if session.question_set and session.question_set.user_questions:
+        context_parts.append("\n**❓ CÁC CÂU HỎI ĐÃ ĐỊNH NGHĨA:**")
+        for i, uq in enumerate(session.question_set.user_questions[:10], 1):
+            context_parts.append(f"{i}. {uq.question}")
+            if uq.description:
+                context_parts.append(f"   → Mô tả: {uq.description}")
+    
+    # 5. Output Fields từ Question Collection
+    if session.question_set and session.question_set.output_fields:
+        context_parts.append("\n**📤 CÁC TRƯỜNG OUTPUT MONG MUỐN:**")
+        for of in session.question_set.output_fields:
+            required = "(bắt buộc)" if of.required else "(tùy chọn)"
+            context_parts.append(f"- {of.field_name} [{of.data_type}] {required}: {of.description}")
+    
+    # 6. Scenarios (ĐẦY ĐỦ CHI TIẾT)
     if session.scenarios:
-        scenarios_text = "\n**🎯 Defined Scenarios:**"
+        context_parts.append("\n**🎯 CÁC SCENARIO ĐÃ ĐỊNH NGHĨA (PHẢI TUÂN THEO KHI CÂU HỎI KHỚP):**")
         for sc in session.scenarios:
-            scenarios_text += f"\n- {sc.name}: {', '.join(sc.questions[:2])}..."
-        context_parts.append(scenarios_text)
+            context_parts.append(f"\n--- Scenario: {sc.name} ---")
+            if sc.description:
+                context_parts.append(f"Mô tả: {sc.description}")
+            context_parts.append(f"Các trường liên quan: {', '.join(str(f) for f in sc.selected_fields)}")
+            context_parts.append("Các câu hỏi mẫu:")
+            for q in sc.questions:
+                context_parts.append(f"  • {q}")
+            
+            # Output format
+            if sc.output_format:
+                if isinstance(sc.output_format, dict):
+                    if sc.output_format.get("type") == "text_description" or "description" in sc.output_format:
+                        context_parts.append(f"Format output: {sc.output_format.get('description', '')}")
+                    else:
+                        context_parts.append(f"Format output (JSON): {json.dumps(sc.output_format, ensure_ascii=False)}")
+            
+            # Example if available
+            if sc.example_input:
+                context_parts.append(f"Ví dụ input: {json.dumps(sc.example_input, ensure_ascii=False)}")
+            if sc.example_output:
+                context_parts.append(f"Ví dụ output: {json.dumps(sc.example_output, ensure_ascii=False)}")
     
     context = "\n".join(context_parts)
     
-    # System prompt
+    # =========================================================================
+    # Build comprehensive system prompt
+    # =========================================================================
     system_prompt = """Bạn là một data analyst thông minh với khả năng query SQL trên NHIỀU BẢNG.
 
-🚨 **MULTI-TABLE SUPPORT** 🚨
+🚨 **NGUYÊN TẮC QUAN TRỌNG - ĐỌC KỸ:** 🚨
 
-Bạn có thể:
-- Query từng bảng riêng lẻ
-- JOIN nhiều bảng với nhau
-- UNION để gộp kết quả
-- So sánh dữ liệu giữa các bảng
+1. **SCENARIO MATCHING (ƯU TIÊN CAO NHẤT)**:
+   - Khi nhận câu hỏi, KIỂM TRA xem nó có khớp với scenario nào không
+   - Nếu khớp → PHẢI tuân theo format output của scenario đó
+   - Nếu scenario có ví dụ → Làm theo cấu trúc ví dụ
 
-**SQL Guidelines:**
-- Dùng [table_name] cho tên bảng
-- Dùng table.column khi JOIN để tránh nhầm lẫn
-- Chỉ SELECT queries được phép
+2. **BUSINESS RULES (BẮT BUỘC)**:
+   - Nếu có "Quy tắc nghiệp vụ" trong context → PHẢI áp dụng
+   - Ví dụ: nếu có công thức tính lương thực lĩnh → dùng công thức đó
 
-**Ví dụ:**
-- `SELECT * FROM [employees] LIMIT 5`
-- `SELECT * FROM [t1] JOIN [t2] ON t1.id = t2.ref_id`
-- `SELECT 'T1' as src, COUNT(*) FROM [t1] UNION SELECT 'T2', COUNT(*) FROM [t2]`
+3. **MULTI-TABLE QUERY**:
+   - Dùng [table_name] cho tên bảng
+   - Dùng table.column khi JOIN để tránh nhầm lẫn
+   - Có thể JOIN, UNION nhiều bảng
 
-LUÔN TRẢ LỜI BẰNG TIẾNG VIỆT.
+4. **SQL Guidelines**:
+   - Chỉ SELECT queries được phép
+   - Ví dụ: `SELECT * FROM [employees] LIMIT 5`
+   - JOIN: `SELECT * FROM [t1] JOIN [t2] ON t1.id = t2.ref_id`
+
+5. **RESPONSE FORMAT**:
+   - LUÔN trả lời bằng TIẾNG VIỆT
+   - Nếu có scenario output format → tuân theo format đó
+   - Nếu không có → trả lời tự nhiên, rõ ràng
+
 Khi cần dữ liệu, hãy dùng tool execute_sql_query."""
 
     messages = [
@@ -2590,7 +2701,7 @@ Khi cần dữ liệu, hãy dùng tool execute_sql_query."""
         "type": "function",
         "function": {
             "name": "execute_sql_query",
-            "description": f"Thực thi SQL SELECT query. Các bảng: {', '.join(sql_tool.tables.keys())}",
+            "description": f"Thực thi SQL SELECT query trên các bảng: {', '.join(sql_tool.tables.keys())}. Dùng [table_name] cho tên bảng.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2607,7 +2718,7 @@ Khi cần dữ liệu, hãy dùng tool execute_sql_query."""
         tools=tools,
         tool_choice="auto",
         temperature=0.7,
-        max_tokens=1500
+        max_tokens=2000
     )
     
     assistant_msg = response.choices[0].message
@@ -2636,14 +2747,38 @@ Khi cần dữ liệu, hãy dùng tool execute_sql_query."""
         
         result_summary = "\n\n".join(sql_results)
         
+        # Build analysis prompt với scenarios context
+        analysis_prompt = f"""Câu hỏi: {question}
+
+Kết quả SQL:
+{result_summary}
+
+"""
+        # Thêm scenario context nếu có
+        if session.scenarios:
+            analysis_prompt += "\n**Lưu ý về Scenarios:**\n"
+            for sc in session.scenarios:
+                # Check if question matches any scenario question
+                for sq in sc.questions:
+                    if any(word in question.lower() for word in sq.lower().split()[:3]):
+                        if sc.output_format:
+                            fmt = sc.output_format.get('description', '') if isinstance(sc.output_format, dict) else str(sc.output_format)
+                            analysis_prompt += f"- Nếu khớp scenario '{sc.name}', format output: {fmt}\n"
+                        break
+        
+        if session.question_set and session.question_set.additional_notes:
+            analysis_prompt += f"\n**Business Rules cần áp dụng:**\n{session.question_set.additional_notes}\n"
+        
+        analysis_prompt += "\nHãy phân tích kết quả và trả lời câu hỏi. Tuân theo format của scenario nếu có."
+        
         final_response = client.chat.completions.create(
             model=st.session_state.get('model', 'gpt-4o-mini'),
             messages=[
-                {"role": "system", "content": "Bạn là data analyst. Phân tích kết quả SQL và trả lời bằng tiếng Việt. Hãy ngắn gọn nhưng đầy đủ."},
-                {"role": "user", "content": f"Câu hỏi: {question}\n\nKết quả:\n{result_summary}\n\nHãy phân tích và trả lời:"}
+                {"role": "system", "content": "Bạn là data analyst. Phân tích kết quả SQL và trả lời bằng tiếng Việt. Nếu có scenario output format, tuân theo format đó."},
+                {"role": "user", "content": analysis_prompt}
             ],
             temperature=0.7,
-            max_tokens=1000
+            max_tokens=1500
         )
         
         final_text = final_response.choices[0].message.content

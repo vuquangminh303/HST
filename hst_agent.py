@@ -2343,7 +2343,7 @@ When you need to query data, use the execute_sql_query tool."""
                 if assistant_msg.tool_calls:
                     for chunk in self._handle_tool_calls(assistant_msg, question):
                         final_text += chunk
-                        buffered = buffer.add(char)
+                        buffered = buffer.add(chunk)
                         if buffered:
                             yield chunk
                     remaining = buffer.flush()

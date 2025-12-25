@@ -162,6 +162,37 @@ def render_chat_message(role: str, content: str, timestamp: str = None):
         """, unsafe_allow_html=True)
 
 
+def stream_agent_response(agent, question: str, placeholder):
+    """
+    Stream response từ agent với st.write_stream style
+    
+    Args:
+        agent: DataSchemaAgent instance
+        question: User question
+        placeholder: Streamlit placeholder để hiển thị streaming
+    
+    Returns:
+        Full response text
+    """
+    full_response = ""
+    try:
+        # Sử dụng generator query() thay vì chat()
+        for chunk in agent.query(question):
+            if isinstance(chunk, dict):
+                # Metadata, skip
+                continue
+            full_response += chunk
+            placeholder.markdown(full_response + "▌")
+        
+        # Hiển thị kết quả cuối cùng không có cursor
+        placeholder.markdown(full_response)
+        return full_response
+    except Exception as e:
+        error_msg = f"❌ Lỗi: {str(e)}"
+        placeholder.markdown(error_msg)
+        return error_msg
+
+
 def render_chat_interface(
     session,
     agent,
@@ -170,7 +201,7 @@ def render_chat_interface(
     quick_questions: List[str] = None
 ):
     """
-    Render chat interface for validation
+    Render chat interface for validation with STREAMING support
     
     Args:
         session: Session object
@@ -194,39 +225,40 @@ def render_chat_interface(
     
     st.divider()
     
-    # Chat input form
-    with st.form(key=f"chat_form_{context_key}", clear_on_submit=True):
-        user_input = st.text_area(
-            "Câu hỏi của bạn:",
-            placeholder=placeholder_text,
-            height=100,
-            key=f"chat_input_{context_key}"
-        )
+    # Chat input - KHÔNG dùng form để có thể streaming
+    user_input = st.text_area(
+        "Câu hỏi của bạn:",
+        placeholder=placeholder_text,
+        height=100,
+        key=f"chat_input_{context_key}"
+    )
+    
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        submitted = st.button("📤 Gửi", type="primary", key=f"btn_send_{context_key}")
+    with col2:
+        clear = st.button("🗑️ Xóa lịch sử", key=f"btn_clear_{context_key}")
+    
+    if clear:
+        clear_chat_history(context_key)
+        st.rerun()
+    
+    if submitted and user_input.strip():
+        # Add user message to history
+        add_to_chat_history(context_key, "user", user_input.strip())
         
-        col1, col2, col3 = st.columns([1, 1, 2])
-        with col1:
-            submitted = st.form_submit_button("📤 Gửi", type="primary")
-        with col2:
-            clear = st.form_submit_button("🗑️ Xóa lịch sử")
+        # Hiển thị user message
+        render_chat_message("user", user_input.strip())
         
-        if clear:
-            clear_chat_history(context_key)
-            st.rerun()
+        # Streaming response
+        st.markdown("**Agent:**")
+        response_placeholder = st.empty()
         
-        if submitted and user_input.strip():
-            # Add user message to history
-            add_to_chat_history(context_key, "user", user_input.strip())
-            
-            # Get response from agent
-            with st.spinner("Agent đang suy nghĩ..."):
-                try:
-                    response = agent.chat(user_input.strip())
-                    add_to_chat_history(context_key, "assistant", response)
-                except Exception as e:
-                    error_msg = f"Lỗi: {str(e)}"
-                    add_to_chat_history(context_key, "assistant", error_msg)
-            
-            st.rerun()
+        response = stream_agent_response(agent, user_input.strip(), response_placeholder)
+        add_to_chat_history(context_key, "assistant", response)
+        
+        # Rerun để clear input
+        st.rerun()
     
     # Quick questions (if provided)
     if quick_questions:
@@ -234,20 +266,35 @@ def render_chat_interface(
         st.markdown("### 💡 Câu hỏi gợi ý")
         st.caption("Click vào câu hỏi để thử ngay")
         
+        # Lưu câu hỏi được chọn vào session state
+        quick_q_key = f"selected_quick_q_{context_key}"
+        
         cols = st.columns(min(3, len(quick_questions)))
         for i, q in enumerate(quick_questions[:6]):  # Max 6 quick questions
             with cols[i % 3]:
-                if st.button(f"💬 {q[:30]}...", key=f"quick_{context_key}_{i}"):
-                    # Add to history and get response
-                    add_to_chat_history(context_key, "user", q)
-                    with st.spinner("Agent đang suy nghĩ..."):
-                        try:
-                            response = agent.chat(q)
-                            add_to_chat_history(context_key, "assistant", response)
-                        except Exception as e:
-                            error_msg = f"Lỗi: {str(e)}"
-                            add_to_chat_history(context_key, "assistant", error_msg)
-                    st.rerun()
+                btn_label = q[:35] + "..." if len(q) > 35 else q
+                if st.button(f"💬 {btn_label}", key=f"quick_{context_key}_{i}"):
+                    st.session_state[quick_q_key] = q
+        
+        # Xử lý câu hỏi được chọn
+        if quick_q_key in st.session_state and st.session_state[quick_q_key]:
+            selected_q = st.session_state[quick_q_key]
+            st.session_state[quick_q_key] = None  # Clear
+            
+            # Add to history
+            add_to_chat_history(context_key, "user", selected_q)
+            
+            # Hiển thị
+            render_chat_message("user", selected_q)
+            
+            # Streaming response
+            st.markdown("**Agent:**")
+            response_placeholder = st.empty()
+            
+            response = stream_agent_response(agent, selected_q, response_placeholder)
+            add_to_chat_history(context_key, "assistant", response)
+            
+            st.rerun()
 
 
 # ============================================================================
@@ -270,18 +317,24 @@ def add_chat_validation_to_questions_tab(session, df_cleaned, sql_tool):
         st.info("📝 Thêm câu hỏi ở phần trên, sau đó quay lại đây để test!")
         return
     
-    # Initialize agent
+    # Initialize agent with df_cleaned and sql_tool
     if 'validation_agent' not in st.session_state or st.session_state.validation_agent is None:
         from hst_agent import DataSchemaAgent
         agent = DataSchemaAgent(
             session,
             st.session_state.api_key,
-            st.session_state.model
+            st.session_state.model,
+            df_cleaned=df_cleaned,
+            sql_tool=sql_tool
         )
-        if sql_tool:
+        st.session_state.validation_agent = agent
+    else:
+        # Update existing agent with current sql_tool if needed
+        agent = st.session_state.validation_agent
+        if sql_tool and agent.sql_tool != sql_tool:
             agent.sql_tool = sql_tool
             agent.db_path = sql_tool.db_path
-        st.session_state.validation_agent = agent
+            agent.df_cleaned = df_cleaned
     
     agent = st.session_state.validation_agent
     
@@ -322,18 +375,24 @@ def add_chat_validation_to_scenarios_tab(session, df_cleaned, sql_tool):
         st.info("📝 Tạo scenario ở phần trên, sau đó quay lại đây để test!")
         return
     
-    # Initialize agent
+    # Initialize agent with df_cleaned and sql_tool
     if 'validation_agent' not in st.session_state or st.session_state.validation_agent is None:
         from hst_agent import DataSchemaAgent
         agent = DataSchemaAgent(
             session,
             st.session_state.api_key,
-            st.session_state.model
+            st.session_state.model,
+            df_cleaned=df_cleaned,
+            sql_tool=sql_tool
         )
-        if sql_tool:
+        st.session_state.validation_agent = agent
+    else:
+        # Update existing agent with current sql_tool if needed
+        agent = st.session_state.validation_agent
+        if sql_tool and agent.sql_tool != sql_tool:
             agent.sql_tool = sql_tool
             agent.db_path = sql_tool.db_path
-        st.session_state.validation_agent = agent
+            agent.df_cleaned = df_cleaned
     
     agent = st.session_state.validation_agent
     
@@ -388,22 +447,23 @@ def add_chat_validation_to_scenarios_tab(session, df_cleaned, sql_tool):
             st.caption("Test tất cả câu hỏi trong scenario một lần")
         with col2:
             if st.button("▶️ Test All Questions", type="primary", key="auto_test_scenario"):
-                with st.spinner("Đang test tất cả câu hỏi..."):
-                    # Clear current chat
-                    clear_chat_history(context_key)
+                # Clear current chat
+                clear_chat_history(context_key)
+                
+                # Test each question với streaming
+                for i, question in enumerate(selected_scenario.questions):
+                    st.markdown(f"**[Q{i+1}] {question}**")
+                    add_to_chat_history(context_key, "user", f"[Q{i+1}] {question}")
                     
-                    # Test each question
-                    for i, question in enumerate(selected_scenario.questions):
-                        add_to_chat_history(context_key, "user", f"[Q{i+1}] {question}")
-                        try:
-                            response = agent.chat(question)
-                            add_to_chat_history(context_key, "assistant", response)
-                        except Exception as e:
-                            error_msg = f"Lỗi: {str(e)}"
-                            add_to_chat_history(context_key, "assistant", error_msg)
+                    # Streaming response
+                    response_placeholder = st.empty()
+                    response = stream_agent_response(agent, question, response_placeholder)
+                    add_to_chat_history(context_key, "assistant", response)
                     
-                    st.success(f"✅ Đã test {len(selected_scenario.questions)} câu hỏi!")
-                    st.rerun()
+                    st.markdown("---")
+                
+                st.success(f"✅ Đã test {len(selected_scenario.questions)} câu hỏi!")
+                st.rerun()
 
 
 # ============================================================================
