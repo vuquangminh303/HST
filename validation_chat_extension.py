@@ -176,10 +176,8 @@ def stream_agent_response(agent, question: str, placeholder):
     """
     full_response = ""
     try:
-        # Sử dụng generator query() thay vì chat()
         for chunk in agent.query(question):
             if isinstance(chunk, dict):
-                # Metadata, skip
                 continue
             full_response += chunk
             placeholder.markdown(full_response + "▌")
