@@ -6,13 +6,16 @@ on:
       - main
     tags:
       - 'v*'
+
 jobs:
   release:
-    runs-on: ubuntu-lastest
-
+    # TYPO FIX 1: Changed 'ubuntu-lastest' to 'ubuntu-latest'
+    runs-on: ubuntu-latest
+    
     steps:
+      # SYNTAX FIX: Combined name and uses into one block
       - name: Checkout code
-      - uses: actions/checkout@v3
+        uses: actions/checkout@v3
 
       - name: Get commit short sha
         id: vars
@@ -27,24 +30,27 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build an push Docker image
+      - name: Build and push Docker image
         uses: docker/build-push-action@v4
         with:
           context: .
           push: true
+          # TYPO FIX 2: Changed ':lastest' to ':latest'
           tags: |
-            ${{ secrets.DOCKER_USERNAME }}/${{ secrets.DOCKER_IMAGE_NAME }}:lastest
-            ${{ secrets.DOCKER_USERNAME}}/${{ secrets.DOCKER_IMAGE_NAME }}:${{ steps.vars.outputs.sha_short}}
+            ${{ secrets.DOCKER_USERNAME }}/${{ secrets.DOCKER_IMAGE_NAME }}:latest
+            ${{ secrets.DOCKER_USERNAME }}/${{ secrets.DOCKER_IMAGE_NAME }}:${{ steps.vars.outputs.sha_short }}
           cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/${{ secrets.DOCKER_IMAGE_NAME }}:buildcache
-          cache-to: type:registry,ref=${{ secrets.DOCKER_USERNAME }}/${{ secrets.DOCKER_IMAGE_NAME }}:buildcache,mode=max
-      
+          # SYNTAX FIX: Changed 'type:registry' to 'type=registry'
+          cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/${{ secrets.DOCKER_IMAGE_NAME }}:buildcache,mode=max
+
+      # INDENTATION FIX: Aligned these steps with the rest of the list
       - name: Success notification
         if: success()
         run: |
           echo "✅ Docker image built and pushed successfully!"
           echo "Image: ${{ secrets.DOCKER_USERNAME }}/${{ secrets.DOCKER_IMAGE_NAME }}:latest"
           echo "Commit: ${{ steps.vars.outputs.sha_short }}"
-        
+
       - name: Failure notification
         if: failure()
         run: |
