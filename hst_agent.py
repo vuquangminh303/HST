@@ -2291,17 +2291,6 @@ When you need to query data, use the execute_sql_query tool."""
     ) -> Generator[str, None, Dict[str, Any]]:
         """
         Query with streaming response
-
-        Args:
-            question: User question
-            conversation_history: Previous conversation (optional)
-            model: Model to override default (optional)
-
-        Yields:
-            Response text chunks
-
-        Returns:
-            Metadata dict with usage info
         """
         import time
         start_time = time.time()
@@ -2316,19 +2305,16 @@ When you need to query data, use the execute_sql_query tool."""
                 {"role": "user", "content": f"**Context:**\n{context}\n\n**Question:**\n{question}"}
             ]
 
-            # Add conversation history if provided
+            # Add conversation history
             if conversation_history:
-                for msg in conversation_history[-10:]:  # Last 10 messages
+                for msg in conversation_history[-10:]:
                     messages.append(msg)
 
-            # Determine if SQL tools should be available
             tools = self._get_tools() if self.sql_tool else None
-
-            # Call OpenAI
             use_model = model or self.model
 
             if tools:
-                # With SQL capability - use tools
+                # Case 1: Có SQL Tools
                 response = self.client.chat.completions.create(
                     model=use_model,
                     messages=messages,
@@ -2340,34 +2326,40 @@ When you need to query data, use the execute_sql_query tool."""
 
                 assistant_msg = response.choices[0].message
                 final_text = ""
+                
                 if assistant_msg.tool_calls:
+                    # Xử lý tool calls và stream kết quả
                     for chunk in self._handle_tool_calls(assistant_msg, question):
                         final_text += chunk
                         buffered = buffer.add(chunk)
                         if buffered:
-                            yield chunk
+                            yield buffered  # <--- QUAN TRỌNG: Yield buffered string
+                    
+                    # Flush phần còn lại trong buffer
                     remaining = buffer.flush()
                     if remaining:
                         yield remaining
 
                 else:
-                    # No tools called, stream response
+                    # Không gọi tool, stream text thường (nhưng qua buffer để mượt)
                     final_text = assistant_msg.content or ""
                     for char in final_text:
                         buffered = buffer.add(char)
                         if buffered:
-                            yield char
-                        remaining = buffer.flush()
-                        if remaining:
-                            yield remaining
-                # Calculate usage
+                            yield buffered # <--- QUAN TRỌNG
+                    
+                    remaining = buffer.flush()
+                    if remaining:
+                        yield remaining
+                
                 usage = {
                     "prompt_tokens": response.usage.prompt_tokens,
                     "completion_tokens": response.usage.completion_tokens,
                     "total_tokens": response.usage.total_tokens
                 }
             else:
-                # Without SQL - simple streaming response
+                # Case 2: Không có SQL Tools (Stream trực tiếp từ OpenAI)
+                # Trường hợp này không dùng Buffer thủ công vì OpenAI stream đã trả về chunks
                 response = self.client.chat.completions.create(
                     model=use_model,
                     messages=messages,
@@ -2381,11 +2373,11 @@ When you need to query data, use the execute_sql_query tool."""
                     if chunk.choices[0].delta.content:
                         text = chunk.choices[0].delta.content
                         final_text += text
-                        yield text
+                        yield text # Yield trực tiếp, không qua buffer vì đã là stream
 
-                usage = {"estimated_tokens": len(final_text) // 4}  # Rough estimate
+                usage = {"estimated_tokens": len(final_text) // 4}
 
-            # Record in conversation
+            # Record conversation
             if hasattr(self, 'session'):
                 self.session.agent_conversations.append(AgentMessage(
                     role="user",
@@ -2399,7 +2391,6 @@ When you need to query data, use the execute_sql_query tool."""
                     context={"used_sql": bool(tools)}
                 ))
 
-            # Return metadata
             return {
                 "usage": usage,
                 "duration": time.time() - start_time,
@@ -2417,55 +2408,6 @@ When you need to query data, use the execute_sql_query tool."""
                 "duration": time.time() - start_time,
                 "model": model or self.model
             }
-    # def _streaming_query(
-    #     self,
-    #     question: str,
-    #     chat_history: List[Dict[str, Any]],
-    #     model: str,
-    #     max_results: int,
-    #     response_id: str = None,
-    #     previous_response_id: str = None,
-    #     user_prompt: str = "",
-    #     orchestrator_request_id: str = None 
-    # ) -> Generator[Dict[str, Any], None, None]:
-        
-
-
-    #     conversation_messages = []
-    #     for turn in chat_history[-3:]:
-    #         role = "user" if turn.get("role") == "user" else "assistant"
-    #         conversation_messages.append({"role": role, "content": turn.get("content", "")})
-        
-    #     tools = self._get_tools() if self.sql_tool else None
-
-    #     request_params = {
-    #         "model": model.split("/")[-1] if '/' in model else model,
-    #         "input": question,
-    #         "tools": tools,
-    #         "stream": True,
-    #         "include": ["file_search_call.results"],
-    #     }
-    #     pass
-    def chat(self, user_message: str) -> str:
-        """
-        Simple chat interface (non-streaming)
-
-        Args:
-            user_message: User message
-
-        Returns:
-            Assistant response text
-        """
-        result = []
-        metadata = None
-
-        for chunk in self.query(user_message):
-            if isinstance(chunk, dict):
-                metadata = chunk
-            else:
-                result.append(chunk)
-
-        return "".join(result)
 
     def _handle_tool_calls(self, assistant_message, original_question: str) -> Generator[str, None, None]:
         """
