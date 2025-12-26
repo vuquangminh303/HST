@@ -29,6 +29,14 @@ from validation_chat_extension import (
     render_export_chat_button,
     render_chat_statistics
 )
+# Import schema refinement helpers
+from schema_refinement import (
+    generate_initial_schema_fast,
+    generate_schema_improvement_suggestions,
+    apply_schema_refinement_chat,
+    render_schema_editor,
+    render_schema_refinement_chat
+)
 from dotenv import load_dotenv
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOGLEVEL","INFO").upper())
@@ -1254,15 +1262,21 @@ def tab_question_collection():
 # ============================================================================
 
 def tab_schema_generation():
-    """Schema generation tab (Now Step 4)"""
-    st.header("📋 Semantic Schema Generation")
+    """
+    NEW FLOW: Schema Generation with AI Review & Refinement
+    1. Generate initial schema
+    2. Review with AI suggestions
+    3. Edit manually or refine with LLM chat
+    4. Confirm schema
+    """
+    st.header("📋 Semantic Schema Generation (AI-Assisted)")
 
     if not st.session_state.session:
         st.warning("⚠️ No active session")
         return
 
     session = st.session_state.session
-    
+
     selected_source_id = st.selectbox(
         "Select Source",
         options=[s.source_id for s in session.sources],
@@ -1281,312 +1295,224 @@ def tab_schema_generation():
         return
 
     st.markdown("""
-    **Two-Step Schema Generation Process:**
+    **NEW Three-Step Schema Generation Process:**
 
-    1. **Step 1**: Analyze data and generate clarification questions (units, formats, constraints, etc.)
-    2. **Step 2**: Answer questions and generate final schema
+    1. **Step 1**: Generate initial schema automatically from data
+    2. **Step 2**: Review & Refine with AI suggestions and manual editing
+    3. **Step 3**: Confirm final schema
     """)
 
     st.divider()
 
-    # Scenarios Section - Guide Schema Generation
-    if session.scenarios:
-        st.subheader("🎯 Use Scenarios to Guide Schema Generation")
-        st.info("You have defined scenarios. Select which ones to use for guiding schema generation.")
-
-        # Select scenarios
-        scenario_names = [s.name for s in session.scenarios]
-        selected_scenario_names = st.multiselect(
-            "Select scenarios to apply",
-            options=scenario_names,
-            default=[],
-            help="Selected scenarios will be used to guide schema generation",
-            key="schema_gen_scenarios"
-        )
-
-        if selected_scenario_names:
-            # Show selected scenarios summary
-            selected_scenarios = [s for s in session.scenarios if s.name in selected_scenario_names]
-
-            with st.expander(f"📋 Selected Scenarios Summary ({len(selected_scenarios)})", expanded=True):
-                for scenario in selected_scenarios:
-                    st.write(f"**{scenario.name}**")
-                    st.write(f"  Fields: {', '.join(scenario.selected_fields[:5])}{'...' if len(scenario.selected_fields) > 5 else ''}")
-                    st.write(f"  Questions: {len(scenario.questions)}")
-
-            # Convert scenarios to QuestionSet for schema generation
-            if "scenarios_question_set" not in st.session_state:
-                st.session_state.scenarios_question_set = None
-
-            if st.button("🔄 Apply Scenarios to Schema Generation", key="apply_scenarios_to_schema"):
-                # Combine all questions and output fields from selected scenarios
-                all_questions = []
-                all_notes = []
-
-                for scenario in selected_scenarios:
-                    all_notes.append(f"\n### Scenario: {scenario.name}")
-                    all_notes.append(f"Description: {scenario.description}")
-                    all_notes.append(f"Required Fields: {', '.join(scenario.selected_fields)}")
-
-                    for q in scenario.questions:
-                        all_questions.append(UserQuestion(
-                            id=f"scenario_{scenario.id}_{len(all_questions)}",
-                            question=q,
-                            description=f"From scenario: {scenario.name}"
-                        ))
-
-                    if scenario.output_format:
-                        all_notes.append(f"Expected Output Format: {json.dumps(scenario.output_format, indent=2)}")
-
-                # Create or update QuestionSet
-                if not session.question_set:
-                    session.question_set = QuestionSet()
-
-                # Merge with existing questions
-                existing_questions = {q.question: q for q in session.question_set.user_questions}
-
-                for new_q in all_questions:
-                    if new_q.question not in existing_questions:
-                        session.question_set.user_questions.append(new_q)
-
-                # Add scenario notes
-                scenario_notes = "\n".join(all_notes)
-                if scenario_notes not in session.question_set.additional_notes:
-                    session.question_set.additional_notes += "\n\n## Scenarios:\n" + scenario_notes
-
-                st.success(f"✅ Applied {len(selected_scenarios)} scenarios to schema generation context!")
-                st.session_state.scenarios_question_set = session.question_set
-                st.rerun()
-
-        st.divider()
-    else:
-        st.info("💡 Tip: Define scenarios in the 'Scenarios' tab to guide schema generation with your use cases.")
-        st.divider()
-
-    # Initialize state for clarification flow
-    if 'clarification_questions' not in st.session_state:
-        st.session_state.clarification_questions = {}
-
-    if 'clarification_answers' not in st.session_state:
-        st.session_state.clarification_answers = {}
+    # Initialize state
+    if 'schema_draft' not in st.session_state:
+        st.session_state.schema_draft = {}
+    if 'schema_profiles' not in st.session_state:
+        st.session_state.schema_profiles = {}
+    if 'schema_suggestions' not in st.session_state:
+        st.session_state.schema_suggestions = {}
+    if 'schema_confirmed' not in st.session_state:
+        st.session_state.schema_confirmed = {}
 
     # ============================================================================
-    # STEP 1: Generate Clarification Questions
+    # STEP 1: Generate Initial Schema (Fast)
     # ============================================================================
-    st.subheader("📝 Step 1: Data Analysis & Clarification Questions")
+    st.subheader("📝 Step 1: Generate Initial Schema")
 
-    clarif_questions = st.session_state.clarification_questions.get(selected_source_id, [])
+    draft_schema = st.session_state.schema_draft.get(selected_source_id)
 
-    if not clarif_questions:
-        if st.button("🔍 Analyze Data & Generate Questions", type="primary"):
-            with st.spinner("Analyzing data and generating clarification questions..."):
-                profiles = ProfileGenerator.generate_profiles(df)
-                sample_rows = ProfileGenerator.get_sample_rows(df)
-                # Store profiles
-                if 'profiles' not in st.session_state:
-                    st.session_state.profiles = {}
-                st.session_state.profiles[selected_source_id] = {
-                    'profiles': profiles,
-                    'sample_rows': sample_rows
-                }
+    if not draft_schema:
+        st.info("👉 Click below to automatically generate an initial schema from your data")
 
-                # Generate clarification questions
-                schema_gen = SchemaGenerator(
+        if st.button("🚀 Generate Initial Schema", type="primary"):
+            with st.spinner("🧠 Analyzing data and generating initial schema..."):
+                # Generate schema fast
+                schema, profiles = generate_initial_schema_fast(
+                    df=df,
                     api_key=st.session_state.api_key,
-                    model=st.session_state.model
-                )
-                questions = schema_gen.generate_clarification_questions(
-                    profiles,
-                    sample_rows,
+                    model=st.session_state.model,
                     question_set=session.question_set
                 )
 
-                st.session_state.clarification_questions[selected_source_id] = questions
-                st.success(f"✅ Generated {len(questions)} clarification questions!")
-                st.rerun()
+                # Store draft
+                st.session_state.schema_draft[selected_source_id] = schema
+                st.session_state.schema_profiles[selected_source_id] = profiles
 
-        st.info("👆 Click the button above to analyze your data and generate clarification questions")
+                st.success(f"✅ Generated initial schema for {len(schema)} columns!")
+                st.rerun()
 
     else:
-        st.success(f"✅ Generated {len(clarif_questions)} questions. Please answer them below.")
+        st.success(f"✅ Initial schema generated for {len(draft_schema)} columns")
+
+        # ============================================================================
+        # STEP 2: Review & Refine Schema
+        # ============================================================================
+        st.divider()
+        st.subheader("🔍 Step 2: Review & Refine Schema")
+
+        # Generate AI suggestions if not already done
+        suggestions = st.session_state.schema_suggestions.get(selected_source_id)
+        if not suggestions:
+            with st.spinner("💡 Generating AI improvement suggestions..."):
+                suggestions = generate_schema_improvement_suggestions(
+                    schema=draft_schema,
+                    profiles=st.session_state.schema_profiles[selected_source_id],
+                    api_key=st.session_state.api_key,
+                    model=st.session_state.model,
+                    question_set=session.question_set
+                )
+                st.session_state.schema_suggestions[selected_source_id] = suggestions
+
+        # Option A: Natural Language Refinement Chat
+        st.markdown("### 💬 Option A: Refine with AI Chat")
+        refinement_result = render_schema_refinement_chat(
+            current_schema=draft_schema,
+            profiles=st.session_state.schema_profiles[selected_source_id],
+            api_key=st.session_state.api_key,
+            model=st.session_state.model
+        )
+
+        if refinement_result:
+            updated_schema, explanation = refinement_result
+            st.session_state.schema_draft[selected_source_id] = updated_schema
+            draft_schema = updated_schema  # Update current view
+            st.rerun()
 
         st.divider()
 
-        # ============================================================================
-        # Display and Answer Clarification Questions
-        # ============================================================================
-        st.subheader("❓ Clarification Questions")
-        st.write("Please answer these questions to help generate an accurate schema:")
+        # Option B: Manual Edit with AI Suggestions
+        st.markdown("### ✏️ Option B: Manual Edit (with AI Suggestions)")
 
-        # Initialize answers dict for this source
-        if selected_source_id not in st.session_state.clarification_answers:
-            st.session_state.clarification_answers[selected_source_id] = {}
+        # Column selector
+        column_names = list(draft_schema.keys())
+        selected_column = st.selectbox(
+            "Select column to edit:",
+            options=column_names,
+            key="schema_edit_column_select"
+        )
 
-        answers_dict = st.session_state.clarification_answers[selected_source_id]
+        if selected_column:
+            schema_col = draft_schema[selected_column]
 
-        for i, q in enumerate(clarif_questions):
-            with st.expander(f"**Question {i+1}: {q.question}**", expanded=True):
-                col1, col2 = st.columns([3, 1])
+            # Find profile
+            profile = None
+            profiles_list = st.session_state.schema_profiles[selected_source_id]
+            for p in profiles_list:
+                if p.name == selected_column:
+                    profile = p
+                    break
 
-                with col1:
-                    st.write(f"**Target Field:** `{q.target}`")
-                    if q.suggested_answer:
-                        st.write(f"**Suggested Answer:** {q.suggested_answer}")
+            if profile is None:
+                # Create dummy profile
+                profile = ColumnProfile(
+                    name=selected_column,
+                    pandas_dtype="unknown",
+                    inferred_type="unknown",
+                    non_null_count=0,
+                    null_count=0,
+                    null_ratio=0.0,
+                    n_unique=0,
+                    sample_values=[],
+                    sample_raw_values=[]
+                )
 
-                    # Answer input
-                    answer_value = st.text_input(
-                        "Your answer:",
-                        value=answers_dict.get(q.id, q.suggested_answer or ""),
-                        key=f"answer_{q.id}_{selected_source_id}",
-                        placeholder="Enter your answer..."
-                    )
+            # Render editor
+            updated_col_schema = render_schema_editor(
+                column_name=selected_column,
+                schema_col=schema_col,
+                profile=profile,
+                suggestions=suggestions.get(selected_column, []),
+                key_prefix=f"{selected_source_id}_edit"
+            )
 
-                    answers_dict[q.id] = answer_value
-
-                with col2:
-                    if answer_value:
-                        st.success("✓ Answered")
-                    else:
-                        st.warning("⚠️ Empty")
-
-        st.divider()
-
-        # Show progress
-        answered_count = sum(1 for ans in answers_dict.values() if ans)
-        total_count = len(clarif_questions)
-
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Questions", total_count)
-        with col2:
-            st.metric("Answered", answered_count)
-        with col3:
-            progress = answered_count / total_count if total_count > 0 else 0
-            st.metric("Progress", f"{progress:.0%}")
-
-        # ============================================================================
-        # STEP 2: Generate Schema
-        # ============================================================================
-        st.divider()
-        st.subheader("🧠 Step 2: Generate Final Schema")
-
-        col1, col2 = st.columns([1, 3])
-
-        with col1:
-            if st.button("🗑️ Reset & Start Over"):
-                st.session_state.clarification_questions.pop(selected_source_id, None)
-                st.session_state.clarification_answers.pop(selected_source_id, None)
-                st.session_state.schema_results.pop(selected_source_id, None)
-                st.success("✓ Reset! Please analyze data again.")
+            # Save button
+            if st.button("💾 Save Changes to this Column", type="primary"):
+                draft_schema[selected_column] = updated_col_schema
+                st.session_state.schema_draft[selected_source_id] = draft_schema
+                st.success(f"✅ Saved changes to column: {selected_column}")
                 st.rerun()
 
-        with col2:
-            can_generate = answered_count >= total_count * 0.5  # At least 50% answered
-
-            if not can_generate:
-                st.warning(f"⚠️ Please answer at least {int(total_count * 0.5)} questions before generating schema")
-
-            if st.button("🚀 Generate Final Schema", type="primary", disabled=not can_generate):
-                with st.spinner("Generating schema with your answers..."):
-                    # Get profiles
-                    profiles_data = st.session_state.profiles.get(selected_source_id)
-                    if not profiles_data:
-                        st.error("Profiles not found. Please run Step 1 again.")
-                        return
-
-                    profiles = profiles_data['profiles']
-                    sample_rows = profiles_data['sample_rows']
-
-                    # Convert answers to Answer objects
-                    clarification_answers = [
-                        Answer(
-                            question_id=q_id,
-                            answer=ans,
-                            timestamp=datetime.now().isoformat(),
-                            applied=True
-                        )
-                        for q_id, ans in answers_dict.items() if ans
-                    ]
-
-                    # Generate schema
-                    schema_gen = SchemaGenerator(
-                        api_key=st.session_state.api_key,
-                        model=st.session_state.model
-                    )
-                    schema, additional_questions = schema_gen.generate_schema(
-                        profiles,
-                        sample_rows,
-                        question_set=session.question_set,
-                        clarification_answers=clarification_answers
-                    )
-
-                    # Store results
-                    if 'schema_results' not in st.session_state:
-                        st.session_state.schema_results = {}
-
-                    st.session_state.schema_results[selected_source_id] = {
-                        'profiles': profiles,
-                        'schema': schema,
-                        'questions': additional_questions,
-                        'clarification_answers': clarification_answers
-                    }
-
-                    # Update session
-                    session.profiles.update(profiles)
-                    session.schema.update(schema)
-                    session.answers.extend(clarification_answers)
-
-                    st.success(f"✅ Generated schema for {len(schema)} columns!")
-                    st.rerun()
-
-    if hasattr(st.session_state, 'schema_results') and selected_source_id in st.session_state.schema_results:
-        results = st.session_state.schema_results[selected_source_id]
         st.divider()
-        st.subheader("📊 Generated Schema")
-        def normalize_key(s):
-            import unicodedata
-            # Chuyển về dạng Unicode chuẩn, bỏ khoảng trắng lạ, lowercase
-            s = unicodedata.normalize('NFC', str(s))
-            return s.replace('\xa0', ' ').replace(' ', '').lower()
-        # Create tabs for each column
-        column_names = list(results['schema'].keys())
-        if column_names:
-            tabs = st.tabs(column_names)
-            for tab, col_name in zip(tabs, column_names):
+
+        # Reset button
+        col1, col2 = st.columns([1, 3])
+        with col1:
+            if st.button("🗑️ Reset & Start Over"):
+                st.session_state.schema_draft.pop(selected_source_id, None)
+                st.session_state.schema_profiles.pop(selected_source_id, None)
+                st.session_state.schema_suggestions.pop(selected_source_id, None)
+                st.session_state.schema_confirmed.pop(selected_source_id, None)
+                st.success("✓ Reset! Please generate schema again.")
+                st.rerun()
+
+        # ============================================================================
+        # STEP 3: Confirm Schema
+        # ============================================================================
+        st.divider()
+        st.subheader("✅ Step 3: Confirm Final Schema")
+
+        # Show schema summary
+        with st.expander("📊 Schema Summary", expanded=True):
+            summary_df = pd.DataFrame([
+                {
+                    "Column": col_name,
+                    "Semantic Type": col_schema.semantic_type,
+                    "Physical Type": col_schema.physical_type,
+                    "Required": "✅" if col_schema.is_required else "❌",
+                    "Unit": col_schema.unit or "-",
+                }
+                for col_name, col_schema in draft_schema.items()
+            ])
+            st.dataframe(summary_df, use_container_width=True)
+
+        st.warning("⚠️ Sau khi confirm, schema sẽ được lưu và bạn có thể chuyển sang các bước tiếp theo.")
+
+        if st.button("✅ Confirm & Save Schema", type="primary", key="confirm_schema_btn"):
+            with st.spinner("Saving schema..."):
+                # Update session schema
+                session.schema.update(draft_schema)
+
+                # Update profiles
+                profiles_dict = {p.name: p for p in st.session_state.schema_profiles[selected_source_id]}
+                session.profiles.update(profiles_dict)
+
+                # Mark as confirmed
+                st.session_state.schema_confirmed[selected_source_id] = True
+
+                st.success(f"✅ Schema confirmed and saved for {len(draft_schema)} columns!")
+                st.balloons()
+                st.rerun()
+
+    # ============================================================================
+    # Display Confirmed Schema
+    # ============================================================================
+    if st.session_state.schema_confirmed.get(selected_source_id):
+        st.divider()
+        st.success("🎉 Schema đã được confirm! Bạn có thể chuyển sang tab tiếp theo.")
+
+        # Show confirmed schema details
+        with st.expander("📋 View Confirmed Schema Details", expanded=False):
+            confirmed_schema = session.schema
+            profiles_dict = session.profiles
+
+            tabs = st.tabs(list(confirmed_schema.keys()))
+            for tab, col_name in zip(tabs, confirmed_schema.keys()):
                 with tab:
-                    profile = results['profiles'].get(col_name)
-                    if profile is None:
-                        target_key = normalize_key(col_name)
-                        for raw_key, raw_profile in results['profiles'].items():
-                            if normalize_key(raw_key) == target_key:
-                                profile = raw_profile
-                                break
-                    
-                    if profile is None:
-                        profile = ColumnProfile(
-                            name=col_name, pandas_dtype="unknown", inferred_type="unknown",
-                            non_null_count=0, null_count=0, null_ratio=0.0, n_unique=0,
-                            sample_values=[], sample_raw_values=[]
-                        )
-                        st.warning(f"⚠️ Không tìm thấy profile gốc cho cột: '{col_name}'. Dữ liệu hiển thị có thể không đầy đủ.")
+                    schema_col = confirmed_schema[col_name]
+                    profile = profiles_dict.get(col_name)
 
-                    schema_col = results['schema'][col_name]
+                    if profile:
+                        col1, col2, col3, col4 = st.columns(4)
+                        with col1:
+                            st.metric("Non-Null", profile.non_null_count)
+                        with col2:
+                            st.metric("Null %", f"{profile.null_ratio:.1%}")
+                        with col3:
+                            st.metric("Unique", profile.n_unique)
+                        with col4:
+                            st.metric("Required", "✅" if schema_col.is_required else "❌")
 
-                    # Metrics
-                    col1, col2, col3, col4 = st.columns(4)
-
-                    with col1:
-                        st.metric("Non-Null Count", profile.non_null_count)
-                    with col2:
-                        st.metric("Null Ratio", f"{profile.null_ratio:.1%}")
-                    with col3:
-                        st.metric("Unique Values", profile.n_unique)
-                    with col4:
-                        st.metric("Required", "✅" if schema_col.is_required else "❌")
-
-                    # Schema details
                     st.subheader("Schema Details")
-
                     col_left, col_right = st.columns(2)
 
                     with col_left:
@@ -1600,9 +1526,9 @@ def tab_schema_generation():
                         if schema_col.constraints:
                             st.write(f"**Constraints:** `{json.dumps(schema_col.constraints)}`")
 
-                    # Sample values
-                    st.subheader("Sample Values")
-                    st.write(profile.sample_values[:10])
+                    if profile and profile.sample_values:
+                        st.subheader("Sample Values")
+                        st.code(", ".join(str(v) for v in profile.sample_values[:10]))
 def tab_agent_qa():
     """Enhanced Agent Q&A with SQL capability"""
     st.header("🤖 Agent Q&A - Chat & Query Your Data")
