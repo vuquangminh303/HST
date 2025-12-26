@@ -373,6 +373,300 @@ def stream_agent_response(agent, question: str, placeholder) -> Generator[str, N
 
 
 # ============================================================================
+# DEBUG MODE FUNCTIONS - Show LLM Reasoning Process
+# ============================================================================
+
+def stream_agent_response_debug(agent, question: str, placeholder) -> Generator[str, None, None]:
+    """
+    DEBUG MODE: Stream response từ agent với debug info
+    Hiển thị cách LLM suy nghĩ và query
+    """
+    from openai import OpenAI
+    import json
+
+    full_response = ""
+    debug_info = []
+
+    try:
+        # Hiển thị debug header
+        debug_header = "### 🔍 DEBUG MODE - LLM Query Process\n\n"
+        placeholder.markdown(debug_header)
+        full_response += debug_header
+        yield debug_header
+
+        # 1. Hiển thị câu hỏi
+        q_section = f"**📝 Câu hỏi:** {question}\n\n"
+        full_response += q_section
+        placeholder.markdown(full_response + "▌")
+        yield q_section
+
+        # 2. Hiển thị context/schema
+        context_section = "**📊 Context được gửi cho LLM:**\n"
+        if agent.session.schema:
+            context_section += "```\n"
+            for col_name, col_schema in list(agent.session.schema.items())[:5]:
+                if hasattr(col_schema, 'semantic_type'):
+                    context_section += f"- {col_name}: {col_schema.semantic_type}\n"
+            context_section += "```\n\n"
+
+        full_response += context_section
+        placeholder.markdown(full_response + "▌")
+        yield context_section
+
+        # 3. Gọi agent và capture response
+        reasoning_section = "**🧠 LLM Reasoning:**\n"
+        full_response += reasoning_section
+        placeholder.markdown(full_response + "▌")
+        yield reasoning_section
+
+        agent_response = ""
+        for chunk in agent.query(question):
+            if isinstance(chunk, dict):
+                # Có thể là metadata hoặc SQL query info
+                if 'sql_query' in chunk:
+                    sql_section = f"\n\n**⚡ SQL Query được tạo:**\n```sql\n{chunk['sql_query']}\n```\n\n"
+                    full_response += sql_section
+                    placeholder.markdown(full_response + "▌")
+                    yield sql_section
+                continue
+            agent_response += chunk
+            full_response += chunk
+            placeholder.markdown(full_response + "▌")
+            yield chunk
+
+        # 4. Final answer section
+        final_section = f"\n\n---\n### ✅ Câu trả lời cuối cùng:\n{agent_response}\n"
+        full_response = full_response.replace(agent_response, "")  # Remove duplicate
+        full_response += final_section
+        placeholder.markdown(full_response)
+        yield "\n" + final_section
+
+    except Exception as e:
+        error_msg = f"\n\n❌ **Lỗi:** {str(e)}\n"
+        full_response += error_msg
+        placeholder.markdown(full_response)
+        yield error_msg
+
+
+def _stream_multi_table_query_debug(question: str, sql_tool: MultiTableSQLQueryTool,
+                                     session, placeholder) -> Generator[str, None, None]:
+    """
+    DEBUG MODE: Query agent với multi-table context VỚI DEBUG INFO
+    Hiển thị toàn bộ quá trình LLM suy nghĩ, query SQL, và trả lời
+    """
+    from openai import OpenAI
+    import json
+
+    client = OpenAI(api_key=st.session_state.api_key)
+    context = _build_multi_table_context_debug(sql_tool, session)
+
+    system_prompt = """Bạn là một data analyst thông minh với khả năng query SQL trên NHIỀU BẢNG.
+
+**NGUYÊN TẮC:**
+1. Dùng [table_name] cho tên bảng
+2. Dùng table.column khi cần phân biệt
+3. Có thể JOIN, UNION nhiều bảng
+4. LUÔN trả lời bằng TIẾNG VIỆT
+5. Nếu có business rules → tuân theo
+
+Khi cần dữ liệu, dùng tool execute_sql_query."""
+
+    full_response = ""
+
+    try:
+        # === DEBUG SECTION 1: Hiển thị System Prompt ===
+        debug_header = "### 🔍 DEBUG MODE - LLM Query Process\n\n"
+        full_response += debug_header
+        placeholder.markdown(full_response)
+        yield debug_header
+
+        prompt_section = f"**📝 System Prompt:**\n```\n{system_prompt[:200]}...\n```\n\n"
+        full_response += prompt_section
+        placeholder.markdown(full_response + "▌")
+        yield prompt_section
+
+        # === DEBUG SECTION 2: Hiển thị Context ===
+        context_section = f"**📊 Context gửi cho LLM:**\n```\n{context[:500]}...\n```\n\n"
+        full_response += context_section
+        placeholder.markdown(full_response + "▌")
+        yield context_section
+
+        # === DEBUG SECTION 3: Hiển thị Question ===
+        q_section = f"**❓ Câu hỏi:** {question}\n\n"
+        full_response += q_section
+        placeholder.markdown(full_response + "▌")
+        yield q_section
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"**Context:**\n{context}\n\n**Câu hỏi:**\n{question}"}
+        ]
+
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "execute_sql_query",
+                "description": f"Thực thi SQL SELECT query trên các bảng: {', '.join(sql_tool.tables.keys())}. Dùng [table_name] cho tên bảng.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "SQL SELECT query"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }]
+
+        # === BƯỚC 1: LLM Thinking ===
+        thinking_section = "**🧠 LLM đang phân tích...**\n\n"
+        full_response += thinking_section
+        placeholder.markdown(full_response + "▌")
+        yield thinking_section
+
+        response = client.chat.completions.create(
+            model=st.session_state.get('model', 'gpt-4o-mini'),
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.7,
+            max_tokens=2000
+        )
+
+        assistant_msg = response.choices[0].message
+
+        # === BƯỚC 2: Tool Call (SQL Execution) ===
+        if assistant_msg.tool_calls:
+            tool_section = "**⚡ LLM quyết định gọi SQL tool:**\n\n"
+            full_response += tool_section
+            placeholder.markdown(full_response + "▌")
+            yield tool_section
+
+            sql_results = []
+
+            for tool_call in assistant_msg.tool_calls:
+                if tool_call.function.name == "execute_sql_query":
+                    args = json.loads(tool_call.function.arguments)
+                    query = args.get("query", "")
+
+                    # === DEBUG: Hiển thị SQL Query ===
+                    sql_display = f"```sql\n{query}\n```\n\n"
+                    full_response += sql_display
+                    placeholder.markdown(full_response + "▌")
+                    yield sql_display
+
+                    exec_msg = "**⏳ Đang thực thi SQL...**\n\n"
+                    full_response += exec_msg
+                    placeholder.markdown(full_response + "▌")
+                    yield exec_msg
+
+                    result_df, error = sql_tool.execute_query(query)
+
+                    if error:
+                        error_result = f"❌ **SQL Error:** {error}\n\n"
+                        full_response += error_result
+                        sql_results.append(f"❌ SQL Error: {error}")
+                        placeholder.markdown(full_response + "▌")
+                        yield error_result
+                    else:
+                        if len(result_df) == 0:
+                            no_result = "⚠️ Query không trả về kết quả\n\n"
+                            full_response += no_result
+                            sql_results.append("Query không trả về kết quả")
+                            placeholder.markdown(full_response + "▌")
+                            yield no_result
+                        else:
+                            # === DEBUG: Hiển thị SQL Results ===
+                            result_display = f"**📊 Kết quả SQL ({len(result_df)} dòng):**\n```\n{result_df.head(10).to_string(index=False)}\n```\n"
+                            if len(result_df) > 10:
+                                result_display += f"*(Hiển thị 10/{len(result_df)} dòng)*\n\n"
+
+                            full_response += result_display
+                            placeholder.markdown(full_response + "▌")
+                            yield result_display
+
+                            result_text = f"Kết quả ({len(result_df)} dòng):\n```\n{result_df.head(15).to_string(index=False)}\n```"
+                            if len(result_df) > 15:
+                                result_text += f"\n(Hiển thị 15/{len(result_df)} dòng)"
+                            sql_results.append(result_text)
+
+            result_summary = "\n\n".join(sql_results)
+
+            # === BƯỚC 3: Final Analysis ===
+            analysis_header = "**📝 LLM đang phân tích kết quả để trả lời...**\n\n"
+            full_response += analysis_header
+            placeholder.markdown(full_response + "▌")
+            yield analysis_header
+
+            final_stream = client.chat.completions.create(
+                model=st.session_state.get('model', 'gpt-4o-mini'),
+                messages=[
+                    {"role": "system", "content": "Phân tích kết quả SQL và trả lời bằng tiếng Việt. Trả lời ngắn gọn và rõ ràng. Format markdown đẹp."},
+                    {"role": "user", "content": f"Câu hỏi: {question}\n\nKết quả SQL:\n{result_summary}\n\nPhân tích và trả lời:"}
+                ],
+                temperature=0.7,
+                max_tokens=1500,
+                stream=True
+            )
+
+            final_answer = ""
+            for chunk in final_stream:
+                if chunk.choices[0].delta.content:
+                    text = chunk.choices[0].delta.content
+                    final_answer += text
+                    full_response += text
+                    placeholder.markdown(full_response + "▌")
+                    yield text
+
+            # === FINAL SECTION ===
+            final_section = f"\n\n---\n### ✅ Câu trả lời cuối cùng:\n{final_answer}\n"
+            placeholder.markdown(full_response + final_section)
+            yield f"\n{final_section}"
+
+        else:
+            # Trường hợp không gọi tool
+            if assistant_msg.content:
+                direct_answer = f"**💡 LLM trả lời trực tiếp (không cần SQL):**\n\n{assistant_msg.content}\n"
+                full_response += direct_answer
+                placeholder.markdown(full_response)
+                yield direct_answer
+            else:
+                no_answer = "⚠️ Không có câu trả lời từ Agent.\n"
+                full_response += no_answer
+                placeholder.markdown(full_response)
+                yield no_answer
+
+    except Exception as e:
+        error_msg = f"\n\n❌ **Lỗi:** {str(e)}\n"
+        full_response += error_msg
+        placeholder.markdown(full_response)
+        yield error_msg
+
+
+def _build_multi_table_context_debug(sql_tool: MultiTableSQLQueryTool, session) -> str:
+    """Build context cho debug mode - KHÔNG bao gồm additional_notes và scenarios"""
+    context_parts = []
+
+    context_parts.append("**📊 CÁC BẢNG DỮ LIỆU:**")
+    for table_name, info in sql_tool.tables.items():
+        cols_preview = ', '.join(str(c) for c in info['columns'][:10])
+        if len(info['columns']) > 10:
+            cols_preview += f", ... (+{len(info['columns']) - 10} cột)"
+        context_parts.append(f"- **{table_name}** ({info['row_count']} rows): {cols_preview}")
+
+    if session.schema:
+        context_parts.append("\n**📋 CHI TIẾT SCHEMA:**")
+        for col_name, col_schema in list(session.schema.items()):
+            if hasattr(col_schema, 'semantic_type') and hasattr(col_schema, 'description'):
+                desc = col_schema.description[:60] if col_schema.description else ''
+                context_parts.append(f"- {col_name}: {col_schema.semantic_type} - {desc}")
+
+    # KHÔNG thêm additional_notes và scenarios trong debug mode
+    context_parts.append("\n⚠️ **NOTE:** Debug mode - Additional notes và scenarios CHƯA được thêm vào context này.")
+
+    return "\n".join(context_parts)
+
+
+# ============================================================================
 # Multi-Table Query with Streaming Support
 # ============================================================================
 
@@ -803,78 +1097,259 @@ def render_multi_table_chat_interface(
         st.rerun()
 
 # ============================================================================
+# Debug Chat Interface Renderers
+# ============================================================================
+
+def render_chat_interface_debug(
+    session,
+    agent,
+    context_key: str,
+    placeholder_text: str = "Hỏi một câu để test...",
+    quick_questions: List[str] = None
+):
+    """Render DEBUG chat interface với streaming debug info"""
+    initialize_chat_state(context_key)
+
+    chat_history = get_chat_history(context_key)
+
+    # Hiển thị lịch sử
+    if not chat_history:
+        st.info("💬 Bắt đầu chat để test! Agent sẽ hiển thị debug info.")
+    else:
+        chat_container = st.container()
+        with chat_container:
+            for msg in chat_history:
+                content = msg["content"]
+                if not isinstance(content, str):
+                    content = str(content)
+                render_chat_message(msg["role"], content, msg.get("timestamp"))
+
+    # Quick Questions
+    if quick_questions:
+        st.markdown("**💡 Câu hỏi gợi ý:**")
+        cols = st.columns(min(len(quick_questions), 3))
+        for i, q in enumerate(quick_questions[:6]):
+            with cols[i % 3]:
+                btn_label = q[:30] + "..." if len(q) > 30 else q
+                if st.button(f"💬 {btn_label}", key=f"{context_key}_quick_debug_{i}"):
+                    add_to_chat_history(context_key, "user", q)
+                    render_chat_message("user", q)
+
+                    response_placeholder = st.empty()
+                    gen = stream_agent_response_debug(agent, q, response_placeholder)
+
+                    full_response = ""
+                    for chunk in gen:
+                        full_response += chunk
+
+                    add_to_chat_history(context_key, "assistant", full_response)
+                    st.rerun()
+
+    st.markdown("---")
+    with st.form(f"chat_form_debug_{context_key}", clear_on_submit=True):
+        user_input = st.text_input(
+            "Nhập câu hỏi của bạn:",
+            placeholder=placeholder_text,
+            key=f"chat_input_debug_{context_key}"
+        )
+
+        col1, col2, col3 = st.columns([1, 1, 4])
+        with col1:
+            submitted = st.form_submit_button("📤 Gửi", type="primary")
+        with col2:
+            clear = st.form_submit_button("🗑️ Xóa chat")
+
+    if clear:
+        clear_chat_history(context_key)
+        st.rerun()
+
+    if submitted and user_input:
+        add_to_chat_history(context_key, "user", user_input)
+        render_chat_message("user", user_input)
+        response_placeholder = st.empty()
+
+        gen = stream_agent_response_debug(agent, user_input, response_placeholder)
+        full_response = ""
+        for chunk in gen:
+            full_response += chunk
+
+        add_to_chat_history(context_key, "assistant", full_response)
+        st.rerun()
+
+
+def render_multi_table_chat_interface_debug(
+    session,
+    sql_tool,
+    context_key: str,
+    placeholder_text: str = "Hỏi về dữ liệu...",
+    quick_questions: List[str] = None
+):
+    """Render DEBUG multi-table chat interface với streaming debug info"""
+    initialize_chat_state(context_key)
+
+    tables_info = sql_tool.get_tables_info()
+    with st.expander(f"📊 Các bảng có sẵn ({tables_info['total_tables']} bảng)", expanded=False):
+        for table in tables_info["tables"]:
+            cols_preview = ', '.join(str(c) for c in table['columns'][:6])
+            if len(table['columns']) > 6:
+                cols_preview += f" ... (+{len(table['columns']) - 6} cột)"
+            st.markdown(f"• **{table['name']}** ({table['row_count']} rows): {cols_preview}")
+
+    chat_history = get_chat_history(context_key)
+
+    if not chat_history:
+        st.info("💬 Bắt đầu chat để test! Agent sẽ hiển thị debug info.")
+    else:
+        chat_container = st.container()
+        with chat_container:
+            for msg in chat_history:
+                content = msg["content"]
+                if not isinstance(content, str):
+                    content = str(content)
+                render_chat_message(msg["role"], content, msg.get("timestamp"))
+
+    # Quick Questions
+    if quick_questions:
+        st.markdown("**💡 Câu hỏi gợi ý:**")
+        cols = st.columns(min(len(quick_questions), 3))
+        for i, q in enumerate(quick_questions[:6]):
+            with cols[i % 3]:
+                btn_label = q[:30] + "..." if len(q) > 30 else q
+                if st.button(f"💬 {btn_label}", key=f"{context_key}_quick_debug_{i}"):
+                    add_to_chat_history(context_key, "user", q)
+                    render_chat_message("user", q)
+
+                    response_placeholder = st.empty()
+                    gen = _stream_multi_table_query_debug(q, sql_tool, session, response_placeholder)
+
+                    full_response = ""
+                    for chunk in gen:
+                        full_response += chunk
+
+                    add_to_chat_history(context_key, "assistant", full_response)
+                    st.rerun()
+
+    st.markdown("---")
+    with st.form(f"chat_form_debug_{context_key}", clear_on_submit=True):
+        user_input = st.text_input(
+            "Nhập câu hỏi của bạn:",
+            placeholder=placeholder_text,
+            key=f"chat_input_debug_{context_key}"
+        )
+
+        col1, col2, col3 = st.columns([1, 1, 4])
+        with col1:
+            submitted = st.form_submit_button("📤 Gửi", type="primary")
+        with col2:
+            clear = st.form_submit_button("🗑️ Xóa chat")
+
+    if clear:
+        clear_chat_history(context_key)
+        st.rerun()
+
+    if submitted and user_input:
+        add_to_chat_history(context_key, "user", user_input)
+        render_chat_message("user", user_input)
+
+        response_placeholder = st.empty()
+
+        gen = _stream_multi_table_query_debug(user_input, sql_tool, session, response_placeholder)
+        full_response = ""
+        for chunk in gen:
+            full_response += chunk
+
+        add_to_chat_history(context_key, "assistant", full_response)
+        st.rerun()
+
+
+# ============================================================================
 # Add Chat Validation Functions
 # ============================================================================
 
-def add_chat_validation_to_questions_tab(session, df_cleaned, sql_tool, 
+def add_chat_validation_to_questions_tab(session, df_cleaned, sql_tool,
                                           use_multi_table: bool = False,
                                           sources_dfs: Dict[str, pd.DataFrame] = None):
-    """Add interactive chat validation to Questions tab"""
+    """Add interactive chat validation to Questions tab - DEBUG MODE với session riêng"""
     st.divider()
-    st.subheader("🔍 Test Câu hỏi với Agent")
-    
+    st.subheader("🔍 Test Câu hỏi với Agent (Debug Mode)")
+
+    st.warning("⚠️ **Chế độ Debug**: Hiển thị cách LLM query để ra câu trả lời. Session riêng, không dùng chung với Agent Q&A tab.")
+
     if not session.question_set or not session.question_set.user_questions:
         st.info("📝 Tạo câu hỏi ở phần trên, sau đó quay lại đây để test!")
         return
-    
+
     user_questions = [q.question for q in session.question_set.user_questions]
-    
-    # --- MULTI TABLE MODE ---
+
+    # --- MULTI TABLE MODE (DEBUG) ---
     if use_multi_table and sources_dfs and len(sources_dfs) > 1:
-        st.info(f"📊 **Chế độ Multi-Table**: Query trên {len(sources_dfs)} bảng")
-        
-        multi_sql_tool = setup_multi_table_sql_tool(session, sources_dfs, 
-                                                     {sid: session.schema for sid in sources_dfs})
-        
+        st.info(f"📊 **Chế độ Multi-Table Debug**: Query trên {len(sources_dfs)} bảng")
+
+        # Tạo debug SQL tool với session ID riêng (thêm _debug suffix)
+        db_dir = Path("./agent_databases")
+        db_dir.mkdir(exist_ok=True)
+        debug_db_path = db_dir / f"debug_questions_{session.session_id}.db"
+
+        debug_sql_tool = MultiTableSQLQueryTool(str(debug_db_path))
+        for source_id, df in sources_dfs.items():
+            debug_sql_tool.add_table(source_id, df)
+
         col1, col2 = st.columns([3, 1])
         with col1:
-            st.success(f"💡 Bạn đã tạo **{len(user_questions)}** câu hỏi. Test với **{len(sources_dfs)} bảng**!")
+            st.success(f"💡 Bạn đã tạo **{len(user_questions)}** câu hỏi. Test với **{len(sources_dfs)} bảng** (Debug Mode)!")
         with col2:
-            if st.button("📋 Copy câu hỏi", key="copy_questions_mt"):
+            if st.button("📋 Copy câu hỏi", key="copy_questions_mt_debug"):
                 questions_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(user_questions)])
                 st.code(questions_text)
-        
-        render_multi_table_chat_interface(
+
+        # Sử dụng debug chat interface
+        render_multi_table_chat_interface_debug(
             session=session,
-            sql_tool=multi_sql_tool,
-            context_key="questions_validation_multi",
-            placeholder_text="Ví dụ: So sánh dữ liệu giữa các bảng, JOIN bảng A và B...",
+            sql_tool=debug_sql_tool,
+            context_key="questions_validation_debug_multi",
+            placeholder_text="Ví dụ: So sánh dữ liệu giữa các bảng...",
             quick_questions=user_questions
         )
-        
-    # --- SINGLE TABLE MODE ---
+
+    # --- SINGLE TABLE MODE (DEBUG) ---
     else:
-        if 'validation_agent' not in st.session_state or st.session_state.validation_agent is None:
+        # Tạo debug SQL tool với session ID riêng
+        db_dir = Path("./agent_databases")
+        db_dir.mkdir(exist_ok=True)
+        debug_db_path = db_dir / f"debug_questions_single_{session.session_id}.db"
+
+        debug_sql_tool = SQLQueryTool(str(debug_db_path), df_cleaned, "data")
+
+        # Tạo debug agent riêng (không dùng chung với validation_agent)
+        if 'debug_questions_agent' not in st.session_state:
             from hst_agent import DataSchemaAgent
-            agent = DataSchemaAgent(
+            debug_agent = DataSchemaAgent(
                 session,
                 st.session_state.api_key,
                 st.session_state.model,
                 df_cleaned=df_cleaned,
-                sql_tool=sql_tool
+                sql_tool=debug_sql_tool
             )
-            st.session_state.validation_agent = agent
+            st.session_state.debug_questions_agent = debug_agent
         else:
-            agent = st.session_state.validation_agent
-            if sql_tool and agent.sql_tool != sql_tool:
-                agent.sql_tool = sql_tool
-                agent.db_path = sql_tool.db_path
-                agent.df_cleaned = df_cleaned
-        
-        agent = st.session_state.validation_agent
-        
+            debug_agent = st.session_state.debug_questions_agent
+            debug_agent.sql_tool = debug_sql_tool
+            debug_agent.db_path = debug_sql_tool.db_path
+            debug_agent.df_cleaned = df_cleaned
+
         col1, col2 = st.columns([3, 1])
         with col1:
-            st.info(f"💡 Bạn đã tạo **{len(user_questions)}** câu hỏi. Test với agent!")
+            st.info(f"💡 Bạn đã tạo **{len(user_questions)}** câu hỏi. Test với agent (Debug Mode)!")
         with col2:
-            if st.button("📋 Copy câu hỏi", key="copy_questions"):
+            if st.button("📋 Copy câu hỏi", key="copy_questions_debug"):
                 questions_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(user_questions)])
                 st.code(questions_text)
-        
-        render_chat_interface(
+
+        # Sử dụng debug chat interface
+        render_chat_interface_debug(
             session=session,
-            agent=agent,
-            context_key="questions_validation",
+            agent=debug_agent,
+            context_key="questions_validation_debug",
             placeholder_text="Ví dụ: What is the average price?",
             quick_questions=user_questions
         )
@@ -883,135 +1358,149 @@ def add_chat_validation_to_questions_tab(session, df_cleaned, sql_tool,
 def add_chat_validation_to_scenarios_tab(session, df_cleaned, sql_tool,
                                           use_multi_table: bool = False,
                                           sources_dfs: Dict[str, pd.DataFrame] = None):
-    """Add interactive chat validation to Scenarios tab VỚI STREAMING"""
+    """Add interactive chat validation to Scenarios tab - DEBUG MODE với session riêng"""
     st.divider()
-    st.subheader("🔍 Test Scenario với Agent")
-    
+    st.subheader("🔍 Test Scenario với Agent (Debug Mode)")
+
+    st.warning("⚠️ **Chế độ Debug**: Hiển thị cách LLM query để ra câu trả lời. Session riêng, không dùng chung với Agent Q&A tab.")
+
     if not session.scenarios:
         st.info("📝 Tạo scenario ở phần trên, sau đó quay lại đây để test!")
         return
-    
+
     scenario_names = [s.name for s in session.scenarios]
     selected_scenario_name = st.selectbox(
         "Chọn scenario để test:",
         options=scenario_names,
-        key="test_scenario_select"
+        key="test_scenario_select_debug"
     )
-    
+
     selected_scenario = next(
         (s for s in session.scenarios if s.name == selected_scenario_name),
         None
     )
-    
+
     if not selected_scenario:
         return
-    
+
     with st.expander("ℹ️ Thông tin Scenario", expanded=False):
         st.write(f"**Tên:** {selected_scenario.name}")
         st.write(f"**Mô tả:** {selected_scenario.description or 'N/A'}")
         st.write(f"**Selected Fields:** `{', '.join(selected_scenario.selected_fields)}`")
         st.write(f"**Số câu hỏi:** {len(selected_scenario.questions)}")
-    
+
     is_multi = use_multi_table and sources_dfs and len(sources_dfs) > 1
-    context_key = f"scenario_{selected_scenario.id}_multi" if is_multi else f"scenario_{selected_scenario.id}"
-    
-    # --- MULTI TABLE SCENARIO ---
+    context_key = f"scenario_debug_{selected_scenario.id}_multi" if is_multi else f"scenario_debug_{selected_scenario.id}"
+
+    # --- MULTI TABLE SCENARIO (DEBUG) ---
     if is_multi:
-        st.info(f"📊 **Chế độ Multi-Table**: Query trên {len(sources_dfs)} bảng")
-        
-        multi_sql_tool = setup_multi_table_sql_tool(session, sources_dfs,
-                                                     {sid: session.schema for sid in sources_dfs})
-        
-        render_multi_table_chat_interface(
+        st.info(f"📊 **Chế độ Multi-Table Debug**: Query trên {len(sources_dfs)} bảng")
+
+        # Tạo debug SQL tool với session ID riêng
+        db_dir = Path("./agent_databases")
+        db_dir.mkdir(exist_ok=True)
+        debug_db_path = db_dir / f"debug_scenario_{selected_scenario.id}_{session.session_id}.db"
+
+        debug_sql_tool = MultiTableSQLQueryTool(str(debug_db_path))
+        for source_id, df in sources_dfs.items():
+            debug_sql_tool.add_table(source_id, df)
+
+        # Sử dụng debug chat interface
+        render_multi_table_chat_interface_debug(
             session=session,
-            sql_tool=multi_sql_tool,
+            sql_tool=debug_sql_tool,
             context_key=context_key,
-            placeholder_text="Hỏi về scenario hoặc query trên nhiều bảng...",
+            placeholder_text="Hỏi về scenario hoặc query trên nhiều bảng (Debug Mode)...",
             quick_questions=selected_scenario.questions
         )
-        
-        # === FIX: TEST ALL QUESTIONS (Multi-Table) ===
+
+        # === TEST ALL QUESTIONS (Multi-Table Debug) ===
         st.divider()
-        st.markdown("### 🧪 Test Tự Động (Streaming)")
-        
-        if st.button("▶️ Test All Questions", type="primary", key="auto_test_scenario_multi"):
+        st.markdown("### 🧪 Test Tự Động (Debug Mode)")
+
+        if st.button("▶️ Test All Questions (Debug)", type="primary", key="auto_test_scenario_debug_multi"):
             clear_chat_history(context_key)
-            
+
             for i, question in enumerate(selected_scenario.questions):
                 st.markdown(f"---\n**[Q{i+1}] {question}**")
                 add_to_chat_history(context_key, "user", f"[Q{i+1}] {question}")
-                
+
                 response_placeholder = st.empty()
-                
-                # Gọi generator
-                gen = _stream_multi_table_query(question, multi_sql_tool, session, response_placeholder)
-                
+
+                # Gọi debug generator
+                gen = _stream_multi_table_query_debug(question, debug_sql_tool, session, response_placeholder)
+
                 # Gom toàn bộ text từ generator
                 full_response = ""
                 for chunk in gen:
                     full_response += chunk
-                
-                # Lưu text đầy đủ vào history (KHÔNG lưu generator object)
-                add_to_chat_history(context_key, "assistant", full_response)
-            
-            st.success(f"✅ Đã test {len(selected_scenario.questions)} câu hỏi!")
-            # Không rerun ở đây để người dùng thấy kết quả streaming cuối cùng
-            # Nếu rerun, history sẽ hiển thị đúng text đầy đủ
 
-    # --- SINGLE TABLE SCENARIO ---
+                # Lưu text đầy đủ vào history
+                add_to_chat_history(context_key, "assistant", full_response)
+
+            st.success(f"✅ Đã test {len(selected_scenario.questions)} câu hỏi (Debug Mode)!")
+
+    # --- SINGLE TABLE SCENARIO (DEBUG) ---
     else:
-        if 'validation_agent' not in st.session_state or st.session_state.validation_agent is None:
+        # Tạo debug SQL tool với session ID riêng
+        db_dir = Path("./agent_databases")
+        db_dir.mkdir(exist_ok=True)
+        debug_db_path = db_dir / f"debug_scenario_single_{selected_scenario.id}_{session.session_id}.db"
+
+        debug_sql_tool = SQLQueryTool(str(debug_db_path), df_cleaned, "data")
+
+        # Tạo debug agent riêng cho scenario
+        debug_agent_key = f'debug_scenario_agent_{selected_scenario.id}'
+        if debug_agent_key not in st.session_state:
             from hst_agent import DataSchemaAgent
-            agent = DataSchemaAgent(
+            debug_agent = DataSchemaAgent(
                 session,
                 st.session_state.api_key,
                 st.session_state.model,
                 df_cleaned=df_cleaned,
-                sql_tool=sql_tool
+                sql_tool=debug_sql_tool
             )
-            st.session_state.validation_agent = agent
+            st.session_state[debug_agent_key] = debug_agent
         else:
-            agent = st.session_state.validation_agent
-            if sql_tool and agent.sql_tool != sql_tool:
-                agent.sql_tool = sql_tool
-                agent.db_path = sql_tool.db_path
-                agent.df_cleaned = df_cleaned
-        
-        agent = st.session_state.validation_agent
-        
-        render_chat_interface(
+            debug_agent = st.session_state[debug_agent_key]
+            debug_agent.sql_tool = debug_sql_tool
+            debug_agent.db_path = debug_sql_tool.db_path
+            debug_agent.df_cleaned = df_cleaned
+
+        # Sử dụng debug chat interface
+        render_chat_interface_debug(
             session=session,
-            agent=agent,
+            agent=debug_agent,
             context_key=context_key,
-            placeholder_text="Hỏi một câu từ scenario hoặc câu hỏi mới...",
+            placeholder_text="Hỏi một câu từ scenario (Debug Mode)...",
             quick_questions=selected_scenario.questions
         )
-        
-        # === FIX: TEST ALL QUESTIONS (Single Table) ===
+
+        # === TEST ALL QUESTIONS (Single Table Debug) ===
         st.divider()
-        st.markdown("### 🧪 Test Tự Động (Streaming)")
-        
-        if st.button("▶️ Test All Questions", type="primary", key="auto_test_scenario"):
+        st.markdown("### 🧪 Test Tự Động (Debug Mode)")
+
+        if st.button("▶️ Test All Questions (Debug)", type="primary", key="auto_test_scenario_debug"):
             clear_chat_history(context_key)
-            
+
             for i, question in enumerate(selected_scenario.questions):
                 st.markdown(f"---\n**[Q{i+1}] {question}**")
                 add_to_chat_history(context_key, "user", f"[Q{i+1}] {question}")
-                
+
                 response_placeholder = st.empty()
-                
-                # Gọi generator
-                gen = stream_agent_response(agent, question, response_placeholder)
-                
+
+                # Gọi debug generator
+                gen = stream_agent_response_debug(debug_agent, question, response_placeholder)
+
                 # Gom toàn bộ text
                 full_response = ""
                 for chunk in gen:
                     full_response += chunk
-                
+
                 # Lưu text đầy đủ vào history
                 add_to_chat_history(context_key, "assistant", full_response)
-            
-            st.success(f"✅ Đã test {len(selected_scenario.questions)} câu hỏi!")
+
+            st.success(f"✅ Đã test {len(selected_scenario.questions)} câu hỏi (Debug Mode)!")
 
 # ============================================================================
 # Export chat history
